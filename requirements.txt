@@ -1,0 +1,8 @@
+aiohttp
+openpyxl
+requests
+numpy
+web3
+eth-abi
+eth-utils
+solidity_parser
