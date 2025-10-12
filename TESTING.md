@@ -32,3 +32,17 @@ troubleshoot issues while it is running:
 
 With this setup, you can leave the bot running unattended yet still observe its behavior,
 collect evidence for tuning strategies, and intervene quickly if something goes wrong.
+
+## Recent 20-Minute Smoke Test (Workspace)
+On 2025-10-12 we executed:
+
+```bash
+timeout 1200 python ethereumbotv2.py
+```
+
+The bot streamed block updates for the full 20-minute window. About eight minutes in, the
+environment briefly lost outbound connectivity to `api.etherscan.io`, which triggered the
+bot's fail-safe: wallet-tracker Etherscan lookups were disabled and subsequent polling
+continued without repeated errors. Multiple pools entered the recheck queue due to missing
+DexScreener metadata, but no other runtime faults surfaced. Use this run as a baseline when
+comparing future long-duration smoke tests.
