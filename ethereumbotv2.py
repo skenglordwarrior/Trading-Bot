@@ -103,9 +103,9 @@ ALCHEMY_URL = os.getenv(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "7948485219:AAEVHATEtxcI38Zxfa_6EC0WOGBhYV6xKMA"
+    "TELEGRAM_BOT_TOKEN", "8274484247:AAEoiTgXb6xLDmmSU3yLbqQaMOW81v541pY"
 )
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4895948667")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4934038934")
 # Pre-compute base URL to avoid repetition
 TELEGRAM_BASE_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
