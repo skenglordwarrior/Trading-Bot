@@ -596,9 +596,7 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
-                j = await r.json()
+        j = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if j.get("status") != "1":
             return False
         for tx in j.get("result", []):
@@ -1012,9 +1010,7 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
-                j = await r.json()
+        j = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if j.get("status") != "1":
             return False
         total_supply = None
@@ -1477,9 +1473,7 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
-                data = await r.json()
+        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if isinstance(data, dict):
             result = data.get("result", [])
             if isinstance(result, list):
@@ -1523,9 +1517,7 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
-                data = await r.json()
+        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if data.get("status") != "1":
             return metrics
         buyers = set()
@@ -1572,9 +1564,7 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
-                data = await r.json()
+        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if data.get("status") != "1":
             return result
         total_supply = None

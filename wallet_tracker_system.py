@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Set, Callable, Awaitable
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
-import aiohttp
+import requests
 from web3 import Web3
 import json
 import time
@@ -319,9 +319,7 @@ class SmartWalletTracker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             if data.get("status") != "1":
                 return wallets
@@ -386,9 +384,7 @@ class SmartWalletTracker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             if data.get("status") != "1":
                 return WalletType.UNKNOWN
@@ -486,9 +482,7 @@ class SmartWalletTracker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             for tx in data.get("result", []):
                 if tx["from"].lower() == wallet_addr.lower() and int(tx["value"]) > 0:
