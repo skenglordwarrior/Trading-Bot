@@ -27,16 +27,6 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 logger = logging.getLogger(__name__)
 
 
-def _etherscan_get(params: Dict[str, str], timeout: int = 20) -> dict:
-    response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-async def _etherscan_get_async(params: Dict[str, str], timeout: int = 20) -> dict:
-    return await asyncio.to_thread(_etherscan_get, params, timeout)
-
-
 def _env_flag(name: str, default: bool = True) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -200,10 +190,12 @@ class SmartWalletTracker:
             "apikey": api_key,
         }
         try:
-            data = await _etherscan_get_async(params, 20)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
+                    data = await resp.json()
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0].get("contractCreator")
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"contract creator lookup failed: {e}")
         except Exception as e:
             logger.error(f"fetch_contract_creator error: {e}")
@@ -222,7 +214,9 @@ class SmartWalletTracker:
             "apikey": self.get_etherscan_key(),
         }
         try:
-            data = await _etherscan_get_async(params, 20)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
+                    data = await resp.json()
             status = data.get("status")
             result = data.get("result", [])
             if status == "1" and result:
@@ -244,7 +238,7 @@ class SmartWalletTracker:
                     sources_list.append({"filename": cname or "contract.sol", "content": scode})
                 return {"status": "verified", "source": sources_list}
             return {"status": "error", "source": []}
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"contract source lookup failed: {e}")
             return {"status": "error", "source": []}
         except Exception as e:
@@ -349,7 +343,7 @@ class SmartWalletTracker:
                     wallet_type = await self.classify_by_behavior(addr, token_addr)
                     wallets[addr] = {"type": wallet_type, "allocation": percentage}
                     
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"distribution analysis lookup failed: {e}")
         except Exception as e:
             logger.error(f"Distribution analysis error: {e}")
@@ -421,7 +415,7 @@ class SmartWalletTracker:
             else:
                 return WalletType.TEAM
                 
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"behavior classification lookup failed: {e}")
             return WalletType.UNKNOWN
         except Exception as e:
@@ -501,7 +495,7 @@ class SmartWalletTracker:
                         "tx_hash": tx["hash"]
                     })
                     
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"marketing spend lookup failed: {e}")
         except Exception as e:
             logger.error(f"Marketing spend tracking error: {e}")
@@ -761,11 +755,13 @@ class SmartWalletTracker:
         }
 
         try:
-            data = await _etherscan_get_async(params)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
+                    data = await resp.json()
 
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0]
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"contract creation lookup failed: {e}")
         except Exception:
             pass
@@ -800,11 +796,13 @@ class SmartWalletTracker:
         }
 
         try:
-            data = await _etherscan_get_async(params)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
+                    data = await resp.json()
 
             if data.get("status") == "1":
                 return data.get("result", [])
-        except (requests.RequestException, ValueError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             set_etherscan_lookup_enabled(False, f"token transaction lookup failed: {e}")
         except Exception:
             pass

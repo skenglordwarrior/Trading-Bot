@@ -611,7 +611,7 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
                 name = info.get("contractName", "").lower()
                 if any(k in name for k in ["lock", "locker", "unicrypt", "team", "pink"]):
                     return True
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"lock lookup failed: {e}")
     except Exception as e:
         logger.debug(f"etherscan lock check error: {e}")
@@ -733,7 +733,9 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
         "apikey": api_key,
     }
     try:
-        j = await _etherscan_get_async(params, FETCH_TIMEOUT)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
+                j = await r.json()
         if j.get("status") != "1":
             return False
         now_ts = time.time()
@@ -742,7 +744,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
                 ts = int(tx.get("timeStamp", "0"))
                 if now_ts - ts <= timeframe_sec:
                     return True
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"liquidity removal lookup failed: {e}")
     except Exception as e:
         logger.debug(f"Etherscan removal check error: {e}")
@@ -778,16 +780,6 @@ def get_next_etherscan_key() -> str:
 
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
-
-
-def _etherscan_get(params: Dict[str, str], timeout: int = FETCH_TIMEOUT) -> dict:
-    response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
-async def _etherscan_get_async(params: Dict[str, str], timeout: int = FETCH_TIMEOUT) -> dict:
-    return await asyncio.to_thread(_etherscan_get, params, timeout)
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -850,7 +842,9 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
         "apikey": api_key,
     }
     try:
-        j = await _etherscan_get_async(params, 20)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
+                j = await r.json()
         status = j.get("status")
         result = j.get("result", [])
 
@@ -900,7 +894,7 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
                 "contractName": "",
             }
 
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"source fetch failed: {e}")
         return {
             "status": ContractVerificationStatus.ERROR,
@@ -936,10 +930,11 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
         "apikey": api_key,
     }
     try:
-        data = _etherscan_get(params, 20)
+        resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
+        data = resp.json()
         if data.get("status") == "1" and data.get("result"):
             return data["result"][0].get("contractCreator")
-    except (requests.RequestException, ValueError) as exc:
+    except requests.RequestException as exc:
         disable_etherscan_lookups(f"contract creator lookup failed: {exc}")
     except Exception:
         logger.debug("contract creator fetch failed", exc_info=True)
@@ -1030,7 +1025,7 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
             if total_supply and val > total_supply * 0.05:
                 return True
         return False
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"owner activity lookup failed: {e}")
         return False
     except Exception as e:
@@ -1293,10 +1288,12 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
         "apikey": get_next_etherscan_key(),
     }
     try:
-        j = await _etherscan_get_async(params, 20)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
+                j = await r.json()
         if j.get("status") == "1" and j.get("result"):
             return True
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"renounce lookup failed: {e}")
     except Exception:
         pass
@@ -1482,7 +1479,7 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
             if isinstance(result, list):
                 return result
         return []
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
         return []
     except Exception as e:
@@ -1537,7 +1534,7 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
         metrics["uniqueBuyers"] = len(buyers)
         metrics["uniqueSellers"] = len(sellers)
         return metrics
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"transfer history lookup failed: {e}")
         return metrics
     except Exception as e:
@@ -1583,7 +1580,7 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
                 result["hasPresale"] = True
                 result["largeTransfers"].append(tx.get("to"))
         return result
-    except (requests.RequestException, ValueError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"private sale lookup failed: {e}")
         return result
     except Exception as e:
