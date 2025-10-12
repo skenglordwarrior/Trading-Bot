@@ -5,12 +5,13 @@ This system tracks and analyzes developer, marketing, and team wallets to predic
 project success and detect potential rugpulls or scams.
 """
 
+import os
 import re
 from typing import Dict, List, Optional, Tuple, Set, Callable, Awaitable
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
-import aiohttp
+import requests
 from web3 import Web3
 import json
 import time
@@ -19,10 +20,46 @@ import numpy as np
 import logging
 
 # Constants shared with ethereumbotv2
-ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 logger = logging.getLogger(__name__)
+
+
+def _etherscan_get(params: Dict[str, str], timeout: int = 20) -> dict:
+    response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+async def _etherscan_get_async(params: Dict[str, str], timeout: int = 20) -> dict:
+    return await asyncio.to_thread(_etherscan_get, params, timeout)
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off"}
+
+
+_ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
+_ETHERSCAN_DISABLED_REASON: Optional[str] = None
+
+
+def set_etherscan_lookup_enabled(enabled: bool, reason: str = ""):
+    """Allow the main bot to toggle Etherscan-dependent features."""
+    global _ETHERSCAN_LOOKUPS_ENABLED, _ETHERSCAN_DISABLED_REASON
+    if _ETHERSCAN_LOOKUPS_ENABLED != enabled:
+        _ETHERSCAN_LOOKUPS_ENABLED = enabled
+        if not enabled and reason:
+            _ETHERSCAN_DISABLED_REASON = reason
+            logger.warning("Disabling wallet tracker Etherscan lookups: %s", reason)
+
+
+def _etherscan_enabled() -> bool:
+    return _ETHERSCAN_LOOKUPS_ENABLED
 
 # ------------------------------------------------------------------
 # Patch A: notifier injection so this module doesn't depend on a
@@ -87,12 +124,17 @@ class SmartWalletTracker:
     
     def __init__(self, w3_read, etherscan_key_getter):
         self.w3 = w3_read
-        self.get_etherscan_key = etherscan_key_getter
+        self._etherscan_key_getter = etherscan_key_getter
         self.tracked_wallets: Dict[str, Dict[str, WalletActivity]] = {}
         self.marketing_spend_patterns = self.load_marketing_patterns()
         # Cache for previously generated reports to avoid API spam
         self.report_cache: Dict[str, Tuple[dict, float]] = {}
         self.report_ttl = 600  # seconds
+
+    def get_etherscan_key(self) -> Optional[str]:
+        if not _etherscan_enabled():
+            return ""
+        return self._etherscan_key_getter()
         
     def load_marketing_patterns(self) -> dict:
         """Load known marketing wallet patterns"""
@@ -145,34 +187,42 @@ class SmartWalletTracker:
 
     async def fetch_contract_creator(self, token_addr: str) -> Optional[str]:
         """Fetch contract deployer using Etherscan."""
+        if not _etherscan_enabled():
+            return None
         api_key = self.get_etherscan_key()
         if not api_key:
             return None
-        url = (
-            f"{ETHERSCAN_API_URL}?module=contract&action=getcontractcreation"
-            f"&contractaddresses={token_addr}&apikey={api_key}"
-        )
+        params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
+            "module": "contract",
+            "action": "getcontractcreation",
+            "contractaddresses": token_addr,
+            "apikey": api_key,
+        }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params, 20)
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0].get("contractCreator")
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"contract creator lookup failed: {e}")
         except Exception as e:
             logger.error(f"fetch_contract_creator error: {e}")
         return None
-    
+
     async def fetch_contract_source(self, token_addr: str) -> dict:
         """Fetch verified contract source from Etherscan."""
+        if not _etherscan_enabled():
+            return {"status": "error", "source": []}
         token_addr = token_addr.lower()
-        url = (
-            f"{ETHERSCAN_API_URL}?module=contract&action=getsourcecode"
-            f"&address={token_addr}&apikey={self.get_etherscan_key()}"
-        )
+        params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
+            "module": "contract",
+            "action": "getsourcecode",
+            "address": token_addr,
+            "apikey": self.get_etherscan_key(),
+        }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params, 20)
             status = data.get("status")
             result = data.get("result", [])
             if status == "1" and result:
@@ -193,6 +243,9 @@ class SmartWalletTracker:
                 else:
                     sources_list.append({"filename": cname or "contract.sol", "content": scode})
                 return {"status": "verified", "source": sources_list}
+            return {"status": "error", "source": []}
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"contract source lookup failed: {e}")
             return {"status": "error", "source": []}
         except Exception as e:
             logger.error(f"fetch_contract_source error: {e}")
@@ -247,28 +300,32 @@ class SmartWalletTracker:
     
     async def analyze_token_distribution(self, token_addr: str) -> Dict[str, dict]:
         """Analyze initial token distribution to find team wallets"""
+        if not _etherscan_enabled():
+            return {}
         wallets = {}
-        
+
         # Get token creation block
         creation_tx = await self.get_contract_creation_tx(token_addr)
         if not creation_tx:
             return wallets
-            
+
         # Query initial transfers
+        api_key = self.get_etherscan_key()
+        if not api_key:
+            return wallets
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "tokentx",
             "contractaddress": token_addr,
             "startblock": creation_tx["blockNumber"],
             "endblock": int(creation_tx["blockNumber"]) + 1000,  # First ~1000 blocks
             "sort": "asc",
-            "apikey": self.get_etherscan_key(),
+            "apikey": api_key,
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             if data.get("status") != "1":
                 return wallets
@@ -292,9 +349,11 @@ class SmartWalletTracker:
                     wallet_type = await self.classify_by_behavior(addr, token_addr)
                     wallets[addr] = {"type": wallet_type, "allocation": percentage}
                     
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"distribution analysis lookup failed: {e}")
         except Exception as e:
             logger.error(f"Distribution analysis error: {e}")
-            
+
         return wallets
     
     async def classify_wallet(self, wallet_addr: str, token_addr: str, info: dict) -> WalletType:
@@ -313,21 +372,25 @@ class SmartWalletTracker:
     
     async def classify_by_behavior(self, wallet_addr: str, token_addr: str) -> WalletType:
         """Classify wallet based on transaction behavior"""
+        if not _etherscan_enabled():
+            return WalletType.UNKNOWN
         # Get recent transactions
+        api_key = self.get_etherscan_key()
+        if not api_key:
+            return WalletType.UNKNOWN
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "txlist",
             "address": wallet_addr,
             "sort": "desc",
             "page": 1,
             "offset": 100,
-            "apikey": self.get_etherscan_key(),
+            "apikey": api_key,
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             if data.get("status") != "1":
                 return WalletType.UNKNOWN
@@ -358,6 +421,9 @@ class SmartWalletTracker:
             else:
                 return WalletType.TEAM
                 
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"behavior classification lookup failed: {e}")
+            return WalletType.UNKNOWN
         except Exception as e:
             logger.error(f"Behavior classification error: {e}")
             return WalletType.UNKNOWN
@@ -404,21 +470,25 @@ class SmartWalletTracker:
     
     async def track_marketing_spends(self, wallet_addr: str) -> List[dict]:
         """Track marketing wallet spending patterns"""
+        if not _etherscan_enabled():
+            return []
         spends = []
-        
+
         # Get ETH transactions
+        api_key = self.get_etherscan_key()
+        if not api_key:
+            return spends
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "txlist",
             "address": wallet_addr,
             "sort": "desc",
-            "apikey": self.get_etherscan_key(),
+            "apikey": api_key,
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
                     
             for tx in data.get("result", []):
                 if tx["from"].lower() == wallet_addr.lower() and int(tx["value"]) > 0:
@@ -431,9 +501,11 @@ class SmartWalletTracker:
                         "tx_hash": tx["hash"]
                     })
                     
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"marketing spend lookup failed: {e}")
         except Exception as e:
             logger.error(f"Marketing spend tracking error: {e}")
-            
+
         return spends
     
     def identify_spend_type(self, to_address: str) -> str:
@@ -675,23 +747,29 @@ class SmartWalletTracker:
             
     async def get_contract_creation_tx(self, contract_addr: str) -> Optional[dict]:
         """Get contract creation transaction"""
+        if not _etherscan_enabled():
+            return None
+        api_key = self.get_etherscan_key()
+        if not api_key:
+            return None
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "contract",
             "action": "getcontractcreation",
             "contractaddresses": contract_addr,
-            "apikey": self.get_etherscan_key(),
+            "apikey": api_key,
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
-                    
+            data = await _etherscan_get_async(params)
+
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0]
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"contract creation lookup failed: {e}")
         except Exception:
             pass
-            
+
         return None
         
     async def get_token_total_supply(self, token_addr: str) -> float:
@@ -706,25 +784,31 @@ class SmartWalletTracker:
             
     async def get_token_transactions(self, wallet_addr: str, token_addr: str) -> List[dict]:
         """Get token transactions for a wallet"""
+        if not _etherscan_enabled():
+            return []
+        api_key = self.get_etherscan_key()
+        if not api_key:
+            return []
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "tokentx",
             "address": wallet_addr,
             "contractaddress": token_addr,
             "sort": "desc",
-            "apikey": self.get_etherscan_key(),
+            "apikey": api_key,
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
-                    
+            data = await _etherscan_get_async(params)
+
             if data.get("status") == "1":
                 return data.get("result", [])
+        except (requests.RequestException, ValueError) as e:
+            set_etherscan_lookup_enabled(False, f"token transaction lookup failed: {e}")
         except Exception:
             pass
-            
+
         return []
     
     async def find_wallets_from_events(self, token_addr: str) -> Dict[str, dict]:
