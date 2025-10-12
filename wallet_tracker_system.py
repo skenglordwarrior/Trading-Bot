@@ -132,7 +132,8 @@ class WalletType(Enum):
 class WalletActivity:
     address: str
     wallet_type: WalletType
-    token_balance: float
+    token_address: Optional[str]
+    token_balance: Optional[float]
     eth_balance: float
     last_activity: int
     total_sells: int
@@ -454,12 +455,18 @@ class SmartWalletTracker:
             logger.error(f"Behavior classification error: {e}")
             return WalletType.UNKNOWN
     
-    async def analyze_wallet_activity(self, wallet_addr: str, token_addr: str, wallet_type: WalletType) -> WalletActivity:
+    async def analyze_wallet_activity(
+        self,
+        wallet_addr: str,
+        token_addr: Optional[str],
+        wallet_type: WalletType,
+    ) -> WalletActivity:
         """Comprehensive wallet activity analysis"""
         activity = WalletActivity(
             address=wallet_addr,
             wallet_type=wallet_type,
-            token_balance=0,
+            token_address=token_addr,
+            token_balance=None,
             eth_balance=0,
             last_activity=0,
             total_sells=0,
@@ -468,30 +475,48 @@ class SmartWalletTracker:
             suspicious_activities=[],
             risk_score=0
         )
-        
+
         # Get current balances
         activity.eth_balance = await self.get_eth_balance(wallet_addr)
-        activity.token_balance = await self.get_token_balance(wallet_addr, token_addr)
-        
-        # Analyze token transactions
-        token_txs = await self.get_token_transactions(wallet_addr, token_addr)
-        
-        for tx in token_txs:
-            if tx["from"].lower() == wallet_addr.lower():
-                activity.total_sells += 1
-                # Check if it's a dump
-                if self.is_suspicious_sell(tx, activity.token_balance):
-                    activity.suspicious_activities.append(f"Large sell: {tx['value']} tokens")
-            else:
-                activity.total_buys += 1
-                
+        token_txs: List[dict] = []
+        if token_addr:
+            activity.token_balance = await self.get_token_balance(wallet_addr, token_addr)
+
+            # Analyze token transactions
+            token_txs = await self.get_token_transactions(wallet_addr, token_addr)
+
+            for tx in token_txs:
+                if tx["from"].lower() == wallet_addr.lower():
+                    activity.total_sells += 1
+                    # Check if it's a dump
+                    if self.is_suspicious_sell(tx, activity.token_balance or 0.0):
+                        activity.suspicious_activities.append(
+                            f"Large sell: {tx['value']} tokens"
+                        )
+                else:
+                    activity.total_buys += 1
+
+            if token_txs:
+                try:
+                    latest_ts = max(int(tx.get("timeStamp", 0)) for tx in token_txs)
+                    activity.last_activity = max(activity.last_activity, latest_ts)
+                except (TypeError, ValueError):
+                    pass
+
         # For marketing wallets, track spending
         if wallet_type == WalletType.MARKETING:
             activity.marketing_spends = await self.track_marketing_spends(wallet_addr)
-            
+
+        if activity.marketing_spends:
+            try:
+                latest_spend = max(int(spend.get("timestamp", 0)) for spend in activity.marketing_spends)
+                activity.last_activity = max(activity.last_activity, latest_spend)
+            except (TypeError, ValueError):
+                pass
+
         # Calculate risk score
         activity.risk_score = self.calculate_wallet_risk_score(activity)
-        
+
         return activity
     
     async def track_marketing_spends(self, wallet_addr: str) -> List[dict]:
@@ -695,27 +720,33 @@ class SmartWalletTracker:
         dev_token_balance = 0
         
         for wallet in wallets.values():
-            total_token_balance += wallet.token_balance
-            
-            # Developer analysis
-            if wallet.wallet_type == WalletType.DEVELOPER:
-                dev_token_balance += wallet.token_balance
-                if wallet.total_sells > 5:
-                    report["risk_assessment"]["red_flags"].append(
-                        f"Dev wallet {wallet.address[:8]}... has {wallet.total_sells} sells"
-                    )
-                    
+            if wallet.token_balance is not None:
+                total_token_balance += wallet.token_balance
+
+                # Developer analysis
+                if wallet.wallet_type == WalletType.DEVELOPER:
+                    dev_token_balance += wallet.token_balance
+                    if wallet.total_sells > 5:
+                        report["risk_assessment"]["red_flags"].append(
+                            f"Dev wallet {wallet.address[:8]}... has {wallet.total_sells} sells"
+                        )
+
+            if wallet.token_balance is None and wallet.wallet_type == WalletType.DEVELOPER and wallet.total_sells > 5:
+                report["risk_assessment"]["red_flags"].append(
+                    f"Dev wallet {wallet.address[:8]}... has {wallet.total_sells} sells"
+                )
+
             # Marketing analysis
-            elif wallet.wallet_type == WalletType.MARKETING:
+            if wallet.wallet_type == WalletType.MARKETING:
                 for spend in wallet.marketing_spends:
                     value_eth = float(spend["value_eth"])
                     report["marketing_analysis"]["total_spend_eth"] += value_eth
                     report["marketing_analysis"]["spend_categories"][spend["type"]] += value_eth
-                    
+
                 # Check if actively marketing
-                recent_spends = [s for s in wallet.marketing_spends 
+                recent_spends = [s for s in wallet.marketing_spends
                                if time.time() - s["timestamp"] < 86400 * 7]  # Last week
-                               
+
                 if len(recent_spends) > 5:
                     report["risk_assessment"]["positive_signals"].append(
                         "Active marketing spending detected"
@@ -752,11 +783,13 @@ class SmartWalletTracker:
         except Exception:
             return 0.0
             
-    async def get_token_balance(self, wallet_addr: str, token_addr: str) -> float:
+    async def get_token_balance(self, wallet_addr: str, token_addr: Optional[str]) -> float:
         """Get token balance of wallet"""
+        if not token_addr:
+            return 0.0
         try:
-            abi = [{"constant": True, "inputs": [{"name": "", "type": "address"}], 
-                   "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], 
+            abi = [{"constant": True, "inputs": [{"name": "", "type": "address"}],
+                   "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
                    "type": "function"}]
             contract = self.w3.eth.contract(Web3.to_checksum_address(token_addr), abi=abi)
             balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet_addr)).call()
@@ -810,8 +843,10 @@ class SmartWalletTracker:
         except Exception:
             return 0.0
             
-    async def get_token_transactions(self, wallet_addr: str, token_addr: str) -> List[dict]:
+    async def get_token_transactions(self, wallet_addr: str, token_addr: Optional[str]) -> List[dict]:
         """Get token transactions for a wallet"""
+        if not token_addr:
+            return []
         if not _etherscan_enabled():
             return []
         api_key = self.get_etherscan_key()
