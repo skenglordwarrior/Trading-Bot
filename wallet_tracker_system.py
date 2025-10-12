@@ -20,7 +20,8 @@ import numpy as np
 import logging
 
 # Constants shared with ethereumbotv2
-ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 logger = logging.getLogger(__name__)
@@ -181,13 +182,16 @@ class SmartWalletTracker:
         api_key = self.get_etherscan_key()
         if not api_key:
             return None
-        url = (
-            f"{ETHERSCAN_API_URL}?module=contract&action=getcontractcreation"
-            f"&contractaddresses={token_addr}&apikey={api_key}"
-        )
+        params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
+            "module": "contract",
+            "action": "getcontractcreation",
+            "contractaddresses": token_addr,
+            "apikey": api_key,
+        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as resp:
+                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
                     data = await resp.json()
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0].get("contractCreator")
@@ -202,13 +206,16 @@ class SmartWalletTracker:
         if not _etherscan_enabled():
             return {"status": "error", "source": []}
         token_addr = token_addr.lower()
-        url = (
-            f"{ETHERSCAN_API_URL}?module=contract&action=getsourcecode"
-            f"&address={token_addr}&apikey={self.get_etherscan_key()}"
-        )
+        params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
+            "module": "contract",
+            "action": "getsourcecode",
+            "address": token_addr,
+            "apikey": self.get_etherscan_key(),
+        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as resp:
+                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
                     data = await resp.json()
             status = data.get("status")
             result = data.get("result", [])
@@ -301,6 +308,7 @@ class SmartWalletTracker:
         if not api_key:
             return wallets
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "tokentx",
             "contractaddress": token_addr,
@@ -367,6 +375,7 @@ class SmartWalletTracker:
         if not api_key:
             return WalletType.UNKNOWN
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "txlist",
             "address": wallet_addr,
@@ -468,6 +477,7 @@ class SmartWalletTracker:
         if not api_key:
             return spends
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "txlist",
             "address": wallet_addr,
@@ -743,6 +753,7 @@ class SmartWalletTracker:
         if not api_key:
             return None
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "contract",
             "action": "getcontractcreation",
             "contractaddresses": contract_addr,
@@ -781,6 +792,7 @@ class SmartWalletTracker:
         if not api_key:
             return []
         params = {
+            "chainid": ETHERSCAN_CHAIN_ID,
             "module": "account",
             "action": "tokentx",
             "address": wallet_addr,

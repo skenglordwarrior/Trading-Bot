@@ -586,6 +586,7 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -724,6 +725,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -764,7 +766,7 @@ _raw_keys = os.getenv(
     "ETHERSCAN_API_KEYS",
     os.getenv(
         "ETHERSCAN_API_KEY",
-        "ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW,DE19NIK8XYRV8BMZRYN6A5I8WNHZB3351Y,QY8285FMHAY16N9Z721SVR27ZEP13DZS5",
+        "HG9G9P667CSWMBM63XUWQQK4QERI49G2MI,DE19NIK8XYRV8BMZRYN6A5I8WNHZB3351Y,ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW",
     ),
 )
 ETHERSCAN_API_KEY_LIST = [k.strip() for k in _raw_keys.split(",") if k.strip()]
@@ -778,7 +780,8 @@ def get_next_etherscan_key() -> str:
     ETHERSCAN_API_INDEX = (ETHERSCAN_API_INDEX + 1) % len(ETHERSCAN_API_KEY_LIST)
     return key
 
-ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -832,13 +835,17 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
             "contractName": "",
         }
     token_addr = token_addr.lower()
-    url = (
-        f"{ETHERSCAN_API_URL}?module=contract&action=getsourcecode"
-        f"&address={token_addr}&apikey={get_next_etherscan_key()}"
-    )
+    api_key = get_next_etherscan_key()
+    params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
+        "module": "contract",
+        "action": "getsourcecode",
+        "address": token_addr,
+        "apikey": api_key,
+    }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=20) as r:
+            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         status = j.get("status")
         result = j.get("result", [])
@@ -917,12 +924,15 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
     api_key = get_next_etherscan_key()
     if not api_key:
         return None
-    url = (
-        f"{ETHERSCAN_API_URL}?module=contract&action=getcontractcreation"
-        f"&contractaddresses={token_addr}&apikey={api_key}"
-    )
+    params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
+        "module": "contract",
+        "action": "getcontractcreation",
+        "contractaddresses": token_addr,
+        "apikey": api_key,
+    }
     try:
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
             return data["result"][0].get("contractCreator")
@@ -991,6 +1001,7 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "address": owner_addr,
@@ -1270,6 +1281,7 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
     topic0 = Web3.keccak(text="OwnershipTransferred(address,address)").hex()
     zero_topic = "0x" + "0" * 64
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "logs",
         "action": "getLogs",
         "fromBlock": "0",
@@ -1456,6 +1468,7 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
     if not api_key:
         return []
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "token",
         "action": "tokenholderlist",
         "contractaddress": token_addr,
@@ -1500,6 +1513,7 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
     if not api_key:
         return metrics
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -1548,6 +1562,7 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
     if not api_key:
         return result
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
