@@ -77,6 +77,9 @@ except ModuleNotFoundError:
             "wallet_tracker module not found; ensure wallet_tracker.py is present"
         ) from exc
 
+# Shared configuration helpers
+from etherscan_config import load_etherscan_keys, make_key_getter
+
 # Fallback no-op to preserve compatibility if tracker module lacks the helper.
 try:
     set_tracker_etherscan_enabled
@@ -760,23 +763,12 @@ def check_recent_liquidity_removal(pair_addr: str, timeframe_sec: int = 600) -> 
 ###########################################################
 
 # Example: Set your Etherscan API keys if you want to do real contract checks
-_raw_keys = os.getenv(
-    "ETHERSCAN_API_KEYS",
-    os.getenv(
-        "ETHERSCAN_API_KEY",
-        "HG9G9P667CSWMBM63XUWQQK4QERI49G2MI,DE19NIK8XYRV8BMZRYN6A5I8WNHZB3351Y,ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW",
-    ),
-)
-ETHERSCAN_API_KEY_LIST = [k.strip() for k in _raw_keys.split(",") if k.strip()]
-ETHERSCAN_API_INDEX = 0
+ETHERSCAN_API_KEY_LIST = load_etherscan_keys()
+_etherscan_key_getter = make_key_getter(ETHERSCAN_API_KEY_LIST)
+
 
 def get_next_etherscan_key() -> str:
-    global ETHERSCAN_API_INDEX
-    if not ETHERSCAN_API_KEY_LIST:
-        return ""
-    key = ETHERSCAN_API_KEY_LIST[ETHERSCAN_API_INDEX]
-    ETHERSCAN_API_INDEX = (ETHERSCAN_API_INDEX + 1) % len(ETHERSCAN_API_KEY_LIST)
-    return key
+    return _etherscan_key_getter()
 
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
