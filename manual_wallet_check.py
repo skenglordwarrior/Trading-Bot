@@ -26,7 +26,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Sequence
 
 from web3 import HTTPProvider, Web3
 
@@ -126,18 +126,14 @@ def _format_timestamp(ts: int) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def _print_activity(wallet: str, activity, token_supplied: bool) -> None:
+def _print_activity(wallet: str, activity) -> None:
     print(f"\nWallet: {wallet}")
     print(f"  Type: {activity.wallet_type.value}")
     print(f"  Risk score: {activity.risk_score}/100")
     print(f"  ETH balance: {activity.eth_balance:.6f}")
-    if token_supplied and activity.token_balance is not None:
-        print(f"  Token balance: {activity.token_balance:.6f}")
-        print(f"  Total buys: {activity.total_buys}")
-        print(f"  Total sells: {activity.total_sells}")
-    else:
-        print("  Token balance: not calculated (token address not provided)")
-        print("  Token-specific buy/sell counts: skipped")
+    print(f"  Token balance: {activity.token_balance:.6f}")
+    print(f"  Total buys: {activity.total_buys}")
+    print(f"  Total sells: {activity.total_sells}")
     print(f"  Last activity: {_format_timestamp(activity.last_activity)}")
 
     if activity.suspicious_activities:
@@ -160,11 +156,10 @@ def _print_activity(wallet: str, activity, token_supplied: bool) -> None:
         print("  Marketing spends: none recorded")
 
 
-def _activity_to_dict(activity, token_supplied: bool) -> dict:
+def _activity_to_dict(activity) -> dict:
     return {
         "wallet_type": activity.wallet_type.value,
         "risk_score": activity.risk_score,
-        "token_address": activity.token_address,
         "eth_balance": activity.eth_balance,
         "token_balance": activity.token_balance,
         "total_buys": activity.total_buys,
@@ -172,25 +167,10 @@ def _activity_to_dict(activity, token_supplied: bool) -> dict:
         "last_activity": activity.last_activity,
         "marketing_spends": activity.marketing_spends,
         "suspicious_activities": activity.suspicious_activities,
-        "token_analysis_enabled": token_supplied,
     }
 
 
-def _normalise_token(token: Optional[str]) -> Optional[str]:
-    """Resolve the token argument, supporting env fallbacks and sentinel values."""
-
-    if token is None:
-        token = os.getenv("DEFAULT_TOKEN_ADDRESS")
-
-    if token:
-        token = token.strip()
-        if token.lower() in {"", "none", "null", "n/a"}:
-            return None
-
-    return token or None
-
-
-async def _run(token: Optional[str], wallets: Sequence[str], wallet_type: WalletType, args) -> None:
+async def _run(token: str, wallets: Sequence[str], wallet_type: WalletType, args) -> None:
     urls = _provider_urls(args.provider)
     if not urls:
         raise RuntimeError(
@@ -209,20 +189,13 @@ async def _run(token: Optional[str], wallets: Sequence[str], wallet_type: Wallet
         activities[wallet] = activity
 
     if args.output == "json":
-        serialised = {
-            wallet: _activity_to_dict(activity, token is not None)
-            for wallet, activity in activities.items()
-        }
+        serialised = {wallet: _activity_to_dict(activity) for wallet, activity in activities.items()}
         json.dump(serialised, sys.stdout, indent=2)
         print()
     else:
         print("\n=== Wallet Safety Report ===")
         for wallet, activity in activities.items():
-            _print_activity(wallet, activity, token_supplied=token is not None)
-        if token is None:
-            print(
-                "\nNote: Token-specific analytics were skipped because no token address was provided."
-            )
+            _print_activity(wallet, activity)
         print("\nAll checks completed. If data returned above, the tracker is functioning.")
 
 
@@ -235,10 +208,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--token",
-        help=(
-            "Token contract address used for wallet activity analysis. "
-            "If omitted (or set to 'none'), token-specific metrics are skipped."
-        ),
+        required=True,
+        help="Token contract address used for wallet activity analysis",
     )
     parser.add_argument(
         "--wallet-type",
@@ -280,8 +251,7 @@ def main() -> None:
     wallet_type = WalletType(args.wallet_type)
 
     try:
-        token = _normalise_token(args.token)
-        asyncio.run(_run(token, wallets, wallet_type, args))
+        asyncio.run(_run(args.token, wallets, wallet_type, args))
     except KeyboardInterrupt:  # pragma: no cover - manual interruption
         print("Interrupted")
     except Exception as exc:
