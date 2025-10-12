@@ -18,6 +18,7 @@ import time
 from collections import defaultdict
 import numpy as np
 import logging
+import aiohttp
 
 # Constants shared with ethereumbotv2
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
@@ -50,6 +51,37 @@ def set_etherscan_lookup_enabled(enabled: bool, reason: str = ""):
 
 def _etherscan_enabled() -> bool:
     return _ETHERSCAN_LOOKUPS_ENABLED
+
+
+async def _etherscan_get_async(params: dict, timeout: int = 20) -> dict:
+    """Shared helper to perform an async Etherscan request.
+
+    The wallet tracker module historically relied on the main bot to provide
+    this helper.  Adding it locally keeps the tracker self-contained so it can
+    be reused by stand-alone tools (like manual safety check scripts) without
+    monkey patching.
+    """
+
+    if not _etherscan_enabled():
+        return {
+            "status": "0",
+            "message": _ETHERSCAN_DISABLED_REASON or "etherscan lookups disabled",
+            "result": [],
+        }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                ETHERSCAN_API_URL, params=params, timeout=timeout
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        set_etherscan_lookup_enabled(False, f"etherscan request failed: {exc}")
+        return {"status": "0", "message": str(exc), "result": []}
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.error("Unexpected Etherscan error: %s", exc)
+        return {"status": "0", "message": str(exc), "result": []}
 
 # ------------------------------------------------------------------
 # Patch A: notifier injection so this module doesn't depend on a
