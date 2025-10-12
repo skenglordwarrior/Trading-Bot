@@ -61,6 +61,7 @@ try:
         wallet_activity_callback,
         get_shared_tracker,
         set_notifier,
+        set_etherscan_lookup_enabled as set_tracker_etherscan_enabled,
     )
 except ModuleNotFoundError:
     try:  # pragma: no cover - backward compatibility
@@ -69,11 +70,19 @@ except ModuleNotFoundError:
             wallet_activity_callback,
             get_shared_tracker,
             set_notifier,
-    )
+            set_etherscan_lookup_enabled as set_tracker_etherscan_enabled,
+        )
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "wallet_tracker module not found; ensure wallet_tracker.py is present"
         ) from exc
+
+# Fallback no-op to preserve compatibility if tracker module lacks the helper.
+try:
+    set_tracker_etherscan_enabled
+except NameError:  # pragma: no cover - defensive
+    def set_tracker_etherscan_enabled(enabled: bool, reason: str = "") -> None:
+        return None
 
 # On Windows the default ProactorEventLoop can emit "Event loop is closed"
 # messages when asyncio.run() is used repeatedly. Switching to the
@@ -103,9 +112,9 @@ ALCHEMY_URL = os.getenv(
 )
 
 TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", "7948485219:AAEVHATEtxcI38Zxfa_6EC0WOGBhYV6xKMA"
+    "TELEGRAM_BOT_TOKEN", "8274484247:AAEoiTgXb6xLDmmSU3yLbqQaMOW81v541pY"
 )
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4895948667")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4934038934")
 # Pre-compute base URL to avoid repetition
 TELEGRAM_BASE_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
@@ -571,10 +580,13 @@ DEXSCREENER_PAIR_TTL = 10  # short TTL for pair endpoint
 
 
 async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return False
     api_key = get_next_etherscan_key()
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -601,6 +613,8 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
                 name = info.get("contractName", "").lower()
                 if any(k in name for k in ["lock", "locker", "unicrypt", "team", "pink"]):
                     return True
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"lock lookup failed: {e}")
     except Exception as e:
         logger.debug(f"etherscan lock check error: {e}")
     return False
@@ -705,10 +719,13 @@ def fetch_dexscreener_data(token_addr: str, pair_addr: str) -> Optional[dict]:
 
 
 async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: int = 600) -> bool:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return False
     api_key = get_next_etherscan_key()
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -729,6 +746,8 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
                 ts = int(tx.get("timeStamp", "0"))
                 if now_ts - ts <= timeframe_sec:
                     return True
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"liquidity removal lookup failed: {e}")
     except Exception as e:
         logger.debug(f"Etherscan removal check error: {e}")
     return False
@@ -747,7 +766,7 @@ _raw_keys = os.getenv(
     "ETHERSCAN_API_KEYS",
     os.getenv(
         "ETHERSCAN_API_KEY",
-        "ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW,DE19NIK8XYRV8BMZRYN6A5I8WNHZB3351Y,QY8285FMHAY16N9Z721SVR27ZEP13DZS5",
+        "HG9G9P667CSWMBM63XUWQQK4QERI49G2MI,DE19NIK8XYRV8BMZRYN6A5I8WNHZB3351Y,ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW",
     ),
 )
 ETHERSCAN_API_KEY_LIST = [k.strip() for k in _raw_keys.split(",") if k.strip()]
@@ -761,7 +780,32 @@ def get_next_etherscan_key() -> str:
     ETHERSCAN_API_INDEX = (ETHERSCAN_API_INDEX + 1) % len(ETHERSCAN_API_KEY_LIST)
     return key
 
-ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off"}
+
+
+ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
+ETHERSCAN_DISABLED_REASON: Optional[str] = None
+
+
+def disable_etherscan_lookups(reason: str) -> None:
+    global ETHERSCAN_LOOKUPS_ENABLED, ETHERSCAN_DISABLED_REASON
+    if ETHERSCAN_LOOKUPS_ENABLED:
+        ETHERSCAN_LOOKUPS_ENABLED = False
+        ETHERSCAN_DISABLED_REASON = reason
+        logger.warning("Disabling Etherscan lookups: %s", reason)
+        try:
+            set_tracker_etherscan_enabled(False, reason)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to propagate Etherscan disable to tracker", exc_info=True)
+
 
 # Initialize wallet tracker now that helper functions are defined
 wallet_tracker = get_shared_tracker(w3_read, get_next_etherscan_key)
@@ -783,14 +827,25 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
         ``compilerVersion``: compiler version string
         ``contractName``: contract name
     """
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+        }
     token_addr = token_addr.lower()
-    url = (
-        f"{ETHERSCAN_API_URL}?module=contract&action=getsourcecode"
-        f"&address={token_addr}&apikey={get_next_etherscan_key()}"
-    )
+    api_key = get_next_etherscan_key()
+    params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
+        "module": "contract",
+        "action": "getsourcecode",
+        "address": token_addr,
+        "apikey": api_key,
+    }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=20) as r:
+            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         status = j.get("status")
         result = j.get("result", [])
@@ -841,6 +896,14 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
                 "contractName": "",
             }
 
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"source fetch failed: {e}")
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+        }
     except Exception as e:
         logger.warning(f"fetch_contract_source_etherscan error: {e}")
         return {
@@ -856,18 +919,25 @@ def fetch_contract_source_etherscan(token_addr: str) -> dict:
 
 def get_contract_creator(token_addr: str) -> Optional[str]:
     """Return the deployer address via Etherscan as a fallback."""
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return None
     api_key = get_next_etherscan_key()
     if not api_key:
         return None
-    url = (
-        f"{ETHERSCAN_API_URL}?module=contract&action=getcontractcreation"
-        f"&contractaddresses={token_addr}&apikey={api_key}"
-    )
+    params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
+        "module": "contract",
+        "action": "getcontractcreation",
+        "contractaddresses": token_addr,
+        "apikey": api_key,
+    }
     try:
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
             return data["result"][0].get("contractCreator")
+    except requests.RequestException as exc:
+        disable_etherscan_lookups(f"contract creator lookup failed: {exc}")
     except Exception:
         logger.debug("contract creator fetch failed", exc_info=True)
     return None
@@ -925,10 +995,13 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
     """Return True if suspicious owner transactions detected recently."""
     if not owner_addr:
         return False
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return False
     api_key = get_next_etherscan_key()
     if not api_key:
         return False
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "address": owner_addr,
@@ -955,6 +1028,9 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
             val = int(tx.get("value", "0"))
             if total_supply and val > total_supply * 0.05:
                 return True
+        return False
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"owner activity lookup failed: {e}")
         return False
     except Exception as e:
         logger.debug(f"owner activity check error: {e}")
@@ -1200,9 +1276,12 @@ def detect_proxy_implementation(addr: str) -> Optional[str]:
 
 
 async def _check_renounced_by_event_async(addr: str) -> bool:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return False
     topic0 = Web3.keccak(text="OwnershipTransferred(address,address)").hex()
     zero_topic = "0x" + "0" * 64
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "logs",
         "action": "getLogs",
         "fromBlock": "0",
@@ -1218,6 +1297,8 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
                 j = await r.json()
         if j.get("status") == "1" and j.get("result"):
             return True
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"renounce lookup failed: {e}")
     except Exception:
         pass
     return False
@@ -1381,10 +1462,13 @@ def advanced_contract_check(token_addr: str) -> dict:
 ###########################################################
 
 async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return []
     api_key = get_next_etherscan_key()
     if not api_key:
         return []
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "token",
         "action": "tokenholderlist",
         "contractaddress": token_addr,
@@ -1401,6 +1485,9 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
             if isinstance(result, list):
                 return result
         return []
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
+        return []
     except Exception as e:
         logger.debug(f"holder distribution error: {e}")
         return []
@@ -1411,6 +1498,12 @@ def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
 
 
 async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> dict:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return {
+            "uniqueBuyers": 0,
+            "uniqueSellers": 0,
+            "smartMoneyCount": 0,
+        }
     api_key = get_next_etherscan_key()
     metrics = {
         "uniqueBuyers": 0,
@@ -1420,6 +1513,7 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
     if not api_key:
         return metrics
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -1448,6 +1542,9 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
         metrics["uniqueBuyers"] = len(buyers)
         metrics["uniqueSellers"] = len(sellers)
         return metrics
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"transfer history lookup failed: {e}")
+        return metrics
     except Exception as e:
         logger.debug(f"transfer history error: {e}")
         return metrics
@@ -1458,11 +1555,14 @@ def analyze_transfer_history(token_addr: str, limit: int = 100) -> dict:
 
 
 async def _detect_private_sale_async(token_addr: str) -> dict:
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return {"hasPresale": False, "largeTransfers": []}
     api_key = get_next_etherscan_key()
     result = {"hasPresale": False, "largeTransfers": []}
     if not api_key:
         return result
     params = {
+        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -1489,6 +1589,9 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
             if total_supply and val > total_supply * 0.02:
                 result["hasPresale"] = True
                 result["largeTransfers"].append(tx.get("to"))
+        return result
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"private sale lookup failed: {e}")
         return result
     except Exception as e:
         logger.debug(f"private sale detect error: {e}")
