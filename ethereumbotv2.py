@@ -4194,8 +4194,6 @@ def save_last_block(bn: int, fname: str):
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
 
-    ensure_etherscan_connectivity()
-
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
         last_block_v2 = safe_block_number(False)
