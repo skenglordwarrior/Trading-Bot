@@ -83,7 +83,11 @@ except (ModuleNotFoundError, ImportError, AttributeError):
         ) from exc
 
 # Shared configuration helpers
-from etherscan_config import load_etherscan_keys, make_key_getter
+from etherscan_config import (
+    load_etherscan_base_urls,
+    load_etherscan_keys,
+    make_key_getter,
+)
 
 # Fallback no-op to preserve compatibility if tracker module lacks the helper.
 try:
@@ -1105,7 +1109,11 @@ _etherscan_key_getter = make_key_getter(ETHERSCAN_API_KEY_LIST)
 def get_next_etherscan_key() -> str:
     return _etherscan_key_getter()
 
-ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+
+ETHERSCAN_API_URL_CANDIDATES = load_etherscan_base_urls()
+ETHERSCAN_API_URL = (
+    ETHERSCAN_API_URL_CANDIDATES[0] if ETHERSCAN_API_URL_CANDIDATES else ""
+)
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
 
@@ -1130,6 +1138,104 @@ def disable_etherscan_lookups(reason: str) -> None:
             set_tracker_etherscan_enabled(False, reason)
         except Exception:  # pragma: no cover - defensive
             logger.debug("Failed to propagate Etherscan disable to tracker", exc_info=True)
+
+
+def ensure_etherscan_connectivity() -> None:
+    """Validate Etherscan API keys and select a reachable endpoint."""
+
+    global ETHERSCAN_API_URL
+
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return
+
+    if not ETHERSCAN_API_URL_CANDIDATES:
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "No Etherscan API URLs configured",
+        )
+        disable_etherscan_lookups("No Etherscan API URLs configured")
+        return
+
+    if not any(key.strip() for key in ETHERSCAN_API_KEY_LIST):
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "No Etherscan API keys configured",
+        )
+        disable_etherscan_lookups("No Etherscan API keys configured")
+        return
+
+    async def _select_endpoint():
+        params = {
+            "module": "proxy",
+            "action": "eth_blockNumber",
+            "apikey": get_next_etherscan_key(),
+        }
+        attempts: List[Tuple[str, str]] = []
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for url in ETHERSCAN_API_URL_CANDIDATES:
+                start = time.perf_counter()
+                try:
+                    async with session.get(url, params=params) as resp:
+                        resp.raise_for_status()
+                        await resp.text()
+                        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                        log_event(
+                            logging.INFO,
+                            "etherscan_endpoint",
+                            "Verified Etherscan endpoint",
+                            context={"url": url},
+                            latency_ms=latency_ms,
+                        )
+                        return url, attempts
+                except Exception as exc:  # pragma: no cover - network errors
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    attempts.append((url, str(exc)))
+                    log_event(
+                        logging.WARNING,
+                        "etherscan_endpoint",
+                        "Failed to reach Etherscan endpoint",
+                        error=str(exc),
+                        context={"url": url},
+                        latency_ms=latency_ms,
+                    )
+        return None, attempts
+
+    try:
+        selected_url, failures = asyncio.run(_select_endpoint())
+    except Exception as exc:  # pragma: no cover - asyncio misconfiguration
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "Etherscan endpoint verification failed",
+            error=str(exc),
+        )
+        disable_etherscan_lookups(f"Etherscan verification failed: {exc}")
+        return
+
+    if selected_url:
+        previous_primary = ETHERSCAN_API_URL_CANDIDATES[0]
+        ETHERSCAN_API_URL = selected_url
+        if selected_url != previous_primary:
+            log_event(
+                logging.INFO,
+                "etherscan_endpoint",
+                "Using fallback Etherscan endpoint",
+                context={"url": selected_url},
+            )
+        return
+
+    for url, error in failures:
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "Etherscan endpoint unreachable",
+            error=error,
+            context={"url": url},
+        )
+    disable_etherscan_lookups("All configured Etherscan endpoints unreachable")
 
 
 # Initialize wallet tracker now that helper functions are defined
