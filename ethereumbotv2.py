@@ -49,6 +49,7 @@ from concurrent.futures import Future
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
+import urllib.parse
 
 # Add the script directory to sys.path for relative imports
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -912,7 +913,6 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -1063,7 +1063,6 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -1268,7 +1267,6 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
     token_addr = token_addr.lower()
     api_key = get_next_etherscan_key()
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
@@ -1356,7 +1354,6 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
     if not api_key:
         return None
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "contract",
         "action": "getcontractcreation",
         "contractaddresses": token_addr,
@@ -1432,7 +1429,6 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "address": owner_addr,
@@ -1710,7 +1706,6 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
     topic0 = Web3.keccak(text="OwnershipTransferred(address,address)").hex()
     zero_topic = "0x" + "0" * 64
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "logs",
         "action": "getLogs",
         "fromBlock": "0",
@@ -1897,7 +1892,6 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
     if not api_key:
         return []
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "token",
         "action": "tokenholderlist",
         "contractaddress": token_addr,
@@ -1940,7 +1934,6 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
     if not api_key:
         return metrics
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -1987,7 +1980,6 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
     if not api_key:
         return result
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -3832,6 +3824,17 @@ def recheck_logic_detail(
 ###########################################################
 
 pending_rechecks: Dict[str, dict] = {}
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
 def _collect_queue_depth() -> dict:
