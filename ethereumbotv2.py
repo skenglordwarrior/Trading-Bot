@@ -3845,6 +3845,17 @@ def _collect_queue_depth() -> dict:
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
 def queue_recheck(pair_addr: str, token0: str, token1: str):
     if pair_addr not in pending_rechecks:
         pending_rechecks[pair_addr] = {
@@ -4193,8 +4204,6 @@ def save_last_block(bn: int, fname: str):
 
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
-
-    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
