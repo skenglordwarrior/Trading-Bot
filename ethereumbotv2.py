@@ -103,6 +103,14 @@ except NameError:  # pragma: no cover - defensive
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+
+def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
+    """Return an ``aiohttp`` session that honours environment proxy settings."""
+
+    if "trust_env" not in kwargs:
+        kwargs["trust_env"] = True
+    return aiohttp.ClientSession(**kwargs)
+
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
 ###########################################################
@@ -728,7 +736,7 @@ async def async_send_telegram_message(text: str, parse_mode: str = "HTML") -> bo
         "disable_web_page_preview": True,
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
                 payload = await resp.json()
                 return bool(payload.get("ok"))
@@ -859,7 +867,7 @@ def check_honeypot_is(
             params["pair"] = pair_addr
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(HONEYPOT_API_URL, params=params, timeout=15) as resp:
                     j = await resp.json()
             hp = j.get("honeypotResult", {}).get("isHoneypot")
@@ -872,7 +880,7 @@ def check_honeypot_is(
 
         try:
             url = f"https://honeypot.is/ethereum?address={token_addr}"
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(url, timeout=15) as r:
                     text = await r.text()
             low = text.lower()
@@ -1273,7 +1281,7 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         status = j.get("status")
@@ -1472,7 +1480,7 @@ async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
         f"{token_addr}"
     )
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
                 data = await resp.json()
         entry = data.get("result", {}).get(token_addr.lower())
@@ -1716,7 +1724,7 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
         "apikey": get_next_etherscan_key(),
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         if j.get("status") == "1" and j.get("result"):
@@ -3824,6 +3832,17 @@ def recheck_logic_detail(
 ###########################################################
 
 pending_rechecks: Dict[str, dict] = {}
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
 def _collect_queue_depth() -> dict:
