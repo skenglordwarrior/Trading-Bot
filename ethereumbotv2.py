@@ -1109,25 +1109,11 @@ def get_next_etherscan_key() -> str:
     return _etherscan_key_getter()
 
 
-ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
-
-
-def _with_chainid(url: str) -> str:
-    if not url:
-        return url
-    parsed = urllib.parse.urlparse(url)
-    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-    if query.get("chainid") == ETHERSCAN_CHAIN_ID:
-        return url
-    query["chainid"] = ETHERSCAN_CHAIN_ID
-    new_query = urllib.parse.urlencode(query)
-    return urllib.parse.urlunparse(parsed._replace(query=new_query))
-
-
-ETHERSCAN_API_URL_CANDIDATES = [_with_chainid(url) for url in load_etherscan_base_urls()]
+ETHERSCAN_API_URL_CANDIDATES = load_etherscan_base_urls()
 ETHERSCAN_API_URL = (
     ETHERSCAN_API_URL_CANDIDATES[0] if ETHERSCAN_API_URL_CANDIDATES else ""
 )
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -3851,6 +3837,39 @@ def _collect_queue_depth() -> dict:
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
 def queue_recheck(pair_addr: str, token0: str, token1: str):
     if pair_addr not in pending_rechecks:
         pending_rechecks[pair_addr] = {
@@ -4199,8 +4218,6 @@ def save_last_block(bn: int, fname: str):
 
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
-
-    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
