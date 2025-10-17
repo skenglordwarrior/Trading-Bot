@@ -119,6 +119,14 @@ def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
         kwargs["trust_env"] = True
     return aiohttp.ClientSession(**kwargs)
 
+
+def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
+    """Return an ``aiohttp`` session that honours environment proxy settings."""
+
+    if "trust_env" not in kwargs:
+        kwargs["trust_env"] = True
+    return aiohttp.ClientSession(**kwargs)
+
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
 ###########################################################
@@ -3840,6 +3848,17 @@ def recheck_logic_detail(
 ###########################################################
 
 pending_rechecks: Dict[str, dict] = {}
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
 def _collect_queue_depth() -> dict:
