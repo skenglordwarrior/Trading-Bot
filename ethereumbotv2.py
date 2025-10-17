@@ -111,6 +111,22 @@ def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
         kwargs["trust_env"] = True
     return aiohttp.ClientSession(**kwargs)
 
+
+def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
+    """Return an ``aiohttp`` session that honours environment proxy settings."""
+
+    if "trust_env" not in kwargs:
+        kwargs["trust_env"] = True
+    return aiohttp.ClientSession(**kwargs)
+
+
+def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
+    """Return an ``aiohttp`` session that honours environment proxy settings."""
+
+    if "trust_env" not in kwargs:
+        kwargs["trust_env"] = True
+    return aiohttp.ClientSession(**kwargs)
+
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
 ###########################################################
@@ -545,7 +561,7 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
         if tracker_etherscan_get_async is not None:
             result = await tracker_etherscan_get_async(params, timeout)
         else:
-            async with create_aiohttp_session() as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.get(
                     ETHERSCAN_API_URL, params=params, timeout=timeout
                 ) as resp:
@@ -966,7 +982,7 @@ async def _fetch_dexscreener_data_async(token_addr: str, pair_addr: str) -> Opti
         if cached and now - cached[0] < DEXSCREENER_CACHE_TTL:
             jdata = cached[1]
         else:
-            async with create_aiohttp_session() as session:
+            async with aiohttp.ClientSession() as session:
                 try:
                     async with session.get(
                         f"{DEXSCREENER_SEARCH_URL}?q={token_addr}",
@@ -994,7 +1010,7 @@ async def _fetch_dexscreener_data_async(token_addr: str, pair_addr: str) -> Opti
             if cached_pair and now - cached_pair[0] < DEXSCREENER_PAIR_TTL:
                 pdata = cached_pair[1]
             else:
-                async with create_aiohttp_session() as session:
+                async with aiohttp.ClientSession() as session:
                     try:
                         async with session.get(
                             f"{DEXSCREENER_PAIR_URL}/{pair_addr}",
@@ -1080,7 +1096,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
         "apikey": api_key,
     }
     try:
-        async with create_aiohttp_session() as session:
+        async with aiohttp.ClientSession() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
         metrics.record_api_call(error=False)
@@ -1117,25 +1133,11 @@ def get_next_etherscan_key() -> str:
     return _etherscan_key_getter()
 
 
-ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
-
-
-def _with_chainid(url: str) -> str:
-    if not url:
-        return url
-    parsed = urllib.parse.urlparse(url)
-    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-    if query.get("chainid") == ETHERSCAN_CHAIN_ID:
-        return url
-    query["chainid"] = ETHERSCAN_CHAIN_ID
-    new_query = urllib.parse.urlencode(query)
-    return urllib.parse.urlunparse(parsed._replace(query=new_query))
-
-
-ETHERSCAN_API_URL_CANDIDATES = [_with_chainid(url) for url in load_etherscan_base_urls()]
+ETHERSCAN_API_URL_CANDIDATES = load_etherscan_base_urls()
 ETHERSCAN_API_URL = (
     ETHERSCAN_API_URL_CANDIDATES[0] if ETHERSCAN_API_URL_CANDIDATES else ""
 )
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -1195,7 +1197,7 @@ def ensure_etherscan_connectivity() -> None:
         }
         attempts: List[Tuple[str, str]] = []
         timeout = aiohttp.ClientTimeout(total=10)
-        async with create_aiohttp_session(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for url in ETHERSCAN_API_URL_CANDIDATES:
                 start = time.perf_counter()
                 try:
@@ -3859,6 +3861,72 @@ def _collect_queue_depth() -> dict:
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
 def queue_recheck(pair_addr: str, token0: str, token1: str):
     if pair_addr not in pending_rechecks:
         pending_rechecks[pair_addr] = {
@@ -4207,8 +4275,6 @@ def save_last_block(bn: int, fname: str):
 
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
-
-    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
