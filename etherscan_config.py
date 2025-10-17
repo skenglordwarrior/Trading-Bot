@@ -20,6 +20,11 @@ _DEFAULT_ETHERSCAN_KEYS = (
     "ADTS5TR8AXUNT8KSJYQXM6GM932SRYRDTW"
 )
 
+_DEFAULT_ETHERSCAN_URLS = (
+    "https://api.etherscan.io/v2/api",
+    "https://api.etherscan.io/api",
+)
+
 
 def _parse_keys(raw: str) -> List[str]:
     """Split a comma-separated string into a list of API keys."""
@@ -44,6 +49,18 @@ def load_etherscan_keys(overrides: Sequence[str] | None = None) -> List[str]:
     if not raw:
         raw = os.getenv("ETHERSCAN_API_KEY", _DEFAULT_ETHERSCAN_KEYS)
     return _parse_keys(raw or "")
+
+
+def load_etherscan_base_urls(overrides: Sequence[str] | None = None) -> List[str]:
+    """Return the configured Etherscan API base URLs in priority order."""
+
+    if overrides:
+        return _parse_keys(",".join(overrides))
+
+    raw = os.getenv("ETHERSCAN_API_URLS")
+    if raw:
+        return _parse_keys(raw)
+    return list(_DEFAULT_ETHERSCAN_URLS)
 
 
 def make_key_rotator(keys: Sequence[str]) -> Iterator[str]:
@@ -73,6 +90,7 @@ def make_key_getter(keys: Sequence[str]):
 
 __all__ = [
     "load_etherscan_keys",
+    "load_etherscan_base_urls",
     "make_key_getter",
     "make_key_rotator",
 ]
