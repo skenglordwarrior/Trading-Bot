@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     parser = None
 import contextlib
 import io
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Union
 from openpyxl import Workbook, load_workbook
 import traceback
 import requests
@@ -971,113 +971,127 @@ def check_liquidity_locked_etherscan(pair_addr: str) -> bool:
     return asyncio.run(_check_liquidity_locked_etherscan_async(pair_addr))
 
 
-async def _fetch_dexscreener_data_async(token_addr: str, pair_addr: str) -> Optional[dict]:
-    try:
-        now = time.time()
-        pair_info = None
+async def _fetch_dexscreener_data_async(
+    token_addr: str, pair_addr: str
+) -> Tuple[Optional[dict], Optional[str]]:
+    now = time.time()
+    pair_info = None
+    reason: Optional[str] = None
 
-        # --- token-based lookup (preferred) ---
-        key = token_addr.lower()
-        cached = DEXSCREENER_CACHE.get(key)
-        if cached and now - cached[0] < DEXSCREENER_CACHE_TTL:
-            jdata = cached[1]
+    async def _get_json(url: str) -> Tuple[Optional[dict], Optional[str]]:
+        try:
+            async with create_aiohttp_session() as session:
+                async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            metrics.record_api_call(error=False)
+            return data, None
+        except aiohttp.ClientResponseError as exc:
+            metrics.record_api_call(error=True)
+            if exc.status == 404:
+                return None, "not_listed"
+            if exc.status == 429:
+                return None, "rate_limited"
+            return None, f"http_{exc.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            metrics.record_api_call(error=True)
+            return None, "network_error"
+        except Exception as exc:  # pragma: no cover - unexpected parser issues
+            metrics.record_api_call(error=True)
+            logger.debug(f"dexscreener fetch error: {exc}")
+            return None, "unexpected_error"
+
+    # --- token-based lookup (preferred) ---
+    key = token_addr.lower()
+    cached = DEXSCREENER_CACHE.get(key)
+    if cached and now - cached[0] < DEXSCREENER_CACHE_TTL:
+        jdata = cached[1]
+        reason = None
+    else:
+        url = f"{DEXSCREENER_SEARCH_URL}?q={token_addr}"
+        jdata, reason = await _get_json(url)
+        if jdata:
+            DEXSCREENER_CACHE[key] = (now, jdata)
+
+    pairs = jdata.get("pairs", []) if jdata else []
+    for p in pairs:
+        if p.get("pairAddress", "").lower() == pair_addr.lower():
+            pair_info = p
+            break
+
+    # --- fallback to pair endpoint when token search fails ---
+    if not pair_info and reason != "rate_limited":
+        pkey = f"pair:{pair_addr.lower()}"
+        cached_pair = DEXSCREENER_CACHE.get(pkey)
+        if cached_pair and now - cached_pair[0] < DEXSCREENER_PAIR_TTL:
+            pdata = cached_pair[1]
+            pair_reason = None
         else:
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.get(
-                        f"{DEXSCREENER_SEARCH_URL}?q={token_addr}",
-                        timeout=FETCH_TIMEOUT,
-                    ) as resp:
-                        resp.raise_for_status()
-                        jdata = await resp.json()
-                    metrics.record_api_call(error=False)
-                except Exception:
-                    metrics.record_api_call(error=True)
-                    raise
-            if jdata:
-                DEXSCREENER_CACHE[key] = (now, jdata)
+            url = f"{DEXSCREENER_PAIR_URL}/{pair_addr}"
+            pdata, pair_reason = await _get_json(url)
+            if pdata:
+                DEXSCREENER_CACHE[pkey] = (now, pdata)
+            reason = pair_reason or reason
 
-        pairs = jdata.get("pairs", []) if jdata else []
-        for p in pairs:
-            if p.get("pairAddress", "").lower() == pair_addr.lower():
-                pair_info = p
-                break
+        plist = pdata.get("pairs", []) if pdata else []
+        if plist:
+            pair_info = plist[0]
+        elif not reason:
+            reason = "not_listed"
 
-        # --- fallback to pair endpoint when token search fails ---
-        if not pair_info:
-            pkey = f"pair:{pair_addr.lower()}"
-            cached_pair = DEXSCREENER_CACHE.get(pkey)
-            if cached_pair and now - cached_pair[0] < DEXSCREENER_PAIR_TTL:
-                pdata = cached_pair[1]
-            else:
-                async with aiohttp.ClientSession() as session:
-                    try:
-                        async with session.get(
-                            f"{DEXSCREENER_PAIR_URL}/{pair_addr}",
-                            timeout=FETCH_TIMEOUT,
-                        ) as resp:
-                            resp.raise_for_status()
-                            pdata = await resp.json()
-                        metrics.record_api_call(error=False)
-                    except Exception:
-                        metrics.record_api_call(error=True)
-                        raise
-                if pdata:
-                    DEXSCREENER_CACHE[pkey] = (now, pdata)
+    if not pair_info:
+        return None, reason or "not_listed"
 
-            plist = pdata.get("pairs", []) if pdata else []
-            if plist:
-                pair_info = plist[0]
-            else:
-                return None
+    price_usd = float(pair_info.get("priceUsd", 0) or 0)
+    liq_usd = float(pair_info.get("liquidity", {}).get("usd", 0) or 0)
+    vol_24h = float(pair_info.get("volume", {}).get("h24", 0) or 0)
+    fdv = float(pair_info.get("fdv", 0) or 0)
+    mc = float(pair_info.get("marketCap", 0) or 0)
 
-        price_usd = float(pair_info.get("priceUsd", 0) or 0)
-        liq_usd = float(pair_info.get("liquidity", {}).get("usd", 0) or 0)
-        vol_24h = float(pair_info.get("volume", {}).get("h24", 0) or 0)
-        fdv = float(pair_info.get("fdv", 0) or 0)
-        mc = float(pair_info.get("marketCap", 0) or 0)
+    tx24 = pair_info.get("txns", {}).get("h24", {})
+    buys_24 = int(tx24.get("buys", 0))
+    sells_24 = int(tx24.get("sells", 0))
 
-        tx24 = pair_info.get("txns", {}).get("h24", {})
-        buys_24 = int(tx24.get("buys", 0))
-        sells_24 = int(tx24.get("sells", 0))
+    base_token = pair_info.get("baseToken", {})
+    base_name = base_token.get("name", "").strip()
+    info_section = pair_info.get("info", {})
+    logo_url = info_section.get("imageUrl", "")
+    websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
+    socials = [s.get("url") for s in info_section.get("socials", []) if s.get("url")]
+    # Determine locked liquidity via DexScreener label and Etherscan data
+    locked = False
+    labels = pair_info.get("labels", [])
+    if "locked" in labels:
+        locked = True
+    else:
+        locked = await _check_liquidity_locked_etherscan_async(pair_addr)
 
-        base_token = pair_info.get("baseToken", {})
-        base_name = base_token.get("name", "").strip()
-        info_section = pair_info.get("info", {})
-        logo_url = info_section.get("imageUrl", "")
-        websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
-        socials = [s.get("url") for s in info_section.get("socials", []) if s.get("url")]
-        # Determine locked liquidity via DexScreener label and Etherscan data
-        locked = False
-        labels = pair_info.get("labels", [])
-        if "locked" in labels:
-            locked = True
-        else:
-            locked = await _check_liquidity_locked_etherscan_async(pair_addr)
+    # Detect paid promotions/trending on Dex platforms
+    dex_paid = any(lbl.lower() in {"promoted", "boosted", "paid"} for lbl in labels)
 
-        # Detect paid promotions/trending on Dex platforms
-        dex_paid = any(lbl.lower() in {"promoted", "boosted", "paid"} for lbl in labels)
+    return {
+        "priceUsd": price_usd,
+        "liquidityUsd": liq_usd,
+        "volume24h": vol_24h,
+        "fdv": fdv,
+        "marketCap": mc,
+        "buys": buys_24,
+        "sells": sells_24,
+        "baseTokenName": base_name,
+        "baseTokenLogo": logo_url,
+        "socialLinks": websites + socials,
+        "lockedLiquidity": locked,
+        "dexPaid": dex_paid,
+    }, None
 
-        return {
-            "priceUsd": price_usd,
-            "liquidityUsd": liq_usd,
-            "volume24h": vol_24h,
-            "fdv": fdv,
-            "marketCap": mc,
-            "buys": buys_24,
-            "sells": sells_24,
-            "baseTokenName": base_name,
-            "baseTokenLogo": logo_url,
-            "socialLinks": websites + socials,
-            "lockedLiquidity": locked,
-            "dexPaid": dex_paid,
-        }
-    except Exception as e:
-        logger.debug(f"fetch_dexscreener_data error: {e}")
-        return None
 
-def fetch_dexscreener_data(token_addr: str, pair_addr: str) -> Optional[dict]:
-    return asyncio.run(_fetch_dexscreener_data_async(token_addr, pair_addr))
+def fetch_dexscreener_data(
+    token_addr: str, pair_addr: str, *, with_reason: bool = False
+) -> Union[Optional[dict], Tuple[Optional[dict], Optional[str]]]:
+    data, reason = asyncio.run(_fetch_dexscreener_data_async(token_addr, pair_addr))
+    if with_reason:
+        return data, reason
+    return data
 
 
 async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: int = 600) -> bool:
@@ -3102,10 +3116,23 @@ def check_pair_criteria(
     main_token = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
 
     # 1) fetch DexScreener first to filter out unlisted or tiny pairs
-    dex_data = fetch_dexscreener_data(main_token, pair_addr)
+    dex_data, dex_reason = fetch_dexscreener_data(
+        main_token, pair_addr, with_reason=True
+    )
     if not dex_data:
-        logger.warning(f"[DexMissing] {pair_addr} missing DexScreener data")
-        return (0, total_checks, {"dexscreener_missing": True})
+        reason = dex_reason or "unknown"
+        logger.warning(
+            f"[DexMissing] {pair_addr} missing DexScreener data ({reason})"
+        )
+        should_requeue = reason not in {"not_listed"}
+        extra = {
+            "dexscreener_missing": True,
+            "dexscreener_reason": reason,
+            "should_requeue": should_requeue,
+        }
+        if should_requeue:
+            extra["transient_failure"] = True
+        return (0, total_checks, extra)
     if dex_data["liquidityUsd"] <= 1:
         return (0, total_checks, {"tokenName": "Rugpull"})
     liq = dex_data["liquidityUsd"]
@@ -3959,6 +3986,18 @@ def handle_rechecks():
             passes, total, extra = recheck_logic_detail(
                 pair, data["token0"], data["token1"], attempt_num, False
             )
+            if isinstance(extra, dict) and extra.get("dexscreener_missing"):
+                dex_reason = extra.get("dexscreener_reason", "unknown")
+                if extra.get("should_requeue", True):
+                    logger.info(
+                        f"[Recheck] => {pair} DexScreener unavailable ({dex_reason}); will retry"
+                    )
+                else:
+                    logger.info(
+                        f"[Recheck] => removing {pair}, DexScreener unavailable ({dex_reason})"
+                    )
+                    rm_list.append(pair)
+                continue
             fail, reason = critical_verification_failure(extra)
             if fail:
                 logger.info(f"[Remove] {pair} removed: {reason}")
@@ -4011,12 +4050,17 @@ def handle_rechecks():
                     f"- {extra.get('tokenName','Unnamed')} => {passes}/{total} (Attempt #{attempt_num}) "
                     f"Verified={extra.get('contractCheckStatus')} Risk={extra.get('riskScore')}"
                 )
-                add_failed_recheck_message(line)
-                data["fail_count"] = data.get("fail_count", 0) + 1
-                if data["fail_count"] >= 3:
-                    logger.info(f"[Recheck] => removing {pair}, failed 3 times")
-                    rm_list.append(pair)
-                    continue
+                if not extra.get("transient_failure"):
+                    add_failed_recheck_message(line)
+                    data["fail_count"] = data.get("fail_count", 0) + 1
+                    if data["fail_count"] >= 3:
+                        logger.info(f"[Recheck] => removing {pair}, failed 3 times")
+                        rm_list.append(pair)
+                        continue
+                else:
+                    logger.info(
+                        f"[Recheck] => {pair} retry deferred due to transient issue"
+                    )
 
         # stop after 10 minutes of failures
         elapsed = now_ts - data.get("created", data["last_attempt"])
@@ -4059,16 +4103,31 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
         outcome_context.update({"passes": passes, "total": total})
         if extra.get("dexscreener_missing"):
-            status_message = "requeue_missing_dexscreener"
-            outcome_context["reason"] = status_message
-            log_event(
-                logging.INFO,
-                "requeue",
-                f"{paddr} missing DexScreener data",
-                pair=paddr,
-                context={"reason": status_message},
-            )
-            queue_recheck(paddr, token0, token1)
+            dex_reason = extra.get("dexscreener_reason", "unknown")
+            should_requeue = extra.get("should_requeue", True)
+            outcome_context["reason"] = dex_reason
+            if should_requeue:
+                status_message = "requeue_missing_dexscreener"
+                log_event(
+                    logging.INFO,
+                    "requeue",
+                    f"{paddr} missing DexScreener data",
+                    pair=paddr,
+                    context={
+                        "reason": status_message,
+                        "dex_reason": dex_reason,
+                    },
+                )
+                queue_recheck(paddr, token0, token1)
+            else:
+                status_message = "skip_missing_dexscreener"
+                log_event(
+                    logging.INFO,
+                    "skip_pair",
+                    f"{paddr} missing DexScreener data (not requeueing)",
+                    pair=paddr,
+                    context={"dex_reason": dex_reason},
+                )
             return
         if not isinstance(extra, dict):
             status_message = "invalid_extra"
