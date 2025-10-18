@@ -44,10 +44,12 @@ from eth_utils import to_checksum_address
 import asyncio
 import aiohttp
 import threading
+from collections import Counter, deque
 from concurrent.futures import Future
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
+import urllib.parse
 
 # Add the script directory to sys.path for relative imports
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -55,6 +57,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import wallet tracker with fallback for legacy filename
+tracker_etherscan_get_async = None
+
 try:
     from wallet_tracker import (
         SmartWalletTracker,
@@ -62,8 +66,9 @@ try:
         get_shared_tracker,
         set_notifier,
         set_etherscan_lookup_enabled as set_tracker_etherscan_enabled,
+        _etherscan_get_async as tracker_etherscan_get_async,
     )
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError, AttributeError):
     try:  # pragma: no cover - backward compatibility
         from wallet_tracker_system import (
             SmartWalletTracker,
@@ -71,6 +76,7 @@ except ModuleNotFoundError:
             get_shared_tracker,
             set_notifier,
             set_etherscan_lookup_enabled as set_tracker_etherscan_enabled,
+            _etherscan_get_async as tracker_etherscan_get_async,
         )
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -78,7 +84,11 @@ except ModuleNotFoundError:
         ) from exc
 
 # Shared configuration helpers
-from etherscan_config import load_etherscan_keys, make_key_getter
+from etherscan_config import (
+    load_etherscan_base_urls,
+    load_etherscan_keys,
+    make_key_getter,
+)
 
 # Fallback no-op to preserve compatibility if tracker module lacks the helper.
 try:
@@ -92,6 +102,14 @@ except NameError:  # pragma: no cover - defensive
 # Selector policy avoids those spurious warnings.
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
+    """Return an ``aiohttp`` session that honours environment proxy settings."""
+
+    if "trust_env" not in kwargs:
+        kwargs["trust_env"] = True
+    return aiohttp.ClientSession(**kwargs)
 
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
@@ -274,12 +292,196 @@ LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
 MAIN_LOOP_SLEEP = 2
 
+BOT_NAME = "advanced-crypto-bot"
+
+
+def _json_default(obj):
+    if isinstance(obj, (datetime,)):
+        return obj.isoformat()
+    return str(obj)
+
+
+class JsonFormatter(logging.Formatter):
+    """Formatter that emits structured JSON logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        message = record.getMessage()
+        payload = {
+            "timestamp": timestamp,
+            "level": record.levelname,
+            "bot": BOT_NAME,
+            "message": message,
+            "action": getattr(record, "action", None),
+            "pair": getattr(record, "pair", None),
+            "latency_ms": getattr(record, "latency_ms", None),
+            "error": getattr(record, "error", None),
+        }
+        if record.exc_info:
+            payload["error"] = self.formatException(record.exc_info)
+        if payload["error"] is None and record.levelno >= logging.ERROR:
+            payload["error"] = message
+        if "etherscan" in message.lower():
+            payload.setdefault("error_source", "etherscan")
+        context = getattr(record, "context", None)
+        if context:
+            payload["context"] = context
+        return json.dumps({k: v for k, v in payload.items() if v is not None}, default=_json_default)
+
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
 logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(asctime)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    handlers=[handler],
+    force=True,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("trading_bot")
+
+
+def log_event(
+    level: int,
+    action: str,
+    message: str,
+    *,
+    pair: Optional[str] = None,
+    latency_ms: Optional[float] = None,
+    error: Optional[str] = None,
+    context: Optional[dict] = None,
+) -> None:
+    """Emit a structured log entry with standard metadata."""
+
+    logger.log(
+        level,
+        message,
+        extra={
+            "action": action,
+            "pair": pair,
+            "latency_ms": latency_ms,
+            "error": error,
+            "context": context,
+        },
+    )
+
+
+class MetricsCollector:
+    """Collect runtime metrics and emit periodic summaries."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.minute_counts: Counter = Counter()
+        self.rpc_latencies: List[float] = []
+        self.api_calls: int = 0
+        self.api_errors: int = 0
+        self.last_emit = time.time()
+        self.last_pair_seen = time.time()
+        self.error_events: deque = deque()
+        self.error_window = 300  # 5 minutes
+        self.error_threshold = 5
+        self.last_error_alert = 0.0
+        self.zero_throughput_window = 600  # 10 minutes
+        self.zero_throughput_alerted = False
+        self.queue_depth_callback = None
+        self.stop_event = threading.Event()
+        threading.Thread(target=self._emit_loop, daemon=True).start()
+
+    def increment(self, name: str, value: int = 1) -> None:
+        with self.lock:
+            self.minute_counts[name] += value
+            if name == "pairs_scanned":
+                self.last_pair_seen = time.time()
+                self.zero_throughput_alerted = False
+
+    def record_rpc_call(self, latency_ms: float, *, error: bool = False) -> None:
+        with self.lock:
+            self.rpc_latencies.append(latency_ms)
+            self.minute_counts["rpc_calls"] += 1
+            if error:
+                self.minute_counts["rpc_errors"] += 1
+
+    def record_api_call(self, *, error: bool) -> None:
+        with self.lock:
+            self.api_calls += 1
+            if error:
+                self.api_errors += 1
+
+    def record_exception(self) -> None:
+        with self.lock:
+            self.minute_counts["exceptions"] += 1
+            self.error_events.append(time.time())
+
+    def set_queue_depth_callback(self, callback) -> None:
+        self.queue_depth_callback = callback
+
+    def _emit_loop(self) -> None:
+        while not self.stop_event.wait(60):
+            self.emit_metrics()
+
+    def emit_metrics(self) -> None:
+        now = time.time()
+        with self.lock:
+            elapsed = max(now - self.last_emit, 1)
+            counts = dict(self.minute_counts)
+            self.minute_counts.clear()
+            rpc_latencies = list(self.rpc_latencies)
+            self.rpc_latencies.clear()
+            api_calls = self.api_calls
+            api_errors = self.api_errors
+            self.api_calls = 0
+            self.api_errors = 0
+            self.error_events = deque(
+                ts for ts in self.error_events if now - ts <= self.error_window
+            )
+            last_pair_seen = self.last_pair_seen
+            zero_alerted = self.zero_throughput_alerted
+            self.last_emit = now
+
+        avg_rpc_latency = (
+            sum(rpc_latencies) / len(rpc_latencies) if rpc_latencies else 0.0
+        )
+        pairs_per_min = counts.get("pairs_scanned", 0) / (elapsed / 60)
+        exceptions_per_min = counts.get("exceptions", 0) / (elapsed / 60)
+        api_error_rate = (api_errors / api_calls) if api_calls else 0.0
+        queue_depths = (
+            self.queue_depth_callback() if self.queue_depth_callback else {}
+        )
+
+        context = {
+            "pairs_scanned_per_min": round(pairs_per_min, 3),
+            "passes": counts.get("passes", 0),
+            "trades_placed": counts.get("trades_placed", 0),
+            "exceptions_per_min": round(exceptions_per_min, 3),
+            "queue_depth": queue_depths,
+            "api_error_rate": round(api_error_rate, 4),
+            "api_calls": api_calls,
+            "average_rpc_latency_ms": round(avg_rpc_latency, 2),
+        }
+
+        log_event(logging.INFO, "metrics", "runtime_metrics", context=context)
+
+        if (not zero_alerted) and (now - last_pair_seen >= self.zero_throughput_window):
+            self.zero_throughput_alerted = True
+            log_event(
+                logging.WARNING,
+                "alert",
+                "No pairs scanned in the last 10 minutes",
+                error="zero_throughput",
+            )
+
+        error_count = len(self.error_events)
+        if error_count >= self.error_threshold and now - self.last_error_alert >= self.error_window:
+            self.last_error_alert = now
+            log_event(
+                logging.WARNING,
+                "alert",
+                "Error spike detected",
+                error="error_spike",
+                context={"errors_last_5m": error_count},
+            )
+
+
+metrics = MetricsCollector()
 
 
 def init_excel(path: str):
@@ -334,30 +536,122 @@ if not w3_event_v3.is_connected():
 FETCH_TIMEOUT = 30
 
 
+async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> dict:
+    """Instrumented wrapper around the tracker Etherscan helper."""
+
+    start = time.perf_counter()
+    success = False
+    try:
+        if tracker_etherscan_get_async is not None:
+            result = await tracker_etherscan_get_async(params, timeout)
+        else:
+            async with create_aiohttp_session() as session:
+                async with session.get(
+                    ETHERSCAN_API_URL, params=params, timeout=timeout
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+        success = str(result.get("status")) == "1"
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        if not success:
+            log_event(
+                logging.WARNING,
+                "etherscan_api",
+                "Etherscan returned non-success status",
+                error=result.get("message"),
+                context={
+                    "module": params.get("module"),
+                    "action": params.get("action"),
+                },
+                latency_ms=latency_ms,
+            )
+        return result
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_exception()
+        log_event(
+            logging.ERROR,
+            "etherscan_api",
+            f"Etherscan request failed: {exc}",
+            error=str(exc),
+            context={
+                "module": params.get("module"),
+                "action": params.get("action"),
+            },
+            latency_ms=latency_ms,
+        )
+        raise
+    finally:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_api_call(error=not success)
+
+
 def safe_block_number(is_v3: bool = False) -> int:
     """Return latest block number with automatic provider fallback."""
     global w3_event, w3_event_v3
     provider = w3_event_v3 if is_v3 else w3_event
     backup_url = INFURA_URL_V3_BACKUP if is_v3 else INFURA_URL_BACKUP
+    network = "v3" if is_v3 else "v2"
+    start = time.perf_counter()
     try:
-        return provider.eth.block_number
+        block = provider.eth.block_number
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_rpc_call(latency_ms)
+        return block
     except Exception as e:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_rpc_call(latency_ms, error=True)
+        metrics.record_exception()
         msg = str(e).lower()
         if "429" in msg or "rate" in msg:
-            logger.warning(
-                f"Rate limit on {'v3' if is_v3 else 'v2'} provider => switching to backup"
+            log_event(
+                logging.WARNING,
+                "rpc_rate_limit",
+                f"Rate limit on {network} provider => switching to backup",
+                error=str(e),
+                context={"network": network},
+                latency_ms=latency_ms,
             )
             new_provider = Web3(HTTPProvider(backup_url))
             if is_v3:
                 w3_event_v3 = new_provider
             else:
                 w3_event = new_provider
+            backup_start = time.perf_counter()
             try:
-                return new_provider.eth.block_number
+                block = new_provider.eth.block_number
+                backup_latency = round(
+                    (time.perf_counter() - backup_start) * 1000, 2
+                )
+                metrics.record_rpc_call(backup_latency)
+                return block
             except Exception as e2:
-                logger.error(f"backup block number error: {e2}")
-        logger.error(f"block number error: {e}")
-        return w3_read.eth.block_number
+                backup_latency = round(
+                    (time.perf_counter() - backup_start) * 1000, 2
+                )
+                metrics.record_rpc_call(backup_latency, error=True)
+                metrics.record_exception()
+                log_event(
+                    logging.ERROR,
+                    "rpc_backup_failure",
+                    f"Backup block number error: {e2}",
+                    error=str(e2),
+                    context={"network": network},
+                    latency_ms=backup_latency,
+                )
+        log_event(
+            logging.ERROR,
+            "rpc_failure",
+            f"Block number error: {e}",
+            error=str(e),
+            context={"network": network},
+            latency_ms=latency_ms,
+        )
+        fallback_start = time.perf_counter()
+        block = w3_read.eth.block_number
+        fallback_latency = round((time.perf_counter() - fallback_start) * 1000, 2)
+        metrics.record_rpc_call(fallback_latency)
+        return block
 
 
 def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
@@ -365,24 +659,62 @@ def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
     global w3_event, w3_event_v3
     provider = w3_event_v3 if is_v3 else w3_event
     backup_url = INFURA_URL_V3_BACKUP if is_v3 else INFURA_URL_BACKUP
+    network = "v3" if is_v3 else "v2"
+    start = time.perf_counter()
     try:
-        return provider.eth.get_logs(filter_params)
+        logs = provider.eth.get_logs(filter_params)
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_rpc_call(latency_ms)
+        return logs
     except Exception as e:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        metrics.record_rpc_call(latency_ms, error=True)
+        metrics.record_exception()
         msg = str(e).lower()
         if "429" in msg or "rate" in msg:
-            logger.warning(
-                f"Rate limit on {'v3' if is_v3 else 'v2'} get_logs => switching to backup"
+            log_event(
+                logging.WARNING,
+                "rpc_rate_limit",
+                f"Rate limit on {network} get_logs => switching to backup",
+                error=str(e),
+                context={"network": network},
+                latency_ms=latency_ms,
             )
             new_provider = Web3(HTTPProvider(backup_url))
             if is_v3:
                 w3_event_v3 = new_provider
             else:
                 w3_event = new_provider
+            backup_start = time.perf_counter()
             try:
-                return new_provider.eth.get_logs(filter_params)
+                logs = new_provider.eth.get_logs(filter_params)
+                backup_latency = round(
+                    (time.perf_counter() - backup_start) * 1000, 2
+                )
+                metrics.record_rpc_call(backup_latency)
+                return logs
             except Exception as e2:
-                logger.error(f"backup get_logs error: {e2}")
-        logger.error(f"get_logs {'v3' if is_v3 else 'v2'} error: {e}")
+                backup_latency = round(
+                    (time.perf_counter() - backup_start) * 1000, 2
+                )
+                metrics.record_rpc_call(backup_latency, error=True)
+                metrics.record_exception()
+                log_event(
+                    logging.ERROR,
+                    "rpc_backup_failure",
+                    f"Backup get_logs error: {e2}",
+                    error=str(e2),
+                    context={"network": network},
+                    latency_ms=backup_latency,
+                )
+        log_event(
+            logging.ERROR,
+            "rpc_failure",
+            f"get_logs {network} error: {e}",
+            error=str(e),
+            context={"network": network},
+            latency_ms=latency_ms,
+        )
         time.sleep(5)
         return []
 
@@ -404,7 +736,7 @@ async def async_send_telegram_message(text: str, parse_mode: str = "HTML") -> bo
         "disable_web_page_preview": True,
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
                 payload = await resp.json()
                 return bool(payload.get("ok"))
@@ -535,7 +867,7 @@ def check_honeypot_is(
             params["pair"] = pair_addr
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(HONEYPOT_API_URL, params=params, timeout=15) as resp:
                     j = await resp.json()
             hp = j.get("honeypotResult", {}).get("isHoneypot")
@@ -548,7 +880,7 @@ def check_honeypot_is(
 
         try:
             url = f"https://honeypot.is/ethereum?address={token_addr}"
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(url, timeout=15) as r:
                     text = await r.text()
             low = text.lower()
@@ -589,7 +921,6 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -635,13 +966,20 @@ async def _fetch_dexscreener_data_async(token_addr: str, pair_addr: str) -> Opti
         if cached and now - cached[0] < DEXSCREENER_CACHE_TTL:
             jdata = cached[1]
         else:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{DEXSCREENER_SEARCH_URL}?q={token_addr}",
-                    timeout=FETCH_TIMEOUT,
-                ) as resp:
-                    jdata = await resp.json()
-            DEXSCREENER_CACHE[key] = (now, jdata)
+            async with create_aiohttp_session() as session:
+                try:
+                    async with session.get(
+                        f"{DEXSCREENER_SEARCH_URL}?q={token_addr}",
+                        timeout=FETCH_TIMEOUT,
+                    ) as resp:
+                        resp.raise_for_status()
+                        jdata = await resp.json()
+                    metrics.record_api_call(error=False)
+                except Exception:
+                    metrics.record_api_call(error=True)
+                    raise
+            if jdata:
+                DEXSCREENER_CACHE[key] = (now, jdata)
 
         pairs = jdata.get("pairs", []) if jdata else []
         for p in pairs:
@@ -656,13 +994,20 @@ async def _fetch_dexscreener_data_async(token_addr: str, pair_addr: str) -> Opti
             if cached_pair and now - cached_pair[0] < DEXSCREENER_PAIR_TTL:
                 pdata = cached_pair[1]
             else:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{DEXSCREENER_PAIR_URL}/{pair_addr}",
-                        timeout=FETCH_TIMEOUT,
-                    ) as resp:
-                        pdata = await resp.json()
-                DEXSCREENER_CACHE[pkey] = (now, pdata)
+                async with create_aiohttp_session() as session:
+                    try:
+                        async with session.get(
+                            f"{DEXSCREENER_PAIR_URL}/{pair_addr}",
+                            timeout=FETCH_TIMEOUT,
+                        ) as resp:
+                            resp.raise_for_status()
+                            pdata = await resp.json()
+                        metrics.record_api_call(error=False)
+                    except Exception:
+                        metrics.record_api_call(error=True)
+                        raise
+                if pdata:
+                    DEXSCREENER_CACHE[pkey] = (now, pdata)
 
             plist = pdata.get("pairs", []) if pdata else []
             if plist:
@@ -726,7 +1071,6 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": pair_addr,
@@ -736,9 +1080,10 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
+        metrics.record_api_call(error=False)
         if j.get("status") != "1":
             return False
         now_ts = time.time()
@@ -748,6 +1093,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
                 if now_ts - ts <= timeframe_sec:
                     return True
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        metrics.record_api_call(error=True)
         disable_etherscan_lookups(f"liquidity removal lookup failed: {e}")
     except Exception as e:
         logger.debug(f"Etherscan removal check error: {e}")
@@ -770,8 +1116,26 @@ _etherscan_key_getter = make_key_getter(ETHERSCAN_API_KEY_LIST)
 def get_next_etherscan_key() -> str:
     return _etherscan_key_getter()
 
-ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
+
+
+def _with_chainid(url: str) -> str:
+    if not url:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    if query.get("chainid") == ETHERSCAN_CHAIN_ID:
+        return url
+    query["chainid"] = ETHERSCAN_CHAIN_ID
+    new_query = urllib.parse.urlencode(query)
+    return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+
+ETHERSCAN_API_URL_CANDIDATES = [_with_chainid(url) for url in load_etherscan_base_urls()]
+ETHERSCAN_API_URL = (
+    ETHERSCAN_API_URL_CANDIDATES[0] if ETHERSCAN_API_URL_CANDIDATES else ""
+)
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -795,6 +1159,104 @@ def disable_etherscan_lookups(reason: str) -> None:
             set_tracker_etherscan_enabled(False, reason)
         except Exception:  # pragma: no cover - defensive
             logger.debug("Failed to propagate Etherscan disable to tracker", exc_info=True)
+
+
+def ensure_etherscan_connectivity() -> None:
+    """Validate Etherscan API keys and select a reachable endpoint."""
+
+    global ETHERSCAN_API_URL
+
+    if not ETHERSCAN_LOOKUPS_ENABLED:
+        return
+
+    if not ETHERSCAN_API_URL_CANDIDATES:
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "No Etherscan API URLs configured",
+        )
+        disable_etherscan_lookups("No Etherscan API URLs configured")
+        return
+
+    if not any(key.strip() for key in ETHERSCAN_API_KEY_LIST):
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "No Etherscan API keys configured",
+        )
+        disable_etherscan_lookups("No Etherscan API keys configured")
+        return
+
+    async def _select_endpoint():
+        params = {
+            "module": "proxy",
+            "action": "eth_blockNumber",
+            "apikey": get_next_etherscan_key(),
+        }
+        attempts: List[Tuple[str, str]] = []
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with create_aiohttp_session(timeout=timeout) as session:
+            for url in ETHERSCAN_API_URL_CANDIDATES:
+                start = time.perf_counter()
+                try:
+                    async with session.get(url, params=params) as resp:
+                        resp.raise_for_status()
+                        await resp.text()
+                        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                        log_event(
+                            logging.INFO,
+                            "etherscan_endpoint",
+                            "Verified Etherscan endpoint",
+                            context={"url": url},
+                            latency_ms=latency_ms,
+                        )
+                        return url, attempts
+                except Exception as exc:  # pragma: no cover - network errors
+                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+                    attempts.append((url, str(exc)))
+                    log_event(
+                        logging.WARNING,
+                        "etherscan_endpoint",
+                        "Failed to reach Etherscan endpoint",
+                        error=str(exc),
+                        context={"url": url},
+                        latency_ms=latency_ms,
+                    )
+        return None, attempts
+
+    try:
+        selected_url, failures = asyncio.run(_select_endpoint())
+    except Exception as exc:  # pragma: no cover - asyncio misconfiguration
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "Etherscan endpoint verification failed",
+            error=str(exc),
+        )
+        disable_etherscan_lookups(f"Etherscan verification failed: {exc}")
+        return
+
+    if selected_url:
+        previous_primary = ETHERSCAN_API_URL_CANDIDATES[0]
+        ETHERSCAN_API_URL = selected_url
+        if selected_url != previous_primary:
+            log_event(
+                logging.INFO,
+                "etherscan_endpoint",
+                "Using fallback Etherscan endpoint",
+                context={"url": selected_url},
+            )
+        return
+
+    for url, error in failures:
+        log_event(
+            logging.ERROR,
+            "etherscan_endpoint",
+            "Etherscan endpoint unreachable",
+            error=error,
+            context={"url": url},
+        )
+    disable_etherscan_lookups("All configured Etherscan endpoints unreachable")
 
 
 # Initialize wallet tracker now that helper functions are defined
@@ -827,14 +1289,13 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
     token_addr = token_addr.lower()
     api_key = get_next_etherscan_key()
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
         "apikey": api_key,
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         status = j.get("status")
@@ -915,7 +1376,6 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
     if not api_key:
         return None
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "contract",
         "action": "getcontractcreation",
         "contractaddresses": token_addr,
@@ -991,7 +1451,6 @@ async def _check_owner_wallet_activity_async(token_addr: str, owner_addr: str) -
     if not api_key:
         return False
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "address": owner_addr,
@@ -1035,7 +1494,7 @@ async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
         f"{token_addr}"
     )
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
                 data = await resp.json()
         entry = data.get("result", {}).get(token_addr.lower())
@@ -1269,7 +1728,6 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
     topic0 = Web3.keccak(text="OwnershipTransferred(address,address)").hex()
     zero_topic = "0x" + "0" * 64
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "logs",
         "action": "getLogs",
         "fromBlock": "0",
@@ -1280,7 +1738,7 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
         "apikey": get_next_etherscan_key(),
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
         if j.get("status") == "1" and j.get("result"):
@@ -1456,7 +1914,6 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
     if not api_key:
         return []
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "token",
         "action": "tokenholderlist",
         "contractaddress": token_addr,
@@ -1499,7 +1956,6 @@ async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> 
     if not api_key:
         return metrics
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -1546,7 +2002,6 @@ async def _detect_private_sale_async(token_addr: str) -> dict:
     if not api_key:
         return result
     params = {
-        "chainid": ETHERSCAN_CHAIN_ID,
         "module": "account",
         "action": "tokentx",
         "contractaddress": token_addr,
@@ -3393,6 +3848,17 @@ def recheck_logic_detail(
 pending_rechecks: Dict[str, dict] = {}
 
 
+def _collect_queue_depth() -> dict:
+    return {
+        "passing_pairs": len(passing_pairs),
+        "volume_checks": len(volume_checks),
+        "pending_rechecks": len(pending_rechecks),
+    }
+
+
+metrics.set_queue_depth_callback(_collect_queue_depth)
+
+
 def queue_recheck(pair_addr: str, token0: str, token1: str):
     if pair_addr not in pending_rechecks:
         pending_rechecks[pair_addr] = {
@@ -3506,37 +3972,88 @@ known_pairs: Dict[str, Tuple[str, str]] = {}
 
 def handle_new_pair(pair_addr: str, token0: str, token1: str):
     """Process a newly created pair and evaluate its criteria."""
+
+    start_time = time.perf_counter()
+    metrics.increment("pairs_scanned")
+    status_message = "processed"
+    outcome_context: Dict[str, object] = {}
+    logged_outcome = False
+    paddr_display = pair_addr
+
     try:
         paddr = to_checksum_address(pair_addr)
         token0 = to_checksum_address(token0)
         token1 = to_checksum_address(token1)
+        paddr_display = paddr
         detected_at[paddr.lower()] = time.time()
         known_pairs[paddr.lower()] = (token0, token1)
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
+        outcome_context.update({"passes": passes, "total": total})
         if extra.get("dexscreener_missing"):
-            logger.info(f"[Requeue] {paddr} missing DexScreener data")
+            status_message = "requeue_missing_dexscreener"
+            outcome_context["reason"] = status_message
+            log_event(
+                logging.INFO,
+                "requeue",
+                f"{paddr} missing DexScreener data",
+                pair=paddr,
+                context={"reason": status_message},
+            )
             queue_recheck(paddr, token0, token1)
             return
         if not isinstance(extra, dict):
-            logger.error(f"check_pair_criteria returned invalid data for {paddr}: {extra}")
+            status_message = "invalid_extra"
+            log_event(
+                logging.ERROR,
+                "invalid_pair_data",
+                f"check_pair_criteria returned invalid data for {paddr}",
+                pair=paddr,
+                error=str(extra),
+            )
             extra = {}
         if not extra or not extra.get("tokenName"):
-            logger.debug(f"[Skip] {paddr} missing DexScreener token name")
+            status_message = "skip_missing_token_name"
+            log_event(
+                logging.DEBUG,
+                "skip_pair",
+                f"{paddr} missing DexScreener token name",
+                pair=paddr,
+            )
             return
         fail, reason = critical_verification_failure(extra)
         if fail:
-            logger.info(f"[Remove] {paddr} removed: {reason}")
+            status_message = "removed_by_verification"
+            outcome_context["remove_reason"] = reason
+            log_event(
+                logging.INFO,
+                "remove_pair",
+                f"{paddr} removed: {reason}",
+                pair=paddr,
+                context={"reason": reason},
+            )
             if reason not in ("verification error", "risk score 9999"):
                 send_telegram_message(f"[Remove] {paddr} removed: {reason}")
             return
-        logger.info(
-            f"[NewPair] {paddr} => {passes}/{total} partial passes. Verified={extra.get('contractCheckStatus')} Risk={extra.get('riskScore')}"
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        log_event(
+            logging.INFO,
+            "new_pair",
+            f"{paddr} => {passes}/{total} partial passes",
+            pair=paddr,
+            latency_ms=latency_ms,
+            context={
+                "verification": extra.get("contractCheckStatus"),
+                "risk": extra.get("riskScore"),
+                "passes": passes,
+                "total": total,
+            },
         )
         store_pair_record(paddr, token0, token1, passes, total, extra)
 
         fail_reasons = evaluate_fail_reasons(extra)
         if fail_reasons:
+            outcome_context["fail_reasons"] = fail_reasons
             passes = 0
 
         mc_now = extra.get("marketCap", 0)
@@ -3585,6 +4102,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             extra["enhanced_pattern_score"] = 0
 
         if passes >= MIN_PASS_THRESHOLD:
+            metrics.increment("passes")
             start_wallet_monitor(main_token)
 
         if passes >= MIN_PASS_THRESHOLD:
@@ -3602,19 +4120,56 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 )
                 liq_now = extra.get("liquidityUsd", 0)
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
+                outcome_context["next_step"] = "passing_refresh"
             else:
-                logger.info(f"[VolumeCheck] waiting on {paddr}")
+                log_event(
+                    logging.INFO,
+                    "queue_volume_check",
+                    f"Waiting for volume targets on {paddr}",
+                    pair=paddr,
+                    context={
+                        "volume24h": vol_now,
+                        "trades": trades_now,
+                    },
+                )
+                outcome_context["next_step"] = "volume_check"
                 queue_volume_check(paddr, token0, token1, passes, total, extra)
         else:
-            logger.info("Not enough passes => queue recheck.")
+            log_event(
+                logging.INFO,
+                "queue_recheck",
+                f"Not enough passes for {paddr}, scheduling recheck",
+                pair=paddr,
+            )
+            outcome_context["next_step"] = "recheck"
             queue_recheck(paddr, token0, token1)
     except Exception as e:
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         tb = traceback.extract_tb(e.__traceback__)
-        line = tb[-1].lineno if tb else 'unknown'
-        logger.error(
-            f"handle_new_pair failed for {pair_addr} at line {line}: {e}",
+        line = tb[-1].lineno if tb else "unknown"
+        metrics.record_exception()
+        log_event(
+            logging.ERROR,
+            "handle_new_pair_error",
+            f"handle_new_pair failed for {paddr_display} at line {line}",
+            pair=paddr_display,
+            latency_ms=latency_ms,
+            error=str(e),
+            context={"line": line},
         )
         logger.debug(''.join(traceback.format_tb(e.__traceback__)))
+        logged_outcome = True
+    finally:
+        if not logged_outcome:
+            latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            log_event(
+                logging.INFO,
+                "handle_new_pair_complete",
+                status_message,
+                pair=paddr_display,
+                latency_ms=latency_ms,
+                context=outcome_context or None,
+            )
 
 
 ###########################################################
@@ -3651,19 +4206,31 @@ def save_last_block(bn: int, fname: str):
 
 
 def main():
-    logger.info("Starting advanced CryptoBot...")
+    log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
+
+    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
         last_block_v2 = safe_block_number(False)
         save_last_block(last_block_v2, LAST_BLOCK_FILE_V2)
-        logger.info(f"Initialized v2 last_block={last_block_v2}")
+        log_event(
+            logging.INFO,
+            "init_block",
+            "Initialized v2 last block",
+            context={"network": "v2", "block": last_block_v2},
+        )
 
     last_block_v3 = load_last_block(LAST_BLOCK_FILE_V3)
     if last_block_v3 == 0:
         last_block_v3 = safe_block_number(True)
         save_last_block(last_block_v3, LAST_BLOCK_FILE_V3)
-        logger.info(f"Initialized v3 last_block={last_block_v3}")
+        log_event(
+            logging.INFO,
+            "init_block",
+            "Initialized v3 last block",
+            context={"network": "v3", "block": last_block_v3},
+        )
 
     while True:
         try:
@@ -3703,8 +4270,16 @@ def main():
 
                 last_block_v2 = to_blk
                 save_last_block(last_block_v2, LAST_BLOCK_FILE_V2)
-                logger.info(
-                    f"Processed v2 blocks {from_blk}->{to_blk}, found {len(logs)} PairCreated logs"
+                log_event(
+                    logging.INFO,
+                    "blocks_processed",
+                    "Processed v2 blocks",
+                    context={
+                        "network": "v2",
+                        "from_block": from_blk,
+                        "to_block": to_blk,
+                        "pairs_found": len(logs),
+                    },
                 )
 
             curr_block_v3 = safe_block_number(True)
@@ -3743,8 +4318,16 @@ def main():
 
                 last_block_v3 = to_blk
                 save_last_block(last_block_v3, LAST_BLOCK_FILE_V3)
-                logger.info(
-                    f"Processed v3 blocks {from_blk}->{to_blk}, found {len(logs)} PoolCreated logs"
+                log_event(
+                    logging.INFO,
+                    "blocks_processed",
+                    "Processed v3 blocks",
+                    context={
+                        "network": "v3",
+                        "from_block": from_blk,
+                        "to_block": to_blk,
+                        "pairs_found": len(logs),
+                    },
                 )
 
             # handle failing rechecks
@@ -3763,10 +4346,16 @@ def main():
             maybe_flush_failed_rechecks()
 
         except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt => stopping.")
+            log_event(logging.INFO, "shutdown", "KeyboardInterrupt => stopping")
             break
         except Exception as e:
-            logger.error(f"Main loop error: {e}")
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "main_loop_error",
+                "Main loop error",
+                error=str(e),
+            )
             time.sleep(5)
 
         time.sleep(MAIN_LOOP_SLEEP)
