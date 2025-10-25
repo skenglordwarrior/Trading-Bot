@@ -143,6 +143,14 @@ INFURA_URL_BACKUP = os.getenv(
     "https://mainnet.infura.io/v3/ec4f1dd756644dcb9eb46762c4c4c9c0",
 )
 INFURA_URL_V3_BACKUP = os.getenv("INFURA_URL_V3_BACKUP", INFURA_URL_BACKUP)
+INFURA_URL_EMERGENCY_1 = os.getenv(
+    "INFURA_URL_EMERGENCY_1",
+    "https://mainnet.infura.io/v3/81a1564705e54d6bb52d3a98bc1767fc",
+)
+INFURA_URL_EMERGENCY_2 = os.getenv(
+    "INFURA_URL_EMERGENCY_2",
+    "https://mainnet.infura.io/v3/bd68c7ff3d58401ea02179b15a9efd0f",
+)
 ALCHEMY_URL = os.getenv(
     "ALCHEMY_URL",
     "https://eth-mainnet.g.alchemy.com/v2/ICzV00BkkR9g70gaOJrx0O80fO_c2oPB",
@@ -199,6 +207,21 @@ MIN_GEM_MARKETING_SCORE = 20
 GEM_ALERT_SCORE = 60
 GEM_WARNING_RISK_DELTA = 10
 GEM_WARNING_MARKETING_DELTA = 10
+
+
+def _unique_urls(urls: List[Optional[str]]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for url in urls:
+        if url and url not in seen:
+            result.append(url)
+            seen.add(url)
+    return result
+
+
+INFURA_EMERGENCY_URLS = _unique_urls(
+    [INFURA_URL_EMERGENCY_1, INFURA_URL_EMERGENCY_2]
+)
 
 # Wallet tracker settings
 WALLET_REPORT_TTL = 600  # 10 minutes
@@ -530,26 +553,107 @@ init_excel(EXCEL_FILE)
 # 2. WEB3 & SESSION
 ###########################################################
 
-w3_event = Web3(HTTPProvider(INFURA_URL))
-w3_event_v3 = Web3(HTTPProvider(INFURA_URL_V3))
-w3_backup_event = Web3(HTTPProvider(INFURA_URL_BACKUP))
-w3_backup_event_v3 = Web3(HTTPProvider(INFURA_URL_V3_BACKUP))
 w3_read = Web3(HTTPProvider(ALCHEMY_URL))
 
-if not w3_event.is_connected():
-    logger.warning("Event provider not connected => using backup provider")
-    w3_event = w3_backup_event
-if not w3_event.is_connected():
-    logger.warning("Backup event provider not connected => fallback to w3_read")
-    w3_event = w3_read
-if not w3_event_v3.is_connected():
-    logger.warning("V3 provider not connected => using backup provider")
-    w3_event_v3 = w3_backup_event_v3
-if not w3_event_v3.is_connected():
-    logger.warning("Backup v3 provider not connected => fallback to w3_read")
-    w3_event_v3 = w3_read
+_EVENT_PROVIDER_URLS = _unique_urls(
+    [INFURA_URL, INFURA_URL_BACKUP, *INFURA_EMERGENCY_URLS]
+)
+_EVENT_V3_PROVIDER_URLS = _unique_urls(
+    [INFURA_URL_V3, INFURA_URL_V3_BACKUP, *INFURA_EMERGENCY_URLS]
+)
+_EVENT_PROVIDER_INDEX = -1
+_EVENT_V3_PROVIDER_INDEX = -1
+
+
+def _connect_provider(urls: List[str], label: str) -> Tuple[Web3, int]:
+    for idx, url in enumerate(urls):
+        try:
+            provider = Web3(HTTPProvider(url))
+            if provider.is_connected():
+                if idx > 0:
+                    log_event(
+                        logging.WARNING,
+                        "rpc_provider_init",
+                        f"{label} provider fallback engaged",
+                        context={"url": url, "index": idx},
+                    )
+                return provider, idx
+        except Exception as exc:  # pragma: no cover - defensive connection guard
+            log_event(
+                logging.ERROR,
+                "rpc_provider_init",
+                f"{label} provider connection error",
+                error=str(exc),
+                context={"url": url, "index": idx},
+            )
+    if w3_read.is_connected():
+        log_event(
+            logging.ERROR,
+            "rpc_provider_init",
+            f"All {label} providers unavailable; using reader",
+            context={"url": ALCHEMY_URL},
+        )
+        return w3_read, -1
+    raise RuntimeError(f"Unable to establish {label} provider")
+
+
+w3_event, _EVENT_PROVIDER_INDEX = _connect_provider(
+    _EVENT_PROVIDER_URLS, "uniswap_v2"
+)
+w3_event_v3, _EVENT_V3_PROVIDER_INDEX = _connect_provider(
+    _EVENT_V3_PROVIDER_URLS, "uniswap_v3"
+)
 
 FETCH_TIMEOUT = 30
+
+
+def _rotate_rpc_provider(is_v3: bool, cause: Exception) -> Optional[Web3]:
+    global w3_event, w3_event_v3, _EVENT_PROVIDER_INDEX, _EVENT_V3_PROVIDER_INDEX
+
+    urls = _EVENT_V3_PROVIDER_URLS if is_v3 else _EVENT_PROVIDER_URLS
+    index = _EVENT_V3_PROVIDER_INDEX if is_v3 else _EVENT_PROVIDER_INDEX
+    label = "uniswap_v3" if is_v3 else "uniswap_v2"
+
+    if not urls:
+        return None
+
+    if index is None or index < 0:
+        order = list(range(len(urls)))
+    else:
+        order = list(range(index + 1, len(urls))) + list(range(0, index))
+
+    for next_idx in order:
+        url = urls[next_idx]
+        try:
+            provider = Web3(HTTPProvider(url))
+            if provider.is_connected():
+                if is_v3:
+                    w3_event_v3 = provider
+                    _EVENT_V3_PROVIDER_INDEX = next_idx
+                else:
+                    w3_event = provider
+                    _EVENT_PROVIDER_INDEX = next_idx
+                log_event(
+                    logging.WARNING,
+                    "rpc_provider_rotate",
+                    f"Switched {label} provider",
+                    context={"url": url, "reason": str(cause)},
+                )
+                return provider
+        except Exception as exc:  # pragma: no cover - defensive connection guard
+            log_event(
+                logging.ERROR,
+                "rpc_provider_rotate",
+                f"Failed switching {label} provider",
+                error=str(exc),
+                context={"url": url},
+            )
+
+    if is_v3:
+        _EVENT_V3_PROVIDER_INDEX = -1
+    else:
+        _EVENT_PROVIDER_INDEX = -1
+    return None
 
 
 async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> dict:
@@ -604,10 +708,9 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
 
 def safe_block_number(is_v3: bool = False) -> int:
     """Return latest block number with automatic provider fallback."""
-    global w3_event, w3_event_v3
+    global w3_event, w3_event_v3, _EVENT_PROVIDER_INDEX, _EVENT_V3_PROVIDER_INDEX
     provider = w3_event_v3 if is_v3 else w3_event
-    backup_url = INFURA_URL_V3_BACKUP if is_v3 else INFURA_URL_BACKUP
-    network = "v3" if is_v3 else "v2"
+    network = "uniswap_v3" if is_v3 else "uniswap_v2"
     start = time.perf_counter()
     try:
         block = provider.eth.block_number
@@ -623,19 +726,26 @@ def safe_block_number(is_v3: bool = False) -> int:
             log_event(
                 logging.WARNING,
                 "rpc_rate_limit",
-                f"Rate limit on {network} provider => switching to backup",
+                f"Rate limit on {network} provider",
                 error=str(e),
                 context={"network": network},
                 latency_ms=latency_ms,
             )
-            new_provider = Web3(HTTPProvider(backup_url))
-            if is_v3:
-                w3_event_v3 = new_provider
-            else:
-                w3_event = new_provider
+        else:
+            log_event(
+                logging.ERROR,
+                "rpc_failure",
+                f"{network} block number error: {e}",
+                error=str(e),
+                context={"network": network},
+                latency_ms=latency_ms,
+            )
+
+        fallback_provider = _rotate_rpc_provider(is_v3, e)
+        if fallback_provider is not None:
             backup_start = time.perf_counter()
             try:
-                block = new_provider.eth.block_number
+                block = fallback_provider.eth.block_number
                 backup_latency = round(
                     (time.perf_counter() - backup_start) * 1000, 2
                 )
@@ -650,19 +760,18 @@ def safe_block_number(is_v3: bool = False) -> int:
                 log_event(
                     logging.ERROR,
                     "rpc_backup_failure",
-                    f"Backup block number error: {e2}",
+                    f"Fallback {network} block number error: {e2}",
                     error=str(e2),
                     context={"network": network},
                     latency_ms=backup_latency,
                 )
-        log_event(
-            logging.ERROR,
-            "rpc_failure",
-            f"Block number error: {e}",
-            error=str(e),
-            context={"network": network},
-            latency_ms=latency_ms,
-        )
+
+        if is_v3:
+            w3_event_v3 = w3_read
+            _EVENT_V3_PROVIDER_INDEX = -1
+        else:
+            w3_event = w3_read
+            _EVENT_PROVIDER_INDEX = -1
         fallback_start = time.perf_counter()
         block = w3_read.eth.block_number
         fallback_latency = round((time.perf_counter() - fallback_start) * 1000, 2)
@@ -672,10 +781,9 @@ def safe_block_number(is_v3: bool = False) -> int:
 
 def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
     """Get logs with fallback to backup provider on rate limit."""
-    global w3_event, w3_event_v3
+    global w3_event, w3_event_v3, _EVENT_PROVIDER_INDEX, _EVENT_V3_PROVIDER_INDEX
     provider = w3_event_v3 if is_v3 else w3_event
-    backup_url = INFURA_URL_V3_BACKUP if is_v3 else INFURA_URL_BACKUP
-    network = "v3" if is_v3 else "v2"
+    network = "uniswap_v3" if is_v3 else "uniswap_v2"
     start = time.perf_counter()
     try:
         logs = provider.eth.get_logs(filter_params)
@@ -691,19 +799,26 @@ def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
             log_event(
                 logging.WARNING,
                 "rpc_rate_limit",
-                f"Rate limit on {network} get_logs => switching to backup",
+                f"Rate limit on {network} get_logs",
                 error=str(e),
                 context={"network": network},
                 latency_ms=latency_ms,
             )
-            new_provider = Web3(HTTPProvider(backup_url))
-            if is_v3:
-                w3_event_v3 = new_provider
-            else:
-                w3_event = new_provider
+        else:
+            log_event(
+                logging.ERROR,
+                "rpc_failure",
+                f"{network} get_logs error: {e}",
+                error=str(e),
+                context={"network": network},
+                latency_ms=latency_ms,
+            )
+
+        fallback_provider = _rotate_rpc_provider(is_v3, e)
+        if fallback_provider is not None:
             backup_start = time.perf_counter()
             try:
-                logs = new_provider.eth.get_logs(filter_params)
+                logs = fallback_provider.eth.get_logs(filter_params)
                 backup_latency = round(
                     (time.perf_counter() - backup_start) * 1000, 2
                 )
@@ -718,21 +833,23 @@ def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
                 log_event(
                     logging.ERROR,
                     "rpc_backup_failure",
-                    f"Backup get_logs error: {e2}",
+                    f"Fallback {network} get_logs error: {e2}",
                     error=str(e2),
                     context={"network": network},
                     latency_ms=backup_latency,
                 )
-        log_event(
-            logging.ERROR,
-            "rpc_failure",
-            f"get_logs {network} error: {e}",
-            error=str(e),
-            context={"network": network},
-            latency_ms=latency_ms,
-        )
-        time.sleep(5)
-        return []
+
+        if is_v3:
+            w3_event_v3 = w3_read
+            _EVENT_V3_PROVIDER_INDEX = -1
+        else:
+            w3_event = w3_read
+            _EVENT_PROVIDER_INDEX = -1
+        fallback_start = time.perf_counter()
+        logs = w3_read.eth.get_logs(filter_params)
+        fallback_latency = round((time.perf_counter() - fallback_start) * 1000, 2)
+        metrics.record_rpc_call(fallback_latency)
+        return logs
 
 
 

@@ -69,6 +69,8 @@ def _provider_urls(cli_url: str | None) -> List[str]:
             os.getenv("INFURA_URL_V3"),
             os.getenv("ALCHEMY_URL_BACKUP"),
             os.getenv("INFURA_URL_BACKUP"),
+            os.getenv("INFURA_URL_EMERGENCY_1"),
+            os.getenv("INFURA_URL_EMERGENCY_2"),
         ]
     )
     return [url for url in urls if url]
