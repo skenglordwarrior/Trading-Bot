@@ -197,6 +197,11 @@ MIN_MARKETCAP_USD = 40_000
 MIN_BUYS_FIRST_HOUR = 20
 MIN_TRADES_REQUIRED = 20
 
+# Allow freshly-created pairs some time to appear on DexScreener before we give up
+DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW = int(
+    os.getenv("DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW", "1800")
+)
+
 # Gem detection thresholds to reduce noise
 MIN_GEM_MARKETCAP_USD = 50_000
 MAX_GEM_MARKETCAP_USD = 200_000
@@ -3222,6 +3227,21 @@ def detect_first_sell(pair_addr: str, token0: str, token1: str, from_block: int)
 detected_at: Dict[str, float] = {}
 
 
+def should_retry_dexscreener(pair_addr: str, reason: str) -> Tuple[bool, Optional[float]]:
+    """Decide whether to keep retrying DexScreener for the given failure reason."""
+
+    if reason != "not_listed":
+        return True, None
+
+    first_seen = detected_at.get(pair_addr.lower())
+    if first_seen is None:
+        # Should not happen, but err on the side of retrying
+        return True, None
+
+    age = time.time() - first_seen
+    return age <= DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW, age
+
+
 def check_pair_criteria(
     pair_addr: str, token0: str, token1: str
 ) -> Tuple[int, int, dict]:
@@ -3241,12 +3261,17 @@ def check_pair_criteria(
         logger.warning(
             f"[DexMissing] {pair_addr} missing DexScreener data ({reason})"
         )
-        should_requeue = reason not in {"not_listed"}
+        should_requeue, not_listed_age = should_retry_dexscreener(pair_addr, reason)
         extra = {
             "dexscreener_missing": True,
             "dexscreener_reason": reason,
             "should_requeue": should_requeue,
         }
+        if not_listed_age is not None:
+            extra["dexscreener_not_listed_age"] = not_listed_age
+            extra["dexscreener_retry_window"] = DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW
+            if not should_requeue:
+                extra["dexscreener_retry_window_expired"] = True
         if should_requeue:
             extra["transient_failure"] = True
         return (0, total_checks, extra)
@@ -4110,9 +4135,19 @@ def handle_rechecks():
                         f"[Recheck] => {pair} DexScreener unavailable ({dex_reason}); will retry"
                     )
                 else:
-                    logger.info(
-                        f"[Recheck] => removing {pair}, DexScreener unavailable ({dex_reason})"
-                    )
+                    age = extra.get("dexscreener_not_listed_age")
+                    retry_window = extra.get("dexscreener_retry_window")
+                    if age is not None and extra.get(
+                        "dexscreener_retry_window_expired"
+                    ):
+                        logger.info(
+                            f"[Recheck] => removing {pair}, DexScreener still not listed after"
+                            f" ~{age:.1f}s (window {retry_window}s)"
+                        )
+                    else:
+                        logger.info(
+                            f"[Recheck] => removing {pair}, DexScreener unavailable ({dex_reason})"
+                        )
                     rm_list.append(pair)
                 continue
             fail, reason = critical_verification_failure(extra)
@@ -4223,6 +4258,16 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             dex_reason = extra.get("dexscreener_reason", "unknown")
             should_requeue = extra.get("should_requeue", True)
             outcome_context["reason"] = dex_reason
+            log_context = {"dex_reason": dex_reason}
+            if "dexscreener_not_listed_age" in extra:
+                log_context["age_seconds"] = round(
+                    float(extra["dexscreener_not_listed_age"]), 2
+                )
+                log_context["retry_window"] = extra.get(
+                    "dexscreener_retry_window"
+                )
+                if extra.get("dexscreener_retry_window_expired"):
+                    log_context["retry_window_expired"] = True
             if should_requeue:
                 status_message = "requeue_missing_dexscreener"
                 log_event(
@@ -4230,10 +4275,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "requeue",
                     f"{paddr} missing DexScreener data",
                     pair=paddr,
-                    context={
-                        "reason": status_message,
-                        "dex_reason": dex_reason,
-                    },
+                    context={"reason": status_message, **log_context},
                 )
                 queue_recheck(paddr, token0, token1)
             else:
@@ -4243,7 +4285,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "skip_pair",
                     f"{paddr} missing DexScreener data (not requeueing)",
                     pair=paddr,
-                    context={"dex_reason": dex_reason},
+                    context=log_context,
                 )
             return
         if not isinstance(extra, dict):
