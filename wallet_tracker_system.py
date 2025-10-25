@@ -18,7 +18,6 @@ import time
 from collections import defaultdict
 import numpy as np
 import logging
-import aiohttp
 
 # Constants shared with ethereumbotv2
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
@@ -70,13 +69,15 @@ async def _etherscan_get_async(params: dict, timeout: int = 20) -> dict:
         }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                ETHERSCAN_API_URL, params=params, timeout=timeout
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        loop = asyncio.get_running_loop()
+
+        def _do_request():
+            resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+
+        return await loop.run_in_executor(None, _do_request)
+    except (requests.RequestException, asyncio.TimeoutError, OSError) as exc:
         set_etherscan_lookup_enabled(False, f"etherscan request failed: {exc}")
         return {"status": "0", "message": str(exc), "result": []}
     except Exception as exc:  # pragma: no cover - defensive logging
@@ -223,13 +224,9 @@ class SmartWalletTracker:
             "apikey": api_key,
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0].get("contractCreator")
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"contract creator lookup failed: {e}")
         except Exception as e:
             logger.error(f"fetch_contract_creator error: {e}")
         return None
@@ -247,9 +244,7 @@ class SmartWalletTracker:
             "apikey": self.get_etherscan_key(),
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
             status = data.get("status")
             result = data.get("result", [])
             if status == "1" and result:
@@ -270,9 +265,6 @@ class SmartWalletTracker:
                 else:
                     sources_list.append({"filename": cname or "contract.sol", "content": scode})
                 return {"status": "verified", "source": sources_list}
-            return {"status": "error", "source": []}
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"contract source lookup failed: {e}")
             return {"status": "error", "source": []}
         except Exception as e:
             logger.error(f"fetch_contract_source error: {e}")
@@ -353,31 +345,29 @@ class SmartWalletTracker:
 
         try:
             data = await _etherscan_get_async(params)
-                    
+
             if data.get("status") != "1":
                 return wallets
-                
+
             # Analyze distribution pattern
             initial_receivers = defaultdict(float)
             total_supply = await self.get_token_total_supply(token_addr)
-            
+
             for tx in data.get("result", [])[:50]:  # First 50 transfers
                 to_addr = tx.get("to", "").lower()
                 value = int(tx.get("value", "0"))
-                
+
                 if to_addr and to_addr != ZERO_ADDRESS.lower():
                     initial_receivers[to_addr] += value
-                    
+
             # Classify based on allocation percentage
             for addr, amount in initial_receivers.items():
                 percentage = (amount / total_supply) * 100 if total_supply > 0 else 0
-                
+
                 if percentage > 5:  # Significant allocation
                     wallet_type = await self.classify_by_behavior(addr, token_addr)
                     wallets[addr] = {"type": wallet_type, "allocation": percentage}
-                    
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"distribution analysis lookup failed: {e}")
+
         except Exception as e:
             logger.error(f"Distribution analysis error: {e}")
 
@@ -418,28 +408,28 @@ class SmartWalletTracker:
 
         try:
             data = await _etherscan_get_async(params)
-                    
+
             if data.get("status") != "1":
                 return WalletType.UNKNOWN
-                
+
             transactions = data.get("result", [])
-            
+
             # Analyze patterns
             marketing_txs = 0
             dev_txs = 0
-            
+
             for tx in transactions:
                 to_addr = tx.get("to", "").lower()
-                
+
                 # Check if sending to known marketing addresses
                 for addresses in self.marketing_spend_patterns.values():
                     if to_addr in [a.lower() for a in addresses]:
                         marketing_txs += 1
-                        
+
                 # Check for contract deployments (dev activity)
                 if not tx.get("to"):  # Contract creation
                     dev_txs += 1
-                    
+
             # Classify based on behavior
             if marketing_txs > 5:
                 return WalletType.MARKETING
@@ -447,10 +437,7 @@ class SmartWalletTracker:
                 return WalletType.DEVELOPER
             else:
                 return WalletType.TEAM
-                
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"behavior classification lookup failed: {e}")
-            return WalletType.UNKNOWN
+
         except Exception as e:
             logger.error(f"Behavior classification error: {e}")
             return WalletType.UNKNOWN
@@ -540,7 +527,7 @@ class SmartWalletTracker:
 
         try:
             data = await _etherscan_get_async(params)
-                    
+
             for tx in data.get("result", []):
                 if tx["from"].lower() == wallet_addr.lower() and int(tx["value"]) > 0:
                     spend_type = self.identify_spend_type(tx["to"])
@@ -551,9 +538,7 @@ class SmartWalletTracker:
                         "type": spend_type,
                         "tx_hash": tx["hash"]
                     })
-                    
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"marketing spend lookup failed: {e}")
+
         except Exception as e:
             logger.error(f"Marketing spend tracking error: {e}")
 
@@ -820,16 +805,12 @@ class SmartWalletTracker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
 
             if data.get("status") == "1" and data.get("result"):
                 return data["result"][0]
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"contract creation lookup failed: {e}")
         except Exception:
-            pass
+            logger.exception("contract creation lookup failed")
 
         return None
         
@@ -863,16 +844,12 @@ class SmartWalletTracker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ETHERSCAN_API_URL, params=params) as resp:
-                    data = await resp.json()
+            data = await _etherscan_get_async(params)
 
             if data.get("status") == "1":
                 return data.get("result", [])
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            set_etherscan_lookup_enabled(False, f"token transaction lookup failed: {e}")
         except Exception:
-            pass
+            logger.exception("token transaction lookup failed")
 
         return []
     
