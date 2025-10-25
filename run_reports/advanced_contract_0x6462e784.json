@@ -1,0 +1,15 @@
+{
+  "verified": false,
+  "riskScore": 9999,
+  "riskFlags": {
+    "ownerActivity": false
+  },
+  "status": "ERROR",
+  "owner": "0x0000000000000000000000000000000000000000",
+  "ownerBalanceEth": 14132.304153799423,
+  "ownerTokenBalance": 0,
+  "implementation": null,
+  "renounced": true,
+  "slitherIssues": null
+}
+
