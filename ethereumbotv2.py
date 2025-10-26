@@ -189,6 +189,19 @@ DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW = int(
     os.getenv("DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW", "1800")
 )
 
+
+def critical_verification_failure(extra: Dict) -> Tuple[bool, str]:
+    """Return True if contract verification indicates a critical failure."""
+
+    status = str(extra.get("contractCheckStatus", "")).upper()
+    risk = extra.get("riskScore")
+    if status == "ERROR":
+        return True, "verification error"
+    if risk == 9999:
+        return True, "risk score 9999"
+    return False, ""
+
+
 def _unique_urls(urls: List[Optional[str]]) -> List[str]:
     seen = set()
     result: List[str] = []
