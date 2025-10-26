@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     parser = None
 import contextlib
 import io
-from typing import Optional, Dict, Tuple, List, Union
+from typing import Optional, Dict, Tuple, List, Union, Set
 from openpyxl import Workbook, load_workbook
 import traceback
 import requests
@@ -522,10 +522,6 @@ class MetricsCollector:
             return period_start, totals
 
 
-metrics = MetricsCollector()
-runtime_reporter = RuntimeReporter(metrics)
-
-
 class RuntimeReporter:
     """Send periodic Telegram summaries about the bot runtime."""
 
@@ -588,6 +584,10 @@ class RuntimeReporter:
             f"Total pairs passed: {totals.get('passes', 0)}"
         )
         send_telegram_message(msg)
+
+
+metrics = MetricsCollector()
+runtime_reporter = RuntimeReporter(metrics)
 
 
 def init_excel(path: str):
@@ -2694,6 +2694,8 @@ def detect_first_sell(pair_addr: str, token0: str, token1: str, from_block: int)
 ###########################################################
 
 detected_at: Dict[str, float] = {}
+# Track which pairs have already been processed to avoid duplicate work.
+SEEN_PAIRS: Set[str] = set()
 
 
 def should_retry_dexscreener(pair_addr: str, reason: str) -> Tuple[bool, Optional[float]]:
