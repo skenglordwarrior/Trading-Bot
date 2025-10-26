@@ -523,7 +523,7 @@ class MetricsCollector:
 
 
 metrics = MetricsCollector()
-runtime_reporter: Optional["RuntimeReporter"] = None
+runtime_reporter = RuntimeReporter(metrics)
 
 
 class RuntimeReporter:
