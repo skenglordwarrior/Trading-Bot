@@ -603,6 +603,9 @@ metrics = MetricsCollector()
 runtime_reporter = RuntimeReporter(metrics)
 
 
+PAIR_RECORD_LOCK = threading.Lock()
+
+
 def init_excel(path: str):
     if not os.path.exists(path):
         wb = Workbook()
@@ -627,6 +630,63 @@ def init_excel(path: str):
 
 
 init_excel(EXCEL_FILE)
+
+
+def store_pair_record(
+    pair_addr: str,
+    token0: str,
+    token1: str,
+    passes: int,
+    total: int,
+    extra: Optional[Dict] = None,
+) -> None:
+    """Persist a snapshot of pair evaluation results to the Excel history file."""
+
+    extra = extra or {}
+    detected_at = datetime.utcnow().replace(microsecond=0).isoformat()
+    liquidity = extra.get("liquidityUsd") or extra.get("liquidity")
+    volume = extra.get("volume24h") or extra.get("volume")
+    marketcap = extra.get("marketCap") or extra.get("marketcap")
+    first_sell_info = extra.get("firstSell") or {}
+
+    row = [
+        pair_addr,
+        token0,
+        token1,
+        detected_at,
+        passes,
+        total,
+        liquidity,
+        volume,
+        marketcap,
+        first_sell_info.get("address"),
+        first_sell_info.get("blockNumber"),
+    ]
+
+    try:
+        with PAIR_RECORD_LOCK:
+            if not os.path.exists(EXCEL_FILE):
+                init_excel(EXCEL_FILE)
+            workbook = load_workbook(EXCEL_FILE)
+            worksheet = (
+                workbook["history"]
+                if "history" in workbook.sheetnames
+                else workbook.active
+            )
+            worksheet.append(row)
+            workbook.save(EXCEL_FILE)
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            "pair_record_store",
+            "Failed to persist pair record",
+            pair=pair_addr,
+            error=str(exc),
+            context={
+                "passes": passes,
+                "total": total,
+            },
+        )
 
 
 ###########################################################
