@@ -111,22 +111,6 @@ def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
         kwargs["trust_env"] = True
     return aiohttp.ClientSession(**kwargs)
 
-
-def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
-    """Return an ``aiohttp`` session that honours environment proxy settings."""
-
-    if "trust_env" not in kwargs:
-        kwargs["trust_env"] = True
-    return aiohttp.ClientSession(**kwargs)
-
-
-def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
-    """Return an ``aiohttp`` session that honours environment proxy settings."""
-
-    if "trust_env" not in kwargs:
-        kwargs["trust_env"] = True
-    return aiohttp.ClientSession(**kwargs)
-
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
 ###########################################################
@@ -168,6 +152,9 @@ TELEGRAM_BASE_URL = (
 # The Graph configuration
 GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzfCBmGwYNdVkduYXVivCsLR"
 GRAPH_BEARER = "6ab18515ae540220006db77a4472de7a"
+
+ETHPLORER_BASE_URL = os.getenv("ETHPLORER_BASE_URL", "https://api.ethplorer.io")
+ETHPLORER_API_KEY = os.getenv("ETHPLORER_API_KEY", "freekey")
 
 UNISWAP_V2_FACTORY_ADDRESS = to_checksum_address(
     "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
@@ -336,49 +323,11 @@ LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
 MAIN_LOOP_SLEEP = 2
 
-BOT_NAME = "advanced-crypto-bot"
-
-
-def _json_default(obj):
-    if isinstance(obj, (datetime,)):
-        return obj.isoformat()
-    return str(obj)
-
-
-class JsonFormatter(logging.Formatter):
-    """Formatter that emits structured JSON logs."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        message = record.getMessage()
-        payload = {
-            "timestamp": timestamp,
-            "level": record.levelname,
-            "bot": BOT_NAME,
-            "message": message,
-            "action": getattr(record, "action", None),
-            "pair": getattr(record, "pair", None),
-            "latency_ms": getattr(record, "latency_ms", None),
-            "error": getattr(record, "error", None),
-        }
-        if record.exc_info:
-            payload["error"] = self.formatException(record.exc_info)
-        if payload["error"] is None and record.levelno >= logging.ERROR:
-            payload["error"] = message
-        if "etherscan" in message.lower():
-            payload.setdefault("error_source", "etherscan")
-        context = getattr(record, "context", None)
-        if context:
-            payload["context"] = context
-        return json.dumps({k: v for k, v in payload.items() if v is not None}, default=_json_default)
-
-
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    handlers=[handler],
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    handlers=[logging.StreamHandler()],
     force=True,
 )
 logger = logging.getLogger("trading_bot")
@@ -396,17 +345,30 @@ def log_event(
 ) -> None:
     """Emit a structured log entry with standard metadata."""
 
-    logger.log(
-        level,
-        message,
-        extra={
-            "action": action,
-            "pair": pair,
-            "latency_ms": latency_ms,
-            "error": error,
-            "context": context,
-        },
-    )
+    parts = []
+    if action:
+        parts.append(f"[{action}]")
+    parts.append(message)
+
+    meta: List[str] = []
+    if pair:
+        meta.append(f"pair={pair}")
+    if latency_ms is not None:
+        meta.append(f"latency={latency_ms:.2f}ms")
+    if error:
+        meta.append(f"error={error}")
+    if context:
+        try:
+            context_str = json.dumps(context, sort_keys=True, default=str)
+        except TypeError:
+            context_str = str(context)
+        meta.append(f"context={context_str}")
+
+    text = " ".join(parts)
+    if meta:
+        text = f"{text} | {' '.join(meta)}"
+
+    logger.log(level, text)
 
 
 class MetricsCollector:
@@ -666,13 +628,14 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
 
     start = time.perf_counter()
     success = False
+    prepared_params = _prepare_etherscan_params(params)
     try:
         if tracker_etherscan_get_async is not None:
-            result = await tracker_etherscan_get_async(params, timeout)
+            result = await tracker_etherscan_get_async(prepared_params, timeout)
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    ETHERSCAN_API_URL, params=params, timeout=timeout
+                    ETHERSCAN_API_URL, params=prepared_params, timeout=timeout
                 ) as resp:
                     resp.raise_for_status()
                     result = await resp.json()
@@ -685,8 +648,9 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
                 "Etherscan returned non-success status",
                 error=result.get("message"),
                 context={
-                    "module": params.get("module"),
-                    "action": params.get("action"),
+                    "module": prepared_params.get("module"),
+                    "action": prepared_params.get("action"),
+                    "result": result.get("result"),
                 },
                 latency_ms=latency_ms,
             )
@@ -700,8 +664,8 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
             f"Etherscan request failed: {exc}",
             error=str(exc),
             context={
-                "module": params.get("module"),
-                "action": params.get("action"),
+                "module": prepared_params.get("module"),
+                "action": prepared_params.get("action"),
             },
             latency_ms=latency_ms,
         )
@@ -1232,6 +1196,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with aiohttp.ClientSession() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
@@ -1276,6 +1241,16 @@ ETHERSCAN_API_URL = (
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
 
+def _prepare_etherscan_params(params: dict, url: Optional[str] = None) -> dict:
+    """Return request parameters augmented with ``chainid`` when required."""
+
+    prepared = dict(params)
+    target_url = (url or ETHERSCAN_API_URL or "").lower()
+    if "/v2/" in target_url and "chainid" not in prepared:
+        prepared["chainid"] = ETHERSCAN_CHAIN_ID
+    return prepared
+
+
 def _env_flag(name: str, default: bool = True) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -1284,6 +1259,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
+USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", False)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
 
 
@@ -1326,17 +1302,20 @@ def ensure_etherscan_connectivity() -> None:
         return
 
     async def _select_endpoint():
-        params = {
-            "module": "proxy",
-            "action": "eth_blockNumber",
-            "apikey": get_next_etherscan_key(),
-        }
         attempts: List[Tuple[str, str]] = []
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for url in ETHERSCAN_API_URL_CANDIDATES:
                 start = time.perf_counter()
                 try:
+                    params = _prepare_etherscan_params(
+                        {
+                            "module": "proxy",
+                            "action": "eth_blockNumber",
+                            "apikey": get_next_etherscan_key(),
+                        },
+                        url,
+                    )
                     async with session.get(url, params=params) as resp:
                         resp.raise_for_status()
                         await resp.text()
@@ -1433,6 +1412,7 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
@@ -1520,6 +1500,7 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
@@ -1876,6 +1857,7 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
         "apikey": get_next_etherscan_key(),
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
@@ -2045,12 +2027,129 @@ def advanced_contract_check(token_addr: str) -> dict:
 # Additional Metrics & Bull Season Helpers
 ###########################################################
 
-async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
-    if not ETHERSCAN_LOOKUPS_ENABLED:
+def _parse_holder_balance(raw_value: Union[str, int, float, None]) -> Optional[int]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, float):
+        if not np.isfinite(raw_value):
+            return None
+        return int(raw_value)
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        if not value:
+            return None
+        try:
+            if value.startswith("0x"):
+                return int(value, 16)
+            if "." in value:
+                return int(float(value))
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_holder_share(raw_value: Union[str, int, float, None]) -> Optional[float]:
+    if raw_value is None:
+        return None
+    try:
+        if isinstance(raw_value, (int, float)):
+            share = float(raw_value)
+        elif isinstance(raw_value, str):
+            cleaned = raw_value.replace("%", "").strip()
+            if not cleaned:
+                return None
+            share = float(cleaned)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    if share > 1:
+        share = share / 100.0
+    if share < 0:
+        return None
+    return min(share, 1.0)
+
+
+def _normalise_holder_entry(entry: dict) -> Optional[dict]:
+    address = entry.get("address") or entry.get("TokenHolderAddress")
+    if not address:
+        return None
+    try:
+        address = to_checksum_address(address)
+    except ValueError:
+        # keep original if checksum conversion fails
+        address = address
+
+    balance = _parse_holder_balance(
+        entry.get("balance")
+        or entry.get("TokenHolderQuantity")
+        or entry.get("TokenHolderBalance")
+        or entry.get("rawBalance")
+    )
+    share = _parse_holder_share(
+        entry.get("share")
+        or entry.get("TokenHolderPercentage")
+        or entry.get("TokenHolderShare")
+    )
+    result = {"address": address, "balance": balance}
+    if share is not None:
+        result["share"] = share
+    return result
+
+
+async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List[dict]:
+    base_url = ETHPLORER_BASE_URL.rstrip("/")
+    url = f"{base_url}/getTopTokenHolders/{token_addr}"
+    params = {"apiKey": ETHPLORER_API_KEY or "freekey", "limit": limit}
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+    try:
+        async with create_aiohttp_session(timeout=timeout) as session:
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        log_event(
+            logging.WARNING,
+            "ethplorer_api",
+            "Failed to fetch holder distribution",
+            error=str(exc),
+            context={"token": token_addr},
+        )
         return []
+    except Exception as exc:
+        logger.debug(f"ethplorer holder fetch error: {exc}")
+        return []
+
+    holders = []
+    for item in payload.get("holders", []):
+        normalised = _normalise_holder_entry(item)
+        if normalised:
+            holders.append(normalised)
+    if holders:
+        log_event(
+            logging.INFO,
+            "ethplorer_api",
+            "Fetched holder distribution via Ethplorer",
+            context={"token": token_addr, "count": len(holders)},
+        )
+    return holders
+
+
+async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
+    holders = await _fetch_ethplorer_top_holders(token_addr, limit)
+    if holders:
+        return holders
+
+    if not ETHERSCAN_LOOKUPS_ENABLED or not USE_ETHERSCAN_TOKEN_HOLDERS:
+        return holders
+
     api_key = get_next_etherscan_key()
     if not api_key:
-        return []
+        return holders
     params = {
         "module": "token",
         "action": "tokenholderlist",
@@ -2064,14 +2163,19 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
         if isinstance(data, dict):
             result = data.get("result", [])
             if isinstance(result, list):
-                return result
-        return []
+                holders = []
+                for entry in result:
+                    normalised = _normalise_holder_entry(entry)
+                    if normalised:
+                        holders.append(normalised)
+                return holders
+        return holders
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
-        return []
+        return holders
     except Exception as e:
         logger.debug(f"holder distribution error: {e}")
-        return []
+        return holders
 
 
 def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
@@ -2204,8 +2308,21 @@ def fetch_onchain_metrics(token_addr: str) -> dict:
 
     top_balance = 0
     for h in holders:
-        if isinstance(h, dict):
-            bal = int(h.get("balance", "0"))
+        if not isinstance(h, dict):
+            continue
+        share = h.get("share")
+        if share is None:
+            share = _parse_holder_share(
+                h.get("TokenHolderPercentage") or h.get("TokenHolderShare")
+            )
+        if share is not None and total_supply > 0:
+            top_balance += int(total_supply * share)
+            continue
+        bal_val = h.get("balance")
+        if bal_val is None:
+            bal_val = h.get("TokenHolderQuantity") or h.get("TokenHolderBalance")
+        bal = _parse_holder_balance(bal_val)
+        if bal is not None:
             top_balance += bal
     if total_supply > 0:
         holder_share = top_balance / total_supply
@@ -4493,6 +4610,7 @@ def save_last_block(bn: int, fname: str):
 
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
+    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
