@@ -31,6 +31,7 @@ from typing import Iterable, List, Sequence
 from web3 import HTTPProvider, Web3
 
 from wallet_tracker_system import SmartWalletTracker, WalletType, set_notifier
+from etherscan_config import load_etherscan_keys, make_key_getter
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -93,35 +94,6 @@ def _build_web3(urls: Iterable[str]) -> Web3:
     raise RuntimeError("Unable to connect to any Ethereum RPC provider") from last_error
 
 
-def _load_etherscan_keys(cli_keys: Sequence[str] | None) -> List[str]:
-    if cli_keys:
-        return [key.strip() for key in cli_keys if key.strip()]
-
-    raw = os.getenv("ETHERSCAN_API_KEYS")
-    if not raw:
-        raw = os.getenv("ETHERSCAN_API_KEY", "")
-    keys = [key.strip() for key in raw.split(",") if key.strip()]
-    return keys
-
-
-def _make_key_getter(keys: Sequence[str]):
-    if not keys:
-        logging.warning(
-            "No Etherscan API keys configured; lookups will likely return empty data"
-        )
-        return lambda: ""
-
-    index = 0
-
-    def _get_next() -> str:
-        nonlocal index
-        key = keys[index]
-        index = (index + 1) % len(keys)
-        return key
-
-    return _get_next
-
-
 def _format_timestamp(ts: int) -> str:
     if not ts:
         return "unknown"
@@ -180,8 +152,12 @@ async def _run(token: str, wallets: Sequence[str], wallet_type: WalletType, args
         )
 
     w3 = _build_web3(urls)
-    keys = _load_etherscan_keys(args.etherscan_key)
-    tracker = SmartWalletTracker(w3, _make_key_getter(keys))
+    keys = load_etherscan_keys(args.etherscan_key)
+    if not keys:
+        logging.warning(
+            "No Etherscan API keys configured; lookups will likely return empty data"
+        )
+    tracker = SmartWalletTracker(w3, make_key_getter(keys))
 
     set_notifier(sync_fn=lambda message: logging.info("NOTIFY: %s", message))
 
