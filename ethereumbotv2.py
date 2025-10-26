@@ -522,10 +522,6 @@ class MetricsCollector:
             return period_start, totals
 
 
-metrics = MetricsCollector()
-runtime_reporter = RuntimeReporter(metrics)
-
-
 class RuntimeReporter:
     """Send periodic Telegram summaries about the bot runtime."""
 
@@ -588,6 +584,10 @@ class RuntimeReporter:
             f"Total pairs passed: {totals.get('passes', 0)}"
         )
         send_telegram_message(msg)
+
+
+metrics = MetricsCollector()
+runtime_reporter = RuntimeReporter(metrics)
 
 
 def init_excel(path: str):
