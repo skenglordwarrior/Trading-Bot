@@ -806,7 +806,7 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
         if tracker_etherscan_get_async is not None:
             result = await tracker_etherscan_get_async(prepared_params, timeout)
         else:
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(
                     ETHERSCAN_API_URL, params=prepared_params, timeout=timeout
                 ) as resp:
@@ -1372,7 +1372,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
     }
     try:
         params = _prepare_etherscan_params(params)
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
         metrics.record_api_call(error=False)
@@ -1479,7 +1479,7 @@ def ensure_etherscan_connectivity() -> None:
     async def _select_endpoint():
         attempts: List[Tuple[str, str]] = []
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with create_aiohttp_session(timeout=timeout) as session:
             for url in ETHERSCAN_API_URL_CANDIDATES:
                 start = time.perf_counter()
                 try:
