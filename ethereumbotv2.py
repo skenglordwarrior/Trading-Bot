@@ -153,6 +153,9 @@ TELEGRAM_BASE_URL = (
 GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzfCBmGwYNdVkduYXVivCsLR"
 GRAPH_BEARER = "6ab18515ae540220006db77a4472de7a"
 
+ETHPLORER_BASE_URL = os.getenv("ETHPLORER_BASE_URL", "https://api.ethplorer.io")
+ETHPLORER_API_KEY = os.getenv("ETHPLORER_API_KEY", "freekey")
+
 UNISWAP_V2_FACTORY_ADDRESS = to_checksum_address(
     "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 )
@@ -1256,6 +1259,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
+USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", False)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
 
 
@@ -2023,12 +2027,129 @@ def advanced_contract_check(token_addr: str) -> dict:
 # Additional Metrics & Bull Season Helpers
 ###########################################################
 
-async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
-    if not ETHERSCAN_LOOKUPS_ENABLED:
+def _parse_holder_balance(raw_value: Union[str, int, float, None]) -> Optional[int]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, float):
+        if not np.isfinite(raw_value):
+            return None
+        return int(raw_value)
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        if not value:
+            return None
+        try:
+            if value.startswith("0x"):
+                return int(value, 16)
+            if "." in value:
+                return int(float(value))
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_holder_share(raw_value: Union[str, int, float, None]) -> Optional[float]:
+    if raw_value is None:
+        return None
+    try:
+        if isinstance(raw_value, (int, float)):
+            share = float(raw_value)
+        elif isinstance(raw_value, str):
+            cleaned = raw_value.replace("%", "").strip()
+            if not cleaned:
+                return None
+            share = float(cleaned)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    if share > 1:
+        share = share / 100.0
+    if share < 0:
+        return None
+    return min(share, 1.0)
+
+
+def _normalise_holder_entry(entry: dict) -> Optional[dict]:
+    address = entry.get("address") or entry.get("TokenHolderAddress")
+    if not address:
+        return None
+    try:
+        address = to_checksum_address(address)
+    except ValueError:
+        # keep original if checksum conversion fails
+        address = address
+
+    balance = _parse_holder_balance(
+        entry.get("balance")
+        or entry.get("TokenHolderQuantity")
+        or entry.get("TokenHolderBalance")
+        or entry.get("rawBalance")
+    )
+    share = _parse_holder_share(
+        entry.get("share")
+        or entry.get("TokenHolderPercentage")
+        or entry.get("TokenHolderShare")
+    )
+    result = {"address": address, "balance": balance}
+    if share is not None:
+        result["share"] = share
+    return result
+
+
+async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List[dict]:
+    base_url = ETHPLORER_BASE_URL.rstrip("/")
+    url = f"{base_url}/getTopTokenHolders/{token_addr}"
+    params = {"apiKey": ETHPLORER_API_KEY or "freekey", "limit": limit}
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
+    try:
+        async with create_aiohttp_session(timeout=timeout) as session:
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        log_event(
+            logging.WARNING,
+            "ethplorer_api",
+            "Failed to fetch holder distribution",
+            error=str(exc),
+            context={"token": token_addr},
+        )
         return []
+    except Exception as exc:
+        logger.debug(f"ethplorer holder fetch error: {exc}")
+        return []
+
+    holders = []
+    for item in payload.get("holders", []):
+        normalised = _normalise_holder_entry(item)
+        if normalised:
+            holders.append(normalised)
+    if holders:
+        log_event(
+            logging.INFO,
+            "ethplorer_api",
+            "Fetched holder distribution via Ethplorer",
+            context={"token": token_addr, "count": len(holders)},
+        )
+    return holders
+
+
+async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
+    holders = await _fetch_ethplorer_top_holders(token_addr, limit)
+    if holders:
+        return holders
+
+    if not ETHERSCAN_LOOKUPS_ENABLED or not USE_ETHERSCAN_TOKEN_HOLDERS:
+        return holders
+
     api_key = get_next_etherscan_key()
     if not api_key:
-        return []
+        return holders
     params = {
         "module": "token",
         "action": "tokenholderlist",
@@ -2042,14 +2163,19 @@ async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> 
         if isinstance(data, dict):
             result = data.get("result", [])
             if isinstance(result, list):
-                return result
-        return []
+                holders = []
+                for entry in result:
+                    normalised = _normalise_holder_entry(entry)
+                    if normalised:
+                        holders.append(normalised)
+                return holders
+        return holders
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
-        return []
+        return holders
     except Exception as e:
         logger.debug(f"holder distribution error: {e}")
-        return []
+        return holders
 
 
 def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
@@ -2182,8 +2308,21 @@ def fetch_onchain_metrics(token_addr: str) -> dict:
 
     top_balance = 0
     for h in holders:
-        if isinstance(h, dict):
-            bal = int(h.get("balance", "0"))
+        if not isinstance(h, dict):
+            continue
+        share = h.get("share")
+        if share is None:
+            share = _parse_holder_share(
+                h.get("TokenHolderPercentage") or h.get("TokenHolderShare")
+            )
+        if share is not None and total_supply > 0:
+            top_balance += int(total_supply * share)
+            continue
+        bal_val = h.get("balance")
+        if bal_val is None:
+            bal_val = h.get("TokenHolderQuantity") or h.get("TokenHolderBalance")
+        bal = _parse_holder_balance(bal_val)
+        if bal is not None:
             top_balance += bal
     if total_supply > 0:
         holder_share = top_balance / total_supply
