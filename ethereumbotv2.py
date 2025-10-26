@@ -4373,8 +4373,11 @@ def save_last_block(bn: int, fname: str):
 
 
 def main():
+    global runtime_reporter
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
     ensure_etherscan_connectivity()
+    if runtime_reporter is None:
+        runtime_reporter = RuntimeReporter(metrics)
     send_telegram_message(
         "🤖 Ethereum bot v2 online and scanning for fresh Ethereum pairs."
     )
