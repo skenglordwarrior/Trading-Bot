@@ -111,22 +111,6 @@ def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
         kwargs["trust_env"] = True
     return aiohttp.ClientSession(**kwargs)
 
-
-def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
-    """Return an ``aiohttp`` session that honours environment proxy settings."""
-
-    if "trust_env" not in kwargs:
-        kwargs["trust_env"] = True
-    return aiohttp.ClientSession(**kwargs)
-
-
-def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
-    """Return an ``aiohttp`` session that honours environment proxy settings."""
-
-    if "trust_env" not in kwargs:
-        kwargs["trust_env"] = True
-    return aiohttp.ClientSession(**kwargs)
-
 ###########################################################
 # 1. GLOBAL CONFIG & CONSTANTS
 ###########################################################
@@ -336,49 +320,11 @@ LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
 MAIN_LOOP_SLEEP = 2
 
-BOT_NAME = "advanced-crypto-bot"
-
-
-def _json_default(obj):
-    if isinstance(obj, (datetime,)):
-        return obj.isoformat()
-    return str(obj)
-
-
-class JsonFormatter(logging.Formatter):
-    """Formatter that emits structured JSON logs."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        message = record.getMessage()
-        payload = {
-            "timestamp": timestamp,
-            "level": record.levelname,
-            "bot": BOT_NAME,
-            "message": message,
-            "action": getattr(record, "action", None),
-            "pair": getattr(record, "pair", None),
-            "latency_ms": getattr(record, "latency_ms", None),
-            "error": getattr(record, "error", None),
-        }
-        if record.exc_info:
-            payload["error"] = self.formatException(record.exc_info)
-        if payload["error"] is None and record.levelno >= logging.ERROR:
-            payload["error"] = message
-        if "etherscan" in message.lower():
-            payload.setdefault("error_source", "etherscan")
-        context = getattr(record, "context", None)
-        if context:
-            payload["context"] = context
-        return json.dumps({k: v for k, v in payload.items() if v is not None}, default=_json_default)
-
-
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    handlers=[handler],
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    handlers=[logging.StreamHandler()],
     force=True,
 )
 logger = logging.getLogger("trading_bot")
@@ -396,17 +342,30 @@ def log_event(
 ) -> None:
     """Emit a structured log entry with standard metadata."""
 
-    logger.log(
-        level,
-        message,
-        extra={
-            "action": action,
-            "pair": pair,
-            "latency_ms": latency_ms,
-            "error": error,
-            "context": context,
-        },
-    )
+    parts = []
+    if action:
+        parts.append(f"[{action}]")
+    parts.append(message)
+
+    meta: List[str] = []
+    if pair:
+        meta.append(f"pair={pair}")
+    if latency_ms is not None:
+        meta.append(f"latency={latency_ms:.2f}ms")
+    if error:
+        meta.append(f"error={error}")
+    if context:
+        try:
+            context_str = json.dumps(context, sort_keys=True, default=str)
+        except TypeError:
+            context_str = str(context)
+        meta.append(f"context={context_str}")
+
+    text = " ".join(parts)
+    if meta:
+        text = f"{text} | {' '.join(meta)}"
+
+    logger.log(level, text)
 
 
 class MetricsCollector:
@@ -666,13 +625,14 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
 
     start = time.perf_counter()
     success = False
+    prepared_params = _prepare_etherscan_params(params)
     try:
         if tracker_etherscan_get_async is not None:
-            result = await tracker_etherscan_get_async(params, timeout)
+            result = await tracker_etherscan_get_async(prepared_params, timeout)
         else:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    ETHERSCAN_API_URL, params=params, timeout=timeout
+                    ETHERSCAN_API_URL, params=prepared_params, timeout=timeout
                 ) as resp:
                     resp.raise_for_status()
                     result = await resp.json()
@@ -685,8 +645,9 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
                 "Etherscan returned non-success status",
                 error=result.get("message"),
                 context={
-                    "module": params.get("module"),
-                    "action": params.get("action"),
+                    "module": prepared_params.get("module"),
+                    "action": prepared_params.get("action"),
+                    "result": result.get("result"),
                 },
                 latency_ms=latency_ms,
             )
@@ -700,8 +661,8 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
             f"Etherscan request failed: {exc}",
             error=str(exc),
             context={
-                "module": params.get("module"),
-                "action": params.get("action"),
+                "module": prepared_params.get("module"),
+                "action": prepared_params.get("action"),
             },
             latency_ms=latency_ms,
         )
@@ -1232,6 +1193,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with aiohttp.ClientSession() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
@@ -1274,6 +1236,16 @@ ETHERSCAN_API_URL = (
     ETHERSCAN_API_URL_CANDIDATES[0] if ETHERSCAN_API_URL_CANDIDATES else ""
 )
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
+
+
+def _prepare_etherscan_params(params: dict, url: Optional[str] = None) -> dict:
+    """Return request parameters augmented with ``chainid`` when required."""
+
+    prepared = dict(params)
+    target_url = (url or ETHERSCAN_API_URL or "").lower()
+    if "/v2/" in target_url and "chainid" not in prepared:
+        prepared["chainid"] = ETHERSCAN_CHAIN_ID
+    return prepared
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -1326,17 +1298,20 @@ def ensure_etherscan_connectivity() -> None:
         return
 
     async def _select_endpoint():
-        params = {
-            "module": "proxy",
-            "action": "eth_blockNumber",
-            "apikey": get_next_etherscan_key(),
-        }
         attempts: List[Tuple[str, str]] = []
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for url in ETHERSCAN_API_URL_CANDIDATES:
                 start = time.perf_counter()
                 try:
+                    params = _prepare_etherscan_params(
+                        {
+                            "module": "proxy",
+                            "action": "eth_blockNumber",
+                            "apikey": get_next_etherscan_key(),
+                        },
+                        url,
+                    )
                     async with session.get(url, params=params) as resp:
                         resp.raise_for_status()
                         await resp.text()
@@ -1433,6 +1408,7 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
@@ -1520,6 +1496,7 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
         "apikey": api_key,
     }
     try:
+        params = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
@@ -1876,6 +1853,7 @@ async def _check_renounced_by_event_async(addr: str) -> bool:
         "apikey": get_next_etherscan_key(),
     }
     try:
+        params = _prepare_etherscan_params(params)
         async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
                 j = await r.json()
@@ -4493,6 +4471,7 @@ def save_last_block(bn: int, fname: str):
 
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
+    ensure_etherscan_connectivity()
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
