@@ -1240,6 +1240,7 @@ async def _fetch_dexscreener_data_async(
 
     base_token = pair_info.get("baseToken", {})
     base_name = base_token.get("name", "").strip()
+    base_symbol = base_token.get("symbol", "").strip()
     info_section = pair_info.get("info", {})
     logo_url = info_section.get("imageUrl", "")
     websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
@@ -1264,6 +1265,7 @@ async def _fetch_dexscreener_data_async(
         "buys": buys_24,
         "sells": sells_24,
         "baseTokenName": base_name,
+        "baseTokenSymbol": base_symbol,
         "baseTokenLogo": logo_url,
         "socialLinks": websites + socials,
         "lockedLiquidity": locked,
@@ -2716,108 +2718,148 @@ def should_retry_dexscreener(pair_addr: str, reason: str) -> Tuple[bool, Optiona
 def check_pair_criteria(
     pair_addr: str, token0: str, token1: str
 ) -> Tuple[int, int, dict]:
-    # advanced contract check + renounce status + dex metrics + wallet analysis
-    total_checks = 13
-    passes = 0
+    """Evaluate core safety criteria for a newly created pair.
 
-    # determine main token (non-WETH)
-    main_token = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+    The legacy implementation returned ``None`` in many scenarios which in turn
+    caused ``handle_new_pair`` to crash when unpacking the result.  The new
+    implementation always returns the expected ``(passes, total, extra)`` tuple
+    together with a detailed ``extra`` payload describing every datapoint used
+    in the decision.
+    """
 
-    # 1) fetch DexScreener first to filter out unlisted or tiny pairs
+    main_token = get_non_weth_token(token0, token1)
+    counter_token = token1 if main_token.lower() == token0.lower() else token0
+
+    expected_total_checks = 14
+
     dex_data, dex_reason = fetch_dexscreener_data(
         main_token, pair_addr, with_reason=True
     )
+
+    extra: Dict[str, object] = {
+        "pairAddress": pair_addr,
+        "token0": token0,
+        "token1": token1,
+        "tokenAddress": main_token,
+        "dexscreener_missing": False,
+        "should_requeue": False,
+        "dexscreener_reason": None,
+        "transient_failure": False,
+    }
+
     if not dex_data:
         reason = dex_reason or "unknown"
-        logger.warning(
-            f"[DexMissing] {pair_addr} missing DexScreener data ({reason})"
+        should_requeue, age = should_retry_dexscreener(pair_addr, reason)
+        extra.update(
+            {
+                "dexscreener_missing": True,
+                "dexscreener_reason": reason,
+                "should_requeue": should_requeue,
+                "dexscreener_not_listed_age": age,
+                "dexscreener_retry_window": DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW,
+                "dexscreener_retry_window_expired": (
+                    age is not None and age > DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW
+                ),
+                "transient_failure": reason
+                in {"network_error", "rate_limited", "unexpected_error"},
+            }
         )
-        disable_etherscan_lookups("No Etherscan API URLs configured")
-        return
+        extra["checkBreakdown"] = {}
+        return 0, expected_total_checks, extra
 
-    if not any(key.strip() for key in ETHERSCAN_API_KEY_LIST):
-        log_event(
-            logging.ERROR,
-            "etherscan_endpoint",
-            "No Etherscan API keys configured",
-        )
-        disable_etherscan_lookups("No Etherscan API keys configured")
-        return
+    extra.update(dex_data)
+    token_name = dex_data.get("baseTokenName") or ""
+    token_symbol = dex_data.get("baseTokenSymbol") or ""
+    extra["tokenName"] = token_name or token_symbol or main_token
+    if token_symbol:
+        extra["tokenSymbol"] = token_symbol
 
-    async def _select_endpoint():
-        attempts: List[Tuple[str, str]] = []
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for url in ETHERSCAN_API_URL_CANDIDATES:
-                start = time.perf_counter()
-                try:
-                    params = _prepare_etherscan_params(
-                        {
-                            "module": "proxy",
-                            "action": "eth_blockNumber",
-                            "apikey": get_next_etherscan_key(),
-                        },
-                        url,
-                    )
-                    async with session.get(url, params=params) as resp:
-                        resp.raise_for_status()
-                        await resp.text()
-                        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-                        log_event(
-                            logging.INFO,
-                            "etherscan_endpoint",
-                            "Verified Etherscan endpoint",
-                            context={"url": url},
-                            latency_ms=latency_ms,
-                        )
-                        return url, attempts
-                except Exception as exc:  # pragma: no cover - network errors
-                    latency_ms = round((time.perf_counter() - start) * 1000, 2)
-                    attempts.append((url, str(exc)))
-                    log_event(
-                        logging.WARNING,
-                        "etherscan_endpoint",
-                        "Failed to reach Etherscan endpoint",
-                        error=str(exc),
-                        context={"url": url},
-                        latency_ms=latency_ms,
-                    )
-        return None, attempts
+    buys = int(dex_data.get("buys", 0) or 0)
+    sells = int(dex_data.get("sells", 0) or 0)
+    trades = buys + sells
+    extra["trades24h"] = trades
+    extra["clogPercent"] = (sells / trades) * 100 if trades else None
 
     try:
-        selected_url, failures = asyncio.run(_select_endpoint())
-    except Exception as exc:  # pragma: no cover - asyncio misconfiguration
-        log_event(
-            logging.ERROR,
-            "etherscan_endpoint",
-            "Etherscan endpoint verification failed",
-            error=str(exc),
-        )
-        disable_etherscan_lookups(f"Etherscan verification failed: {exc}")
-        return
+        contract_info = advanced_contract_check(main_token)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.error("contract analysis failed for %s: %s", main_token, exc)
+        contract_info = {
+            "verified": False,
+            "riskScore": 9999,
+            "status": "ERROR",
+            "owner": None,
+            "ownerBalanceEth": None,
+            "ownerTokenBalance": None,
+            "implementation": None,
+            "renounced": None,
+            "slitherIssues": None,
+            "privateSale": {},
+            "onChainMetrics": {},
+        }
 
-    if selected_url:
-        previous_primary = ETHERSCAN_API_URL_CANDIDATES[0]
-        ETHERSCAN_API_URL = selected_url
-        if selected_url != previous_primary:
-            log_event(
-                logging.INFO,
-                "etherscan_endpoint",
-                "Using fallback Etherscan endpoint",
-                context={"url": selected_url},
-            )
-        return
+    extra.update(
+        {
+            "verified": contract_info.get("verified"),
+            "contractCheckStatus": contract_info.get("status"),
+            "riskScore": contract_info.get("riskScore"),
+            "owner": contract_info.get("owner"),
+            "ownerBalanceEth": contract_info.get("ownerBalanceEth"),
+            "ownerTokenBalance": contract_info.get("ownerTokenBalance"),
+            "implementation": contract_info.get("implementation"),
+            "contractRenounced": contract_info.get("renounced"),
+            "slitherIssues": contract_info.get("slitherIssues"),
+            "privateSale": contract_info.get("privateSale", {}),
+            "onChainMetrics": contract_info.get("onChainMetrics", {}),
+        }
+    )
 
-    for url, error in failures:
-        log_event(
-            logging.ERROR,
-            "etherscan_endpoint",
-            "Etherscan endpoint unreachable",
-            error=error,
-            context={"url": url},
-        )
-    disable_etherscan_lookups("All configured Etherscan endpoints unreachable")
+    honeypot_main = check_honeypot_is(main_token, pair_addr=pair_addr)
+    honeypot_counter = False
+    if counter_token.lower() != WETH_ADDRESS.lower():
+        honeypot_counter = check_honeypot_is(counter_token, pair_addr=pair_addr)
+    extra["honeypotMain"] = honeypot_main
+    extra["honeypotCounter"] = honeypot_counter
 
+    recent_liq_removal = check_recent_liquidity_removal(pair_addr)
+    extra["recentLiquidityRemoval"] = recent_liq_removal
+
+    checks: List[Tuple[str, bool]] = []
+
+    def add_check(name: str, passed: bool) -> None:
+        checks.append((name, bool(passed)))
+
+    add_check("liquidity", float(dex_data.get("liquidityUsd", 0)) >= MIN_LIQUIDITY_USD)
+    add_check("volume", float(dex_data.get("volume24h", 0)) >= MIN_VOLUME_USD)
+    add_check("fdv", float(dex_data.get("fdv", 0)) >= MIN_FDV_USD)
+    add_check("marketcap", float(dex_data.get("marketCap", 0)) >= MIN_MARKETCAP_USD)
+    add_check("buys", buys >= MIN_BUYS_FIRST_HOUR)
+    add_check("trades", trades >= MIN_TRADES_REQUIRED)
+    add_check("locked_liquidity", bool(dex_data.get("lockedLiquidity")))
+    add_check("no_recent_liq_removal", not recent_liq_removal)
+    add_check("honeypot_main", not honeypot_main)
+    add_check(
+        "honeypot_counter",
+        counter_token.lower() == WETH_ADDRESS.lower() or not honeypot_counter,
+    )
+    add_check("contract_verified", contract_info.get("verified") is True)
+    risk_score = contract_info.get("riskScore")
+    add_check(
+        "risk_score",
+        isinstance(risk_score, (int, float)) and risk_score < 10,
+    )
+    add_check("renounced", contract_info.get("renounced") is True)
+    private_sale = contract_info.get("privateSale", {})
+    add_check(
+        "no_private_sale",
+        not bool(private_sale.get("hasPresale")) if isinstance(private_sale, dict) else True,
+    )
+
+    passes = sum(1 for _, ok in checks if ok)
+    total_checks = len(checks) or expected_total_checks
+    extra["checkBreakdown"] = {name: ok for name, ok in checks}
+
+    return passes, total_checks, extra
 
 # Initialize wallet tracker now that helper functions are defined
 wallet_tracker = get_shared_tracker(w3_read, get_next_etherscan_key)
