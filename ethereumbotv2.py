@@ -378,6 +378,11 @@ class MetricsCollector:
         self.zero_throughput_alerted = False
         self.queue_depth_callback = None
         self.stop_event = threading.Event()
+        self.event_history = {name: deque() for name in ("pairs_scanned", "passes")}
+        self.daily_totals: Counter = Counter()
+        self.daily_period_start = datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         threading.Thread(target=self._emit_loop, daemon=True).start()
 
     def increment(self, name: str, value: int = 1) -> None:
@@ -386,6 +391,13 @@ class MetricsCollector:
             if name == "pairs_scanned":
                 self.last_pair_seen = time.time()
                 self.zero_throughput_alerted = False
+            if name in self.event_history:
+                now = time.time()
+                hist = self.event_history[name]
+                for _ in range(value):
+                    hist.append(now)
+                self._trim_history(name, now)
+                self.daily_totals[name] += value
 
     def record_rpc_call(self, latency_ms: float, *, error: bool = False) -> None:
         with self.lock:
@@ -407,6 +419,13 @@ class MetricsCollector:
 
     def set_queue_depth_callback(self, callback) -> None:
         self.queue_depth_callback = callback
+
+    def _trim_history(self, name: str, now: float, window: int = 3600) -> None:
+        hist = self.event_history.get(name)
+        if not hist:
+            return
+        while hist and now - hist[0] > window:
+            hist.popleft()
 
     def _emit_loop(self) -> None:
         while not self.stop_event.wait(60):
@@ -474,8 +493,101 @@ class MetricsCollector:
                 context={"errors_last_5m": error_count},
             )
 
+    def get_recent_counts(self, window: int = 3600) -> Dict[str, int]:
+        now = time.time()
+        with self.lock:
+            result: Dict[str, int] = {}
+            for name in self.event_history:
+                self._trim_history(name, now, window)
+                result[name] = len(self.event_history[name])
+            return result
+
+    def get_queue_depths(self) -> Dict[str, int]:
+        callback = self.queue_depth_callback
+        if not callback:
+            return {}
+        try:
+            data = callback() or {}
+        except Exception:
+            logger.exception("queue_depth_callback_error")
+            return {}
+        return dict(data)
+
+    def snapshot_daily_totals(self) -> Tuple[datetime, Dict[str, int]]:
+        with self.lock:
+            period_start = self.daily_period_start
+            totals = dict(self.daily_totals)
+            self.daily_totals = Counter()
+            self.daily_period_start = datetime.utcnow()
+            return period_start, totals
+
 
 metrics = MetricsCollector()
+runtime_reporter = RuntimeReporter(metrics)
+
+
+class RuntimeReporter:
+    """Send periodic Telegram summaries about the bot runtime."""
+
+    def __init__(self, metrics_collector: MetricsCollector):
+        self.metrics = metrics_collector
+        self.stop_event = threading.Event()
+        self.next_hour = self._next_hour_boundary()
+        self.next_midnight = self._next_midnight_boundary()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def _next_hour_boundary(reference: Optional[datetime] = None) -> datetime:
+        ref = reference or datetime.utcnow()
+        truncated = ref.replace(minute=0, second=0, microsecond=0)
+        return truncated + timedelta(hours=1)
+
+    @staticmethod
+    def _next_midnight_boundary(reference: Optional[datetime] = None) -> datetime:
+        ref = reference or datetime.utcnow()
+        tomorrow = (ref + timedelta(days=1)).date()
+        return datetime.combine(tomorrow, datetime.min.time())
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(30):
+            now = datetime.utcnow()
+            if now >= self.next_hour:
+                try:
+                    self.send_hourly_update(now)
+                except Exception:
+                    logger.exception("hourly_runtime_report_error")
+                self.next_hour = self._next_hour_boundary(now)
+            if now >= self.next_midnight:
+                try:
+                    self.send_daily_summary(now)
+                except Exception:
+                    logger.exception("daily_runtime_report_error")
+                self.next_midnight = self._next_midnight_boundary(now)
+
+    def send_hourly_update(self, now: datetime) -> None:
+        counts = self.metrics.get_recent_counts(3600)
+        queue_depths = self.metrics.get_queue_depths()
+        pending_rechecks = queue_depths.get("pending_rechecks", 0)
+        volume_pending = queue_depths.get("volume_checks", 0)
+        msg = (
+            "⏱️ Hourly runtime report\n"
+            f"Pairs scanned (1h): {counts.get('pairs_scanned', 0)}\n"
+            f"Pairs passed (1h): {counts.get('passes', 0)}\n"
+            f"Pairs pending recheck: {pending_rechecks}\n"
+            f"Volume checks pending: {volume_pending}"
+        )
+        send_telegram_message(msg)
+
+    def send_daily_summary(self, now: datetime) -> None:
+        period_start, totals = self.metrics.snapshot_daily_totals()
+        period_label = period_start.date().isoformat()
+        msg = (
+            "🗓️ Daily summary\n"
+            f"Period starting {period_label}\n"
+            f"Total pairs scanned: {totals.get('pairs_scanned', 0)}\n"
+            f"Total pairs passed: {totals.get('passes', 0)}"
+        )
+        send_telegram_message(msg)
 
 
 def init_excel(path: str):
@@ -2294,26 +2406,32 @@ def fetch_onchain_metrics(token_addr: str) -> dict:
     except Exception as e:
         logger.debug(f"totalSupply fetch error: {e}")
 
-    top_balance = 0
-    for h in holders:
-        if not isinstance(h, dict):
+    share_values: List[float] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
             continue
-        share = h.get("share")
+        share = holder.get("share")
         if share is None:
             share = _parse_holder_share(
-                h.get("TokenHolderPercentage") or h.get("TokenHolderShare")
+                holder.get("TokenHolderPercentage")
+                or holder.get("TokenHolderShare")
             )
-        if share is not None and total_supply > 0:
-            top_balance += int(total_supply * share)
+        if share is not None:
+            share_values.append(share)
             continue
-        bal_val = h.get("balance")
-        if bal_val is None:
-            bal_val = h.get("TokenHolderQuantity") or h.get("TokenHolderBalance")
-        bal = _parse_holder_balance(bal_val)
-        if bal is not None:
-            top_balance += bal
-    if total_supply > 0:
-        holder_share = top_balance / total_supply
+        if total_supply > 0:
+            bal_val = holder.get("balance")
+            if bal_val is None:
+                bal_val = (
+                    holder.get("TokenHolderQuantity")
+                    or holder.get("TokenHolderBalance")
+                    or holder.get("rawBalance")
+                )
+            bal = _parse_holder_balance(bal_val)
+            if bal is not None:
+                share_values.append(bal / total_supply)
+    if share_values:
+        holder_share = max(min(s, 1.0) for s in share_values)
     ratio = None
     if transfers["uniqueSellers"] > 0:
         ratio = transfers["uniqueBuyers"] / transfers["uniqueSellers"]
@@ -2446,760 +2564,6 @@ def list_wallet_monitors() -> List[str]:
     """Return list of tokens currently being monitored."""
     return list(wallet_monitor_tasks.keys())
 
-
-def detect_bull_market_early_gems(token_addr: str, pair_addr: str, wallet_report: dict = None) -> dict:
-    """Detect projects with high potential in first 5-30 minutes"""
-    indicators = {
-        "rapid_buyer_growth": False,
-        "no_early_dumps": False,
-        "organic_growth": False,
-        "dev_holding_stable": False,
-        "smart_money_aping": False,
-        "viral_potential": False,
-        "score": 0,
-    }
-
-    if MARKET_MODE != "bull":
-        return indicators
-
-    ds = fetch_dexscreener_data(token_addr, pair_addr)
-    metrics = analyze_transfer_history(token_addr, limit=50)
-
-    mc = (ds.get("fdv") or ds.get("marketCap") or 0) if ds else 0
-    liq = ds.get("liquidityUsd", 0) if ds else 0
-    buyers = metrics.get("uniqueBuyers", 0)
-    if (
-        mc < MIN_GEM_MARKETCAP_USD
-        or mc > MAX_GEM_MARKETCAP_USD
-        or liq < MIN_GEM_LIQUIDITY_USD
-        or buyers < MIN_GEM_UNIQUE_BUYERS
-    ):
-        return indicators
-
-    if wallet_report:
-        risk = wallet_report.get("risk_assessment", {}).get("overall_risk", 100)
-        marketing = wallet_report.get("marketing_analysis", {}).get("activity_score", 0)
-        if risk > MAX_GEM_RISK_SCORE or marketing < MIN_GEM_MARKETING_SCORE:
-            return indicators
-
-    if buyers >= MIN_GEM_UNIQUE_BUYERS:
-        indicators["rapid_buyer_growth"] = True
-        indicators["score"] += 25
-
-    sells = ds.get("sells", 0) if ds else 0
-    if liq > 0 and sells <= 3:
-        indicators["no_early_dumps"] = True
-        indicators["score"] += 20
-
-    total_buys = ds.get("buys", 0) if ds else 0
-    if total_buys > 0 and buyers / total_buys >= 0.5:
-        indicators["organic_growth"] = True
-        indicators["score"] += 15
-
-    adv = advanced_contract_check(token_addr)
-    if not adv.get("ownerActivity"):
-        indicators["dev_holding_stable"] = True
-        indicators["score"] += 10
-
-    if metrics.get("smartMoneyCount", 0) > 0:
-        indicators["smart_money_aping"] = True
-        indicators["score"] += 20
-
-    if ds and ds.get("baseTokenName") and re.search(
-        r"(pepe|doge|floki|inu|meme|pump)", ds.get("baseTokenName"), re.IGNORECASE
-    ):
-        indicators["viral_potential"] = True
-        indicators["score"] += 10
-
-    if wallet_report:
-        indicators["score"] += wallet_report.get("marketing_analysis", {}).get("activity_score", 0) * 0.2
-        risk = wallet_report.get("risk_assessment", {}).get("overall_risk", 100)
-        indicators["score"] += max(0, 50 - risk) * 0.2
-
-    return indicators
-
-
-
-def identify_bull_pump_patterns(pair_data: dict) -> dict:
-    patterns = {
-        "stealth_launch": False,
-        "community_takeover": False,
-        "meme_velocity": False,
-        "whale_accumulation": False,
-        "exchange_potential": False,
-        "whitelist_blacklist": False,
-        "dex_paid": False,
-        "score": 0,
-    }
-
-    if not has_private_sale(pair_data.get("token")):
-        patterns["stealth_launch"] = True
-        patterns["score"] += 20
-
-    if (
-        pair_data.get("renounced")
-        and pair_data.get("telegram_members_growth_rate", 0) > 50
-    ):
-        patterns["community_takeover"] = True
-        patterns["score"] += 20
-
-    name = str(pair_data.get("tokenName", ""))
-    if re.search(r"(pepe|doge|floki|inu|meme|pump)", name, re.IGNORECASE):
-        patterns["meme_velocity"] = True
-        patterns["score"] += 10
-
-    metrics = pair_data.get("onChainMetrics", {})
-    hc = metrics.get("holderConcentration")
-    sm = metrics.get("smartMoneyCount", 0)
-    if hc is not None and hc < 0.1 and sm > 0:
-        patterns["whale_accumulation"] = True
-        patterns["score"] += 20
-
-    if str(pair_data.get("contractCheckStatus", "")).lower() in {"ok", "verified"} and pair_data.get("riskScore", 0) < 5:
-        patterns["exchange_potential"] = True
-        patterns["score"] += 20
-
-    risk_flags = pair_data.get("riskFlags", {}) or {}
-    if risk_flags.get("canBlacklist") or risk_flags.get("botWhitelist"):
-        patterns["whitelist_blacklist"] = True
-        patterns["score"] += 60
-        if risk_flags.get("canBlacklist") and risk_flags.get("botWhitelist"):
-            patterns["score"] += 10
-
-    if pair_data.get("dexPaid"):
-        patterns["dex_paid"] = True
-        patterns["score"] += 15
-
-    return patterns
-
-
-###########################################################
-# Enhanced Bull Market Detection System
-###########################################################
-
-
-class BullMarketDetector:
-    """Utility class for Graph based analytics"""
-
-    def __init__(self):
-        self.successful_patterns = self.load_historical_patterns()
-        self.market_sentiment = self.calculate_market_sentiment()
-
-    def query_graph(self, query: str) -> dict:
-        """Execute GraphQL query against The Graph"""
-        try:
-            resp = requests.post(
-                GRAPH_URL,
-                json={"query": query},
-                headers={"Authorization": f"Bearer {GRAPH_BEARER}"},
-                timeout=10,
-            )
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Graph query failed: {e}")
-            return {}
-
-    def load_historical_patterns(self) -> dict:
-        """Load successful token patterns from previous bull runs"""
-        query = """
-        {
-            tokens(first:100, where:{ derivedETH_gt: "0.01" }, orderBy: tradeVolumeUSD, orderDirection: desc){
-                id
-                symbol
-                name
-                derivedETH
-                tradeVolumeUSD
-                totalLiquidity
-                txCount
-            }
-        }
-        """
-        data = self.query_graph(query)
-        patterns = {
-            "volume_acceleration": [],
-            "liquidity_growth": [],
-            "holder_patterns": [],
-            "price_trajectories": [],
-        }
-        for tok in data.get("data", {}).get("tokens", []):
-            patterns["volume_acceleration"].append(self.analyze_volume_pattern(tok["id"]))
-        return patterns
-
-    def calculate_market_sentiment(self) -> float:
-        """Calculate overall crypto market sentiment"""
-        query = """
-        {
-            bundle(id: "1") { ethPrice }
-            tokens(first:10, orderBy: tradeVolumeUSD, orderDirection: desc){ priceUSD volumeUSD totalValueLockedUSD }
-        }
-        """
-        _data = self.query_graph(query)
-        # Placeholder for real calculation
-        return 75.0
-
-    def analyze_volume_pattern(self, token_addr: str) -> dict:
-        query = f"""
-        {{
-            tokenDayDatas(first:30, orderBy: date, orderDirection: desc, where:{{ token: "{token_addr.lower()}" }}){{
-                date
-                volumeUSD
-            }}
-        }}
-        """
-        data = self.query_graph(query)
-        daily = data.get("data", {}).get("tokenDayDatas", [])
-        if len(daily) < 2:
-            return {"acceleration": 0, "consistency": 0, "trend": "flat"}
-        vols = [float(d.get("volumeUSD", 0)) for d in daily]
-        acceleration = float(np.gradient(vols).mean()) if vols else 0
-        consistency = 1 / (1 + np.std(vols) / (np.mean(vols) + 1))
-        return {
-            "acceleration": acceleration,
-            "consistency": consistency,
-            "trend": "increasing" if acceleration > 0 else "decreasing",
-        }
-
-    def get_token_metrics(self, token_addr: str) -> dict:
-        query = f"""
-        {{
-            token(id: "{token_addr.lower()}"){{
-                tradeVolumeUSD
-                totalLiquidity
-                txCount
-            }}
-        }}
-        """
-        data = self.query_graph(query)
-        t = data.get("data", {}).get("token", {}) or {}
-        return {
-            "volume": float(t.get("tradeVolumeUSD", 0)),
-            "liquidity": float(t.get("totalLiquidity", 0)),
-            "txCount": int(t.get("txCount", 0)),
-        }
-
-    def get_similar_tokens(self, token_addr: str, limit: int = 5) -> List[dict]:
-        token_info = self.get_token_metrics(token_addr)
-        query = (
-            "{ tokens(first:50, where:{ totalLiquidity_gte: \"%f\", totalLiquidity_lte: \"%f\", txCount_gte: %d }, orderBy: tradeVolumeUSD, orderDirection: desc){ id symbol priceUSD tradeVolumeUSD totalLiquidity }}"
-            % (
-                token_info["liquidity"] * 0.5,
-                token_info["liquidity"] * 2.0,
-                max(token_info["txCount"] // 2, 1),
-            )
-        )
-        data = self.query_graph(query)
-        return data.get("data", {}).get("tokens", [])[:limit]
-
-    def calculate_network_effect(self, token_addr: str) -> float:
-        query = f"""
-        {{
-            pairs(where: {{ token0: "{token_addr.lower()}" }}){{ id volumeUSD reserveUSD }}
-            pairs1: pairs(where: {{ token1: "{token_addr.lower()}" }}){{ id volumeUSD reserveUSD }}
-        }}
-        """
-        data = self.query_graph(query)
-        pairs = data.get("data", {}).get("pairs", [])
-        pairs.extend(data.get("data", {}).get("pairs1", []))
-        score = 0.0
-        for p in pairs:
-            vol = float(p.get("volumeUSD", 0))
-            reserve = float(p.get("reserveUSD", 0))
-            score += np.log1p(vol) * 0.3 + np.log1p(reserve) * 0.7
-        return min(score / 10, 100.0)
-
-
-class EnhancedBullGemDetector:
-    def __init__(self, graph_detector: BullMarketDetector):
-        self.graph = graph_detector
-        self.weights = {
-            "volume_velocity": 0.15,
-            "holder_quality": 0.15,
-            "network_effect": 0.10,
-            "market_timing": 0.10,
-            "pattern_match": 0.15,
-            "social_momentum": 0.10,
-            "liquidity_stability": 0.10,
-            "smart_money": 0.15,
-        }
-
-    def detect_bull_market_early_gems(self, token_addr: str, pair_addr: str, onchain_data: dict | None) -> dict:
-        onchain_data = onchain_data or {}
-        scores: Dict[str, float] = {}
-        vol_pat = self.graph.analyze_volume_pattern(token_addr)
-        scores["volume_velocity"] = self.calculate_volume_velocity_score(vol_pat, onchain_data)
-        scores["holder_quality"] = self.calculate_holder_quality_score(token_addr, onchain_data)
-        scores["network_effect"] = self.graph.calculate_network_effect(token_addr)
-        scores["market_timing"] = self.calculate_market_timing_score()
-        scores["pattern_match"] = self.calculate_pattern_match_score(token_addr, self.graph.get_similar_tokens(token_addr))
-        scores["social_momentum"] = self.calculate_social_momentum_score(onchain_data)
-        scores["liquidity_stability"] = self.calculate_liquidity_stability_score(pair_addr)
-        scores["smart_money"] = self.calculate_enhanced_smart_money_score(token_addr, onchain_data)
-
-        total = sum(scores[k] * self.weights[k] for k in scores)
-        gem_indicators = {
-            "is_early_gem": total >= 70,
-            "gem_confidence": min(total / 100, 1.0),
-            "score": total,
-            "breakdown": scores,
-            "top_factors": self.get_top_factors(scores),
-            "risk_factors": self.identify_risk_factors(scores),
-            "recommended_action": self.get_recommendation(total, scores),
-        }
-        return gem_indicators
-
-    def calculate_volume_velocity_score(self, volume_pattern: dict, onchain_data: dict | None) -> float:
-        onchain_data = onchain_data or {}
-        base = 0.0
-        if volume_pattern.get("acceleration", 0) > 1000:
-            base += 40
-        elif volume_pattern.get("acceleration", 0) > 100:
-            base += 25
-        elif volume_pattern.get("acceleration", 0) > 0:
-            base += 10
-        base += volume_pattern.get("consistency", 0) * 30
-        curr = onchain_data.get("volume24h", 0)
-        if curr > 100000:
-            base += 20
-        elif curr > 25000:
-            base += 10
-        if onchain_data.get("age_minutes", 60) < 60 and onchain_data.get("buys", 0) > 50:
-            base += 10
-        return min(base, 100.0)
-
-    def calculate_holder_quality_score(self, token_addr: str, onchain_data: dict | None) -> float:
-        onchain_data = onchain_data or {}
-        score = 0.0
-        query = f"""
-        {{
-            token(id: "{token_addr.lower()}"){{ holders: holderCount }}
-            transfers(first:100, where:{{ token:"{token_addr.lower()}" }}, orderBy: timestamp, orderDirection: desc){{ from to amount }}
-        }}
-        """
-        data = self.graph.query_graph(query)
-        holders = data.get("data", {}).get("token", {}).get("holders", 0)
-        if holders > 100:
-            score += 30
-        elif holders > 50:
-            score += 20
-        elif holders > 20:
-            score += 10
-        transfers = data.get("data", {}).get("transfers", [])
-        unique_buyers = len({t.get("to") for t in transfers})
-        unique_sellers = len({t.get("from") for t in transfers})
-        if unique_buyers > unique_sellers * 2:
-            score += 30
-        elif unique_buyers > unique_sellers:
-            score += 15
-        if onchain_data.get("holderConcentration", 1.0) < 0.3:
-            score += 20
-        elif onchain_data.get("holderConcentration", 1.0) < 0.5:
-            score += 10
-        if self.detect_organic_pattern(transfers):
-            score += 20
-        return min(score, 100.0)
-
-    def calculate_market_timing_score(self) -> float:
-        sentiment = self.graph.market_sentiment
-        if 40 <= sentiment <= 70:
-            return 80.0
-        if 30 <= sentiment <= 80:
-            return 60.0
-        if sentiment > 80:
-            return 40.0
-        return 20.0
-
-    def calculate_pattern_match_score(self, token_addr: str, similar_tokens: List[dict]) -> float:
-        if not similar_tokens:
-            return 50.0
-        score = 0.0
-        current = self.graph.get_token_metrics(token_addr)
-        for s in similar_tokens:
-            if current.get("volume", 0) > float(s.get("tradeVolumeUSD", 0)) * 0.1:
-                score += 20
-        return min(score, 100.0)
-
-    def calculate_social_momentum_score(self, onchain_data: dict | None) -> float:
-        onchain_data = onchain_data or {}
-        score = 0.0
-        name = str(onchain_data.get("tokenName", "")).lower()
-        viral_terms = [
-            "pepe",
-            "doge",
-            "shib",
-            "floki",
-            "inu",
-            "moon",
-            "rocket",
-            "elon",
-            "trump",
-            "lambo",
-            "wagmi",
-            "gm",
-            "based",
-            "chad",
-        ]
-        viral_count = sum(1 for term in viral_terms if term in name)
-        score += min(viral_count * 15, 30)
-        links = onchain_data.get("socialLinks", [])
-        if any("twitter" in l for l in links):
-            score += 20
-        if any("telegram" in l for l in links):
-            score += 20
-        if any("discord" in l for l in links):
-            score += 10
-        buys = onchain_data.get("buys", 0)
-        age_hours = onchain_data.get("age_minutes", 60) / 60
-        if age_hours > 0:
-            bph = buys / age_hours
-            if bph > 100:
-                score += 20
-            elif bph > 50:
-                score += 10
-        return min(score, 100.0)
-
-    def calculate_liquidity_stability_score(self, pair_addr: str) -> float:
-        query = f"""
-        {{
-            pairDayDatas(first:7, orderBy: date, orderDirection: desc, where:{{ pairAddress: "{pair_addr.lower()}" }}){{ date reserveUSD }}
-        }}
-        """
-        data = self.graph.query_graph(query)
-        daily = data.get("data", {}).get("pairDayDatas", [])
-        if not daily:
-            return 50.0
-        reserves = [float(d.get("reserveUSD", 0)) for d in daily]
-        if len(reserves) >= 2:
-            if reserves[0] > reserves[-1] * 1.5:
-                return 90.0
-            if reserves[0] > reserves[-1] * 1.2:
-                return 70.0
-            if reserves[0] > reserves[-1]:
-                return 60.0
-        return 40.0
-
-    def calculate_enhanced_smart_money_score(self, token_addr: str, onchain_data: dict | None) -> float:
-        onchain_data = onchain_data or {}
-        score = onchain_data.get("smartMoneyCount", 0) * 10
-        query = f"""
-        {{
-            transfers(first:50, where:{{ token:"{token_addr.lower()}", amount_gt: "1000000" }}, orderBy: amount, orderDirection: desc){{ from to amount }}
-        }}
-        """
-        data = self.graph.query_graph(query)
-        transfers = data.get("data", {}).get("transfers", [])
-        whale_buys = sum(1 for t in transfers if t.get("to") not in BASE_TOKENS)
-        whale_sells = sum(1 for t in transfers if t.get("from") not in BASE_TOKENS)
-        if whale_buys > whale_sells * 2:
-            score += 40
-        elif whale_buys > whale_sells:
-            score += 20
-        return min(score, 100.0)
-
-    def detect_organic_pattern(self, transfers: List[dict]) -> bool:
-        if len(transfers) < 10:
-            return True
-        amounts = [float(t.get("amount", 0)) for t in transfers[:20]]
-        if amounts:
-            std = np.std(amounts)
-            mean = np.mean(amounts)
-            if mean > 0 and std / mean < 0.1:
-                return False
-        return True
-
-    def get_top_factors(self, scores: dict) -> List[str]:
-        sorted_scores = sorted(scores.items(), key=lambda x: x[1] * self.weights.get(x[0], 0), reverse=True)
-        return [k for k, _ in sorted_scores[:3] if scores.get(k, 0) > 50]
-
-    def identify_risk_factors(self, scores: dict) -> List[str]:
-        risks = []
-        if scores.get("liquidity_stability", 0) < 40:
-            risks.append("Unstable liquidity")
-        if scores.get("holder_quality", 0) < 30:
-            risks.append("Poor holder distribution")
-        if scores.get("market_timing", 0) < 30:
-            risks.append("Unfavorable market conditions")
-        if scores.get("pattern_match", 0) < 20:
-            risks.append("Doesn't match successful patterns")
-        return risks
-
-    def get_recommendation(self, total: float, scores: dict) -> str:
-        if total >= 80:
-            return "🚀 HIGH CONVICTION - Strong buy signal"
-        if total >= 70:
-            return "✅ GOOD OPPORTUNITY - Consider entry"
-        if total >= 60:
-            return "👀 WATCH CLOSELY - Wait for confirmation"
-        if total >= 50:
-            # Avoid potential unicode parsing issues on some platforms
-            return "RISKY - Only for high risk tolerance (\u26A0)"
-        return "❌ AVOID - Too many red flags"
-
-
-class EnhancedBullPatternAnalyzer:
-    def __init__(self, graph_detector: BullMarketDetector):
-        self.graph = graph_detector
-        self.patterns = {
-            "stealth_ninja": self.detect_stealth_ninja_launch,
-            "community_fomo": self.detect_community_fomo_pattern,
-            "whale_accumulation": self.detect_whale_accumulation,
-            "exchange_rush": self.detect_exchange_rush_pattern,
-            "meme_supercycle": self.detect_meme_supercycle,
-            "defi_rotation": self.detect_defi_rotation,
-            "copy_trade_magnet": self.detect_copy_trade_pattern,
-        }
-
-    def identify_bull_pump_patterns(self, token_data: dict) -> dict:
-        detected = {}
-        confidences = []
-        for name, func in self.patterns.items():
-            res = func(token_data)
-            if res["detected"]:
-                detected[name] = res
-                confidences.append(res["confidence"])
-        avg_score = sum(confidences) / len(confidences) if confidences else 0.0
-        dominant = max(detected, key=lambda k: detected[k]["confidence"]) if detected else None
-        return {
-            "patterns_detected": list(detected.keys()),
-            "pattern_details": detected,
-            "score": min(avg_score, 100.0),
-            "dominant_pattern": dominant,
-            "pump_probability": self.calculate_pump_probability(detected),
-            "recommended_strategy": self.get_strategy_recommendation(detected),
-        }
-
-    def detect_stealth_ninja_launch(self, token_data: dict) -> dict:
-        indicators = {
-            "no_presale": not token_data.get("privateSale", {}).get("hasPresale", False),
-            "low_initial_liquidity": token_data.get("liquidityUsd", 0) < 50000,
-            "rapid_growth": token_data.get("buys", 0) > 30 and in_first_hour(token_data),
-            "fair_launch": token_data.get("contractRenounced", False),
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 60, "confidence": conf, "indicators": indicators, "description": "Stealth launch with organic growth potential"}
-
-    def detect_community_fomo_pattern(self, token_data: dict) -> dict:
-        growth = self.analyze_social_growth(token_data)
-        indicators = {
-            "telegram_explosive": growth.get("telegram_growth_rate", 0) > 100,
-            "twitter_viral": growth.get("twitter_mentions", 0) > 50,
-            "holder_rush": token_data.get("uniqueBuyers", 0) > 100,
-            "no_major_sells": token_data.get("sells", 0) < token_data.get("buys", 0) * 0.1,
-            "increasing_volume": self.check_volume_trend(token_data),
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 70, "confidence": conf, "indicators": indicators, "description": "Community FOMO building rapidly"}
-
-    def detect_whale_accumulation(self, token_data: dict) -> dict:
-        query = f"""
-        {{
-            transfers(
-                where: {{ token: "{token_data['token'].lower()}", amount_gt: "10000" }},
-                orderBy: timestamp,
-                orderDirection: asc
-            ) {{
-                from
-                to
-                amount
-                timestamp
-            }}
-        }}
-        """
-        data = self.graph.query_graph(query)
-        transfers = data.get("data", {}).get("transfers", [])
-        whale_wallets = set()
-        score = 0
-        for t in transfers:
-            if t.get("to") not in BASE_TOKENS:
-                whale_wallets.add(t.get("to"))
-                score += 1
-            if t.get("from") in whale_wallets:
-                score -= 0.5
-        indicators = {
-            "whale_count": len(whale_wallets) > 3,
-            "accumulation_trend": score > 5,
-            "smart_money_present": token_data.get("smartMoneyCount", 0) > 0,
-            "stable_liquidity": token_data.get("liquidityUsd", 0) > 100000,
-            "low_sell_pressure": token_data.get("clogPercent", 100) < 30,
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 60, "confidence": conf, "indicators": indicators, "whale_addresses": list(whale_wallets)[:5], "description": f"{len(whale_wallets)} whales accumulating"}
-
-    def detect_exchange_rush_pattern(self, token_data: dict) -> dict:
-        indicators = {
-            "high_volume": token_data.get("volume24h", 0) > 500000,
-            "many_holders": self.get_holder_count(token_data["token"]) > 500,
-            "verified_contract": token_data.get("contractCheckStatus") == "OK",
-            "low_risk": token_data.get("riskScore", 100) < 5,
-            "professional_setup": bool(token_data.get("socialLinks", [])),
-            "locked_liquidity": token_data.get("lockedLiquidity", False),
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 70, "confidence": conf, "indicators": indicators, "description": "Professional setup indicating exchange ambitions"}
-
-    def detect_meme_supercycle(self, token_data: dict) -> dict:
-        name = token_data.get("tokenName", "").lower()
-        meme_keywords = {
-            "tier1": ["pepe", "doge", "shib", "floki"],
-            "tier2": ["inu", "elon", "moon", "chad", "wojak"],
-            "tier3": ["gm", "wagmi", "based", "frog", "cat", "pnut"],
-        }
-        meme_score = 0
-        for tier, keywords in meme_keywords.items():
-            for kw in keywords:
-                if kw in name:
-                    meme_score += {"tier1": 30, "tier2": 20, "tier3": 10}[tier]
-        meme_market_hot = self.check_meme_market_temperature()
-        indicators = {
-            "meme_name": meme_score > 0,
-            "viral_potential": meme_score >= 30,
-            "meme_market_hot": meme_market_hot > 70,
-            "community_driven": token_data.get("contractRenounced", False),
-            "high_tx_count": token_data.get("buys", 0) + token_data.get("sells", 0) > 100,
-            "social_presence": len(token_data.get("socialLinks", [])) > 0,
-        }
-        conf = (sum(indicators.values()) / len(indicators)) * 100
-        conf *= (1 + meme_score / 100)
-        return {"detected": conf > 60, "confidence": min(conf, 100.0), "indicators": indicators, "meme_score": meme_score, "description": f"Meme potential in {meme_market_hot}% hot market"}
-
-    def detect_defi_rotation(self, token_data: dict) -> dict:
-        defi = self.check_defi_characteristics(token_data)
-        indicators = {
-            "defi_features": defi.get("has_defi_features"),
-            "high_apy_potential": defi.get("yield_potential", 0) > 100,
-            "tvl_growing": self.check_tvl_growth(token_data["token"]),
-            "institutional_interest": token_data.get("liquidityUsd", 0) > 500000,
-            "low_risk_profile": token_data.get("riskScore", 100) < 10,
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 60, "confidence": conf, "indicators": indicators, "description": "DeFi rotation opportunity detected"}
-
-    def detect_copy_trade_pattern(self, token_data: dict) -> dict:
-        notable_buyers = self.identify_notable_buyers(token_data["token"])
-        indicators = {
-            "followed_wallets": len(notable_buyers) > 0,
-            "consistent_buys": self.check_consistent_buying(token_data["token"]),
-            "no_insider_dumps": not self.detect_insider_selling(token_data),
-            "growing_interest": token_data.get("buys", 0) > token_data.get("sells", 0) * 3,
-            "alpha_seekers": token_data.get("smartMoneyCount", 0) > 2,
-        }
-        conf = sum(indicators.values()) / len(indicators) * 100
-        return {"detected": conf > 60, "confidence": conf, "indicators": indicators, "notable_buyers": notable_buyers[:3], "description": f"{len(notable_buyers)} notable wallets accumulating"}
-
-    def calculate_pump_probability(self, patterns: dict) -> float:
-        if not patterns:
-            return 10.0
-        weights = {
-            "whale_accumulation": 0.25,
-            "community_fomo": 0.20,
-            "meme_supercycle": 0.15,
-            "exchange_rush": 0.15,
-            "stealth_ninja": 0.10,
-            "copy_trade_magnet": 0.10,
-            "defi_rotation": 0.05,
-        }
-        prob = 0.0
-        for p, d in patterns.items():
-            prob += d["confidence"] * weights.get(p, 0.1)
-        prob *= (0.5 + 0.5 * self.graph.market_sentiment / 100)
-        return min(prob, 95.0)
-
-    def get_strategy_recommendation(self, patterns: dict) -> dict:
-        if not patterns:
-            return {"action": "SKIP", "reasoning": "No significant patterns detected", "risk_level": "N/A"}
-        dom = max(patterns, key=lambda k: patterns[k]["confidence"])
-        strategies = {
-            "whale_accumulation": {"action": "ACCUMULATE", "reasoning": "Whales accumulating", "risk_level": "LOW", "position_size": "5%"},
-            "community_fomo": {"action": "BUY BREAKOUT", "reasoning": "Community FOMO", "risk_level": "MEDIUM", "position_size": "3%"},
-            "exchange_rush": {"action": "Accumulate before listing", "exit": "Sell on exchange announcement", "risk_level": "MEDIUM", "position_size": "2-4% of portfolio"},
-        }
-        return strategies.get(dom, {"action": "RESEARCH MORE", "reasoning": f"{dom} pattern needs investigation", "risk_level": "UNKNOWN"})
-
-    # ----- helper stubs -----
-    def check_volume_trend(self, token_data: dict) -> bool:
-        vp = self.graph.analyze_volume_pattern(token_data["token"])
-        return vp.get("trend") == "increasing"
-
-    def get_holder_count(self, token_addr: str) -> int:
-        query = f"{{ token(id: \"{token_addr.lower()}\"){{ holderCount }} }}"
-        data = self.graph.query_graph(query)
-        return data.get("data", {}).get("token", {}).get("holderCount", 0)
-
-    def check_meme_market_temperature(self) -> float:
-        return 0.0
-
-    def analyze_social_growth(self, token_data: dict) -> dict:
-        return {"telegram_growth_rate": 0, "twitter_mentions": 0}
-
-    def check_defi_characteristics(self, token_data: dict) -> dict:
-        return {"has_defi_features": False, "yield_potential": 0}
-
-    def check_tvl_growth(self, token_addr: str) -> bool:
-        return False
-
-    def identify_notable_buyers(self, token_addr: str) -> List[str]:
-        return []
-
-    def check_consistent_buying(self, token_addr: str) -> bool:
-        return False
-
-    def detect_insider_selling(self, token_data: dict) -> bool:
-        return False
-
-
-def in_first_hour(token_data: dict) -> bool:
-    return token_data.get("age_minutes", 61) <= 60
-
-
-def integrate_enhanced_detection(token_addr: str, pair_addr: str, existing_data: dict) -> dict:
-    graph_detector = BullMarketDetector()
-    gem_detector = EnhancedBullGemDetector(graph_detector)
-    pattern_analyzer = EnhancedBullPatternAnalyzer(graph_detector)
-    gem_results = gem_detector.detect_bull_market_early_gems(token_addr, pair_addr, existing_data)
-    pattern_results = pattern_analyzer.identify_bull_pump_patterns({**existing_data, "token": token_addr})
-    return {
-        "gem_analysis": gem_results,
-        "pattern_analysis": pattern_results,
-        "combined_score": (gem_results["score"] + pattern_results["score"]) / 2,
-        "action_required": gem_results["score"] >= 70 or pattern_results["score"] >= 70,
-        "priority_level": calculate_priority(gem_results, pattern_results),
-    }
-
-
-def calculate_priority(gem_results: dict, pattern_results: dict) -> str:
-    combined = (gem_results["score"] + pattern_results["score"]) / 2
-    if combined >= 85:
-        return "🔴 CRITICAL - Immediate action"
-    if combined >= 70:
-        return "🟠 HIGH - Strong opportunity"
-    if combined >= 55:
-        return "🟡 MEDIUM - Worth watching"
-    return "🟢 LOW - Monitor only"
-
-
-def send_enhanced_alert(pair_addr: str, results: dict):
-    msg = f"[EnhancedBull] <code>{pair_addr}</code>\n"
-    msg += f"Gem Score: {results['gem_analysis']['score']:.1f}\n"
-    msg += f"Pattern Score: {results['pattern_analysis']['score']:.1f}\n"
-    msg += f"Priority: {results['priority_level']}"
-    send_telegram_message(msg)
-
-
-def send_borderline_warning(
-    pair_addr: str,
-    mc: float,
-    liq: float,
-    risk_score: float,
-    marketing_score: float,
-    wl_bl: bool,
-):
-    """Alert when a project narrowly misses gem criteria."""
-    msg = f"[GemWarning] <code>{pair_addr}</code>\n"
-    msg += f"MC: ${mc:,.0f} | Liq: ${liq:,.0f}\n"
-    msg += f"Risk: {risk_score:.1f} | Marketing: {marketing_score:.1f}"
-    if wl_bl:
-        msg += "\nWhitelist/Blacklist present"
-    msg += "\nBorderline metrics - monitor closely"
-    send_telegram_message(msg)
 
 
 ###########################################################
@@ -4100,502 +3464,6 @@ def advanced_contract_check(token_addr: str) -> dict:
         }
 
 
-###########################################################
-# Additional Metrics Helpers
-###########################################################
-
-def _parse_holder_balance(raw_value: Union[str, int, float, None]) -> Optional[int]:
-    if raw_value is None:
-        return None
-    if isinstance(raw_value, int):
-        return raw_value
-    if isinstance(raw_value, float):
-        if not np.isfinite(raw_value):
-            return None
-        return int(raw_value)
-    if isinstance(raw_value, str):
-        value = raw_value.strip()
-        if not value:
-            return None
-        try:
-            if value.startswith("0x"):
-                return int(value, 16)
-            if "." in value:
-                return int(float(value))
-            return int(value)
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_holder_share(raw_value: Union[str, int, float, None]) -> Optional[float]:
-    if raw_value is None:
-        return None
-    try:
-        if isinstance(raw_value, (int, float)):
-            share = float(raw_value)
-        elif isinstance(raw_value, str):
-            cleaned = raw_value.replace("%", "").strip()
-            if not cleaned:
-                return None
-            share = float(cleaned)
-        else:
-            return None
-    except (TypeError, ValueError):
-        return None
-
-    if share > 1:
-        share = share / 100.0
-    if share < 0:
-        return None
-    return min(share, 1.0)
-
-
-def _normalise_holder_entry(entry: dict) -> Optional[dict]:
-    address = entry.get("address") or entry.get("TokenHolderAddress")
-    if not address:
-        return None
-    try:
-        address = to_checksum_address(address)
-    except ValueError:
-        # keep original if checksum conversion fails
-        address = address
-
-    balance = _parse_holder_balance(
-        entry.get("balance")
-        or entry.get("TokenHolderQuantity")
-        or entry.get("TokenHolderBalance")
-        or entry.get("rawBalance")
-    )
-    share = _parse_holder_share(
-        entry.get("share")
-        or entry.get("TokenHolderPercentage")
-        or entry.get("TokenHolderShare")
-    )
-    result = {"address": address, "balance": balance}
-    if share is not None:
-        result["share"] = share
-    return result
-
-
-async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List[dict]:
-    base_url = ETHPLORER_BASE_URL.rstrip("/")
-    url = f"{base_url}/getTopTokenHolders/{token_addr}"
-    params = {"apiKey": ETHPLORER_API_KEY or "freekey", "limit": limit}
-    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
-    try:
-        async with create_aiohttp_session(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-        log_event(
-            logging.WARNING,
-            "ethplorer_api",
-            "Failed to fetch holder distribution",
-            error=str(exc),
-            context={"token": token_addr},
-        )
-        return []
-    except Exception as exc:
-        logger.debug(f"ethplorer holder fetch error: {exc}")
-        return []
-
-    holders = []
-    for item in payload.get("holders", []):
-        normalised = _normalise_holder_entry(item)
-        if normalised:
-            holders.append(normalised)
-    if holders:
-        log_event(
-            logging.INFO,
-            "ethplorer_api",
-            "Fetched holder distribution via Ethplorer",
-            context={"token": token_addr, "count": len(holders)},
-        )
-    return holders
-
-
-async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
-    holders = await _fetch_ethplorer_top_holders(token_addr, limit)
-    if holders:
-        return holders
-
-    if not ETHERSCAN_LOOKUPS_ENABLED or not USE_ETHERSCAN_TOKEN_HOLDERS:
-        return holders
-
-    api_key = get_next_etherscan_key()
-    if not api_key:
-        return holders
-    params = {
-        "module": "token",
-        "action": "tokenholderlist",
-        "contractaddress": token_addr,
-        "page": 1,
-        "offset": limit,
-        "apikey": api_key,
-    }
-    try:
-        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
-        if isinstance(data, dict):
-            result = data.get("result", [])
-            if isinstance(result, list):
-                holders = []
-                for entry in result:
-                    normalised = _normalise_holder_entry(entry)
-                    if normalised:
-                        holders.append(normalised)
-                return holders
-        return holders
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
-        return holders
-    except Exception as e:
-        logger.debug(f"holder distribution error: {e}")
-        return holders
-
-
-def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
-    return asyncio.run(_fetch_holder_distribution_async(token_addr, limit))
-
-
-async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> dict:
-    if not ETHERSCAN_LOOKUPS_ENABLED:
-        return {
-            "uniqueBuyers": 0,
-            "uniqueSellers": 0,
-            "smartMoneyCount": 0,
-        }
-    api_key = get_next_etherscan_key()
-    metrics = {
-        "uniqueBuyers": 0,
-        "uniqueSellers": 0,
-        "smartMoneyCount": 0,
-    }
-    if not api_key:
-        return metrics
-    params = {
-        "module": "account",
-        "action": "tokentx",
-        "contractaddress": token_addr,
-        "page": 1,
-        "offset": limit,
-        "sort": "asc",
-        "apikey": api_key,
-    }
-    try:
-        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
-        if data.get("status") != "1":
-            return metrics
-        buyers = set()
-        sellers = set()
-        for tx in data.get("result", []):
-            frm = tx.get("from", "").lower()
-            to = tx.get("to", "").lower()
-            if frm in {ZERO_ADDRESS.lower(), token_addr.lower()}:
-                buyers.add(to)
-            elif to in {ZERO_ADDRESS.lower(), token_addr.lower()}:
-                sellers.add(frm)
-            if frm in SMART_MONEY_WALLETS or to in SMART_MONEY_WALLETS:
-                metrics["smartMoneyCount"] += 1
-        metrics["uniqueBuyers"] = len(buyers)
-        metrics["uniqueSellers"] = len(sellers)
-        return metrics
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"transfer history lookup failed: {e}")
-        return metrics
-    except Exception as e:
-        logger.debug(f"transfer history error: {e}")
-        return metrics
-
-
-def analyze_transfer_history(token_addr: str, limit: int = 100) -> dict:
-    return asyncio.run(_analyze_transfer_history_async(token_addr, limit))
-
-
-async def _detect_private_sale_async(token_addr: str) -> dict:
-    if not ETHERSCAN_LOOKUPS_ENABLED:
-        return {"hasPresale": False, "largeTransfers": []}
-    api_key = get_next_etherscan_key()
-    result = {"hasPresale": False, "largeTransfers": []}
-    if not api_key:
-        return result
-    params = {
-        "module": "account",
-        "action": "tokentx",
-        "contractaddress": token_addr,
-        "page": 1,
-        "offset": 20,
-        "sort": "asc",
-        "apikey": api_key,
-    }
-    try:
-        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
-        if data.get("status") != "1":
-            return result
-        total_supply = None
-        try:
-            abi = [{"constant": True, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}]
-            c = w3_read.eth.contract(to_checksum_address(token_addr), abi=abi)
-            total_supply = c.functions.totalSupply().call()
-        except Exception:
-            pass
-        for tx in data.get("result", []):
-            val = int(tx.get("value", "0"))
-            if total_supply and val > total_supply * 0.02:
-                result["hasPresale"] = True
-                result["largeTransfers"].append(tx.get("to"))
-        return result
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"private sale lookup failed: {e}")
-        return result
-    except Exception as e:
-        logger.debug(f"private sale detect error: {e}")
-        return result
-
-
-def detect_private_sale_indicators(token_addr: str) -> dict:
-    return asyncio.run(_detect_private_sale_async(token_addr))
-
-
-def has_private_sale(token_addr: str) -> bool:
-    info = detect_private_sale_indicators(token_addr)
-    return info.get("hasPresale", False)
-
-
-def fetch_onchain_metrics(token_addr: str) -> dict:
-    holders = fetch_holder_distribution(token_addr)
-    if not isinstance(holders, list):
-        holders = []
-    transfers = analyze_transfer_history(token_addr)
-    holder_share = None
-    total_supply = 0
-    try:
-        abi = [{
-            "constant": True,
-            "inputs": [],
-            "name": "totalSupply",
-            "outputs": [{"name": "", "type": "uint256"}],
-            "type": "function",
-        }]
-        c = w3_read.eth.contract(to_checksum_address(token_addr), abi=abi)
-        total_supply = c.functions.totalSupply().call()
-    except Exception as e:
-        logger.debug(f"totalSupply fetch error: {e}")
-
-    top_balance = 0
-    for h in holders:
-        if not isinstance(h, dict):
-            continue
-        share = h.get("share")
-        if share is None:
-            share = _parse_holder_share(
-                h.get("TokenHolderPercentage") or h.get("TokenHolderShare")
-            )
-        if share is not None and total_supply > 0:
-            top_balance += int(total_supply * share)
-            continue
-        bal_val = h.get("balance")
-        if bal_val is None:
-            bal_val = h.get("TokenHolderQuantity") or h.get("TokenHolderBalance")
-        bal = _parse_holder_balance(bal_val)
-        if bal is not None:
-            top_balance += bal
-    if total_supply > 0:
-        holder_share = top_balance / total_supply
-    ratio = None
-    if transfers["uniqueSellers"] > 0:
-        ratio = transfers["uniqueBuyers"] / transfers["uniqueSellers"]
-    return {
-        "holderConcentration": holder_share,
-        "uniqueBuyerSellerRatio": ratio,
-        "smartMoneyCount": transfers["smartMoneyCount"],
-    }
-
-
-def get_current_liquidity(token_addr: str, pair_addr: str) -> float:
-    """Helper to fetch current liquidity for a pair.
-
-    The previous implementation mistakenly queried DexScreener with the pair
-    address for both parameters which always returned empty data. By accepting
-    the token address separately we ensure the lookup matches the pair and
-    provides meaningful liquidity figures."""
-    ds = fetch_dexscreener_data(token_addr, pair_addr)
-    if ds:
-        return ds.get("liquidityUsd", 0)
-    return 0
-
-
-def get_wallet_report(token_addr: str) -> dict:
-    """Return cached wallet report or generate a new one."""
-    key = token_addr.lower()
-    now = time.time()
-    data = WALLET_REPORT_CACHE.get(key)
-    if data and now - data.get("ts", 0) < WALLET_REPORT_TTL:
-        return data["report"]
-    try:
-        fut = asyncio.run_coroutine_threadsafe(
-            wallet_tracker.generate_wallet_report(token_addr), wallet_event_loop
-        )
-        report = fut.result()
-        WALLET_REPORT_CACHE[key] = {"ts": now, "report": report}
-        return report
-    except Exception as e:
-        logger.error(f"wallet report error for {token_addr}: {e}")
-        return {
-            "risk_assessment": {"overall_risk": 100, "red_flags": ["error"]},
-            "marketing_analysis": {"activity_score": 0, "total_spend_eth": 0},
-            "developer_analysis": {"holding_percentage": 0},
-            "wallet_summary": {},
-        }
-
-
-
-# ---------------------------------------------------------
-# Wallet monitoring helpers (start/stop/list + resolver)
-# ---------------------------------------------------------
-
-def _resolve_main_token_from_arg(arg: str) -> Optional[str]:
-    """Accepts a token or pair address; returns main token address or None."""
-    if not arg:
-        return None
-    a = arg.strip()
-    a_low = a.lower()
-    # Direct token address (heuristic)
-    if a_low.startswith("0x") and len(a_low) == 42:
-        # If it's a known pair, convert to token
-        if a_low in known_pairs:
-            t0, t1 = known_pairs[a_low]
-            try:
-                return get_non_weth_token(t0, t1)
-            except Exception:
-                return t1 if t0.lower() == WETH_ADDRESS.lower() else t0
-        # Otherwise assume token
-        return a
-    # Try to match known pairs by prefix
-    for p, (t0, t1) in list(known_pairs.items()):
-        if p.lower().startswith(a_low) or p.lower().endswith(a_low):
-            try:
-                return get_non_weth_token(t0, t1)
-            except Exception:
-                return t1 if t0.lower() == WETH_ADDRESS.lower() else t0
-    return None
-
-
-def start_wallet_monitor(token_addr: str):
-    """Start background wallet monitoring if under limit."""
-    key = token_addr.lower()
-    if key in wallet_monitor_tasks or len(wallet_monitor_tasks) >= MAX_WALLET_MONITORS:
-        return
-    stop_event = asyncio.Event()
-    wallet_monitor_stops[key] = stop_event
-    try:
-        fut = asyncio.run_coroutine_threadsafe(
-            wallet_tracker.monitor_wallet_realtime(token_addr, wallet_activity_callback, stop_event),
-            wallet_event_loop,
-        )
-        wallet_monitor_tasks[key] = fut
-    except Exception as e:
-        logger.error(f"wallet monitor error for {token_addr}: {e}")
-
-
-def stop_wallet_monitor(token_or_pair_addr: str) -> bool:
-    """Stop a running monitor. Returns True if stopped."""
-    token = _resolve_main_token_from_arg(token_or_pair_addr) or token_or_pair_addr
-    key = token.lower()
-    fut = wallet_monitor_tasks.pop(key, None)
-    ev = wallet_monitor_stops.pop(key, None)
-    if ev is not None:
-        try:
-            ev.set()
-        except Exception:
-            pass
-    if fut is not None:
-        try:
-            fut.cancel()
-        except Exception:
-            pass
-        return True
-    return False
-
-
-def stop_all_wallet_monitors() -> int:
-    keys = list(wallet_monitor_tasks.keys())
-    count = 0
-    for k in keys:
-        try:
-            if stop_wallet_monitor(k):
-                count += 1
-        except Exception:
-            continue
-    return count
-
-
-def list_wallet_monitors() -> List[str]:
-    """Return list of tokens currently being monitored."""
-    return list(wallet_monitor_tasks.keys())
-
-
-def in_first_hour(token_data: dict) -> bool:
-    return token_data.get("age_minutes", 61) <= 60
-
-
-def critical_verification_failure(extra: Dict) -> Tuple[bool, str]:
-    """Return True if contract is unverified with error or risk score 9999."""
-    status = str(extra.get("contractCheckStatus", "")).upper()
-    risk = extra.get("riskScore")
-    if status == "ERROR":
-        return True, "verification error"
-    if risk == 9999:
-        return True, "risk score 9999"
-    return False, ""
-
-
-def store_pair_record(pair: str, token0: str, token1: str, passes: int, total: int, extra: Dict):
-    if not isinstance(extra, dict):
-        extra = {}
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb.active
-    found = False
-    for row in ws.iter_rows(min_row=2):
-        if str(row[0].value).lower() == pair.lower():
-            row[1].value = token0
-            row[2].value = token1
-            row[3].value = int(time.time())
-            row[4].value = passes
-            row[5].value = total
-            row[6].value = extra.get("liquidityUsd", 0)
-            row[7].value = extra.get("volume24h", 0)
-            row[8].value = extra.get("marketCap", 0)
-            found = True
-            break
-    if not found:
-        ws.append([
-            pair,
-            token0,
-            token1,
-            int(time.time()),
-            passes,
-            total,
-            extra.get("liquidityUsd", 0),
-            extra.get("volume24h", 0),
-            extra.get("marketCap", 0),
-            "",
-            "",
-        ])
-    wb.save(EXCEL_FILE)
-
-
-def record_first_sell(pair: str, seller: str, block: int):
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb.active
-    for row in ws.iter_rows(min_row=2):
-        if str(row[0].value).lower() == pair.lower():
-            row[9].value = seller
-            row[10].value = block
-            break
-    wb.save(EXCEL_FILE)
-
 
 ###########################################################
 # 10. PASSING PAIRS
@@ -5113,6 +3981,8 @@ def recheck_logic_detail(
         check_marketcap_milestones(pair_addr, mc)
     main_token = get_non_weth_token(t0, t1)
     wallet_rep = get_wallet_report(main_token)
+    if passes >= MIN_PASS_THRESHOLD and not is_passing_refresh:
+        metrics.increment("passes")
     if passes >= MIN_PASS_THRESHOLD:
         start_wallet_monitor(main_token)
     return (passes, total, extra)
@@ -5397,45 +4267,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             check_marketcap_milestones(paddr, mc_now)
 
         main_token = get_non_weth_token(token0, token1)
-        wallet_report = extra.get("wallet_analysis")
-        if not wallet_report or "risk_assessment" not in wallet_report:
-            wallet_report = get_wallet_report(main_token)
-        gem = {}
-        patterns = {}
-        liq_now = extra.get("liquidityUsd", 0)
-        risk_flags = extra.get("riskFlags", {})
-        wl_bl = risk_flags.get("canBlacklist") or risk_flags.get("botWhitelist")
-        risk_score = wallet_report.get("risk_assessment", {}).get("overall_risk", 100)
-        marketing_score = wallet_report.get("marketing_analysis", {}).get("activity_score", 0)
-        risk_ok = risk_score <= MAX_GEM_RISK_SCORE
-        marketing_ok = marketing_score >= MIN_GEM_MARKETING_SCORE
-        near_risk = risk_score <= MAX_GEM_RISK_SCORE + GEM_WARNING_RISK_DELTA
-        near_marketing = marketing_score >= MIN_GEM_MARKETING_SCORE - GEM_WARNING_MARKETING_DELTA
-        mc_ok = MIN_GEM_MARKETCAP_USD <= mc_now <= MAX_GEM_MARKETCAP_USD
-        liq_ok = liq_now >= MIN_GEM_LIQUIDITY_USD
-        near_mc = MIN_GEM_MARKETCAP_USD * 0.8 <= mc_now < MIN_GEM_MARKETCAP_USD
-        near_liq = MIN_GEM_LIQUIDITY_USD * 0.8 <= liq_now < MIN_GEM_LIQUIDITY_USD
-        if ((risk_ok and marketing_ok and wallet_report) or wl_bl) and mc_ok and liq_ok:
-            report_for_gem = wallet_report if risk_ok and marketing_ok else None
-            gem = detect_bull_market_early_gems(main_token, paddr, report_for_gem)
-            patterns = identify_bull_pump_patterns({**extra, "token": main_token, "riskFlags": risk_flags, "dexPaid": extra.get("dexPaid", False)})
-            send_bull_insights(paddr, extra.get("tokenName", ""), gem, patterns)
-        elif (
-            (mc_ok and liq_ok and (near_risk or near_marketing or wl_bl))
-            or ((near_mc or near_liq) and risk_ok and marketing_ok)
-        ):
-            send_borderline_warning(paddr, mc_now, liq_now, risk_score, marketing_score, bool(wl_bl))
-
-        if mc_ok and liq_ok:
-            enhanced_results = integrate_enhanced_detection(main_token, paddr, extra)
-            if enhanced_results["action_required"]:
-                send_enhanced_alert(paddr, enhanced_results)
-            extra["enhanced_gem_score"] = enhanced_results["gem_analysis"]["score"]
-            extra["enhanced_pattern_score"] = enhanced_results["pattern_analysis"]["score"]
-            extra["bull_market_signals"] = enhanced_results
-        else:
-            extra["enhanced_gem_score"] = 0
-            extra["enhanced_pattern_score"] = 0
 
         if passes >= MIN_PASS_THRESHOLD:
             metrics.increment("passes")
@@ -5544,6 +4375,9 @@ def save_last_block(bn: int, fname: str):
 def main():
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
     ensure_etherscan_connectivity()
+    send_telegram_message(
+        "🤖 Ethereum bot v2 online and scanning for fresh Ethereum pairs."
+    )
 
     last_block_v2 = load_last_block(LAST_BLOCK_FILE_V2)
     if last_block_v2 == 0:
