@@ -139,6 +139,10 @@ ALCHEMY_URL = os.getenv(
     "ALCHEMY_URL",
     "https://eth-mainnet.g.alchemy.com/v2/ICzV00BkkR9g70gaOJrx0O80fO_c2oPB",
 )
+ALCHEMY_URL_BACKUP = os.getenv(
+    "ALCHEMY_URL_BACKUP",
+    "https://eth-mainnet.g.alchemy.com/v2/_KmbgabXYB1pttUpXP5Ls",
+)
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", "8274484247:AAEoiTgXb6xLDmmSU3yLbqQaMOW81v541pY"
@@ -215,6 +219,60 @@ def _unique_urls(urls: List[Optional[str]]) -> List[str]:
 INFURA_EMERGENCY_URLS = _unique_urls(
     [INFURA_URL_EMERGENCY_1, INFURA_URL_EMERGENCY_2]
 )
+
+ALCHEMY_PROVIDER_URLS = _unique_urls([ALCHEMY_URL, ALCHEMY_URL_BACKUP])
+_READ_PROVIDER_INDEX = -1
+
+
+def _init_read_provider(urls: List[str]) -> Tuple[Web3, int]:
+    """Initialise the primary read-only provider with fallback support."""
+
+    if not urls:
+        raise RuntimeError("No Alchemy provider URLs configured")
+
+    last_exc: Optional[Exception] = None
+    for idx, url in enumerate(urls):
+        try:
+            provider = Web3(HTTPProvider(url))
+            if provider.is_connected():
+                if idx > 0:
+                    log_event(
+                        logging.WARNING,
+                        "rpc_provider_init",
+                        "reader provider fallback engaged",
+                        context={"url": url, "index": idx},
+                    )
+                return provider, idx
+            log_event(
+                logging.ERROR,
+                "rpc_provider_init",
+                "reader provider unreachable",
+                context={"url": url, "index": idx},
+            )
+        except Exception as exc:  # pragma: no cover - defensive connection guard
+            last_exc = exc
+            log_event(
+                logging.ERROR,
+                "rpc_provider_init",
+                "reader provider connection error",
+                error=str(exc),
+                context={"url": url, "index": idx},
+            )
+
+    log_event(
+        logging.ERROR,
+        "rpc_provider_init",
+        "reader provider fallback failed; defaulting to primary",
+        error=str(last_exc) if last_exc else "unreachable",
+        context={"url": urls[0], "index": 0},
+    )
+    return Web3(HTTPProvider(urls[0])), 0
+
+
+def _current_read_provider_url() -> str:
+    if 0 <= _READ_PROVIDER_INDEX < len(ALCHEMY_PROVIDER_URLS):
+        return ALCHEMY_PROVIDER_URLS[_READ_PROVIDER_INDEX]
+    return ALCHEMY_URL
 
 # Wallet tracker settings
 WALLET_REPORT_TTL = 600  # 10 minutes
@@ -693,7 +751,18 @@ def store_pair_record(
 # 2. WEB3 & SESSION
 ###########################################################
 
-w3_read = Web3(HTTPProvider(ALCHEMY_URL))
+try:
+    w3_read, _READ_PROVIDER_INDEX = _init_read_provider(ALCHEMY_PROVIDER_URLS)
+except Exception as exc:  # pragma: no cover - defensive startup guard
+    _READ_PROVIDER_INDEX = 0
+    w3_read = Web3(HTTPProvider(ALCHEMY_PROVIDER_URLS[0]))
+    log_event(
+        logging.ERROR,
+        "rpc_provider_init",
+        "reader provider initialization exception",
+        error=str(exc),
+        context={"url": _current_read_provider_url()},
+    )
 
 _EVENT_PROVIDER_URLS = _unique_urls(
     [INFURA_URL, INFURA_URL_BACKUP, *INFURA_EMERGENCY_URLS]
@@ -731,7 +800,7 @@ def _connect_provider(urls: List[str], label: str) -> Tuple[Web3, int]:
             logging.ERROR,
             "rpc_provider_init",
             f"All {label} providers unavailable; using reader",
-            context={"url": ALCHEMY_URL},
+            context={"url": _current_read_provider_url()},
         )
         return w3_read, -1
     raise RuntimeError(f"Unable to establish {label} provider")
