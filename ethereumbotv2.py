@@ -3720,6 +3720,7 @@ def advanced_contract_check(token_addr: str) -> dict:
 ###########################################################
 
 passing_pairs: Dict[str, dict] = {}
+PASSED_PAIRS: Set[str] = set()
 
 # Pairs waiting to hit minimum volume/trade requirements before promotion
 volume_checks: Dict[str, dict] = {}
