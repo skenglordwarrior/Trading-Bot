@@ -139,6 +139,10 @@ ALCHEMY_URL = os.getenv(
     "ALCHEMY_URL",
     "https://eth-mainnet.g.alchemy.com/v2/ICzV00BkkR9g70gaOJrx0O80fO_c2oPB",
 )
+ALCHEMY_URL_BACKUP = os.getenv(
+    "ALCHEMY_URL_BACKUP",
+    "https://eth-mainnet.g.alchemy.com/v2/_KmbgabXYB1pttUpXP5Ls",
+)
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN", "8274484247:AAEoiTgXb6xLDmmSU3yLbqQaMOW81v541pY"
@@ -214,6 +218,16 @@ def _unique_urls(urls: List[Optional[str]]) -> List[str]:
 
 INFURA_EMERGENCY_URLS = _unique_urls(
     [INFURA_URL_EMERGENCY_1, INFURA_URL_EMERGENCY_2]
+)
+
+_READER_PROVIDER_URLS = _unique_urls(
+    [
+        ALCHEMY_URL,
+        ALCHEMY_URL_BACKUP,
+        INFURA_URL,
+        INFURA_URL_BACKUP,
+        *INFURA_EMERGENCY_URLS,
+    ]
 )
 
 # Wallet tracker settings
@@ -693,19 +707,9 @@ def store_pair_record(
 # 2. WEB3 & SESSION
 ###########################################################
 
-w3_read = Web3(HTTPProvider(ALCHEMY_URL))
-
-_EVENT_PROVIDER_URLS = _unique_urls(
-    [INFURA_URL, INFURA_URL_BACKUP, *INFURA_EMERGENCY_URLS]
-)
-_EVENT_V3_PROVIDER_URLS = _unique_urls(
-    [INFURA_URL_V3, INFURA_URL_V3_BACKUP, *INFURA_EMERGENCY_URLS]
-)
-_EVENT_PROVIDER_INDEX = -1
-_EVENT_V3_PROVIDER_INDEX = -1
-
-
-def _connect_provider(urls: List[str], label: str) -> Tuple[Web3, int]:
+def _connect_provider(
+    urls: List[str], label: str, fallback: Optional[Web3] = None
+) -> Tuple[Web3, int]:
     for idx, url in enumerate(urls):
         try:
             provider = Web3(HTTPProvider(url))
@@ -726,22 +730,48 @@ def _connect_provider(urls: List[str], label: str) -> Tuple[Web3, int]:
                 error=str(exc),
                 context={"url": url, "index": idx},
             )
-    if w3_read.is_connected():
+    if fallback is not None and fallback.is_connected():
+        provider = getattr(fallback, "provider", None)
+        fallback_url = getattr(provider, "endpoint_uri", "<unknown>")
         log_event(
             logging.ERROR,
             "rpc_provider_init",
             f"All {label} providers unavailable; using reader",
-            context={"url": ALCHEMY_URL},
+            context={"url": fallback_url},
         )
-        return w3_read, -1
+        return fallback, -1
     raise RuntimeError(f"Unable to establish {label} provider")
 
 
+w3_read, _ = _connect_provider(_READER_PROVIDER_URLS, "reader")
+
+_EVENT_PROVIDER_URLS = _unique_urls(
+    [
+        ALCHEMY_URL,
+        ALCHEMY_URL_BACKUP,
+        INFURA_URL,
+        INFURA_URL_BACKUP,
+        *INFURA_EMERGENCY_URLS,
+    ]
+)
+_EVENT_V3_PROVIDER_URLS = _unique_urls(
+    [
+        ALCHEMY_URL,
+        ALCHEMY_URL_BACKUP,
+        INFURA_URL_V3,
+        INFURA_URL_V3_BACKUP,
+        *INFURA_EMERGENCY_URLS,
+    ]
+)
+_EVENT_PROVIDER_INDEX = -1
+_EVENT_V3_PROVIDER_INDEX = -1
+
+
 w3_event, _EVENT_PROVIDER_INDEX = _connect_provider(
-    _EVENT_PROVIDER_URLS, "uniswap_v2"
+    _EVENT_PROVIDER_URLS, "uniswap_v2", fallback=w3_read
 )
 w3_event_v3, _EVENT_V3_PROVIDER_INDEX = _connect_provider(
-    _EVENT_V3_PROVIDER_URLS, "uniswap_v3"
+    _EVENT_V3_PROVIDER_URLS, "uniswap_v3", fallback=w3_read
 )
 
 FETCH_TIMEOUT = 30
@@ -806,7 +836,7 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
         if tracker_etherscan_get_async is not None:
             result = await tracker_etherscan_get_async(prepared_params, timeout)
         else:
-            async with aiohttp.ClientSession() as session:
+            async with create_aiohttp_session() as session:
                 async with session.get(
                     ETHERSCAN_API_URL, params=prepared_params, timeout=timeout
                 ) as resp:
@@ -1372,7 +1402,7 @@ async def _check_recent_liquidity_removal_async(pair_addr: str, timeframe_sec: i
     }
     try:
         params = _prepare_etherscan_params(params)
-        async with aiohttp.ClientSession() as session:
+        async with create_aiohttp_session() as session:
             async with session.get(ETHERSCAN_API_URL, params=params, timeout=FETCH_TIMEOUT) as r:
                 j = await r.json()
         metrics.record_api_call(error=False)
@@ -1479,7 +1509,7 @@ def ensure_etherscan_connectivity() -> None:
     async def _select_endpoint():
         attempts: List[Tuple[str, str]] = []
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with create_aiohttp_session(timeout=timeout) as session:
             for url in ETHERSCAN_API_URL_CANDIDATES:
                 start = time.perf_counter()
                 try:

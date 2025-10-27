@@ -19,8 +19,15 @@ from collections import defaultdict
 import numpy as np
 import logging
 
+from etherscan_config import load_etherscan_base_urls
+
 # Constants shared with ethereumbotv2
-ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+_ETHERSCAN_API_URLS = load_etherscan_base_urls()
+ETHERSCAN_API_URL = (
+    _ETHERSCAN_API_URLS[0]
+    if _ETHERSCAN_API_URLS
+    else "https://api.etherscan.io/v2/api"
+)
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
