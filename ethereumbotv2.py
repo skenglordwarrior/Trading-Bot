@@ -1851,7 +1851,41 @@ def check_owner_wallet_activity(token_addr: str, owner_addr: str) -> bool:
     return asyncio.run(_check_owner_wallet_activity_async(token_addr, owner_addr))
 
 
-async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
+def _coerce_goplus_flag(value: Optional[Union[str, int, bool]]) -> Optional[bool]:
+    """Normalize GoPlus boolean-like values to real booleans."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"1", "true", "yes", "y"}:
+            return True
+        if cleaned in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _extract_goplus_security(entry: dict) -> dict:
+    """Return a trimmed security payload with normalized flags."""
+
+    security: dict = {"raw": entry}
+    score = entry.get("total_score")
+    try:
+        security["total_score"] = int(score) if score is not None else None
+    except (TypeError, ValueError):
+        security["total_score"] = None
+    whitelist_flag = entry.get("is_whitelist")
+    if whitelist_flag is None:
+        whitelist_flag = entry.get("is_whitelisted")
+    security["is_whitelist"] = _coerce_goplus_flag(whitelist_flag)
+    return security
+
+
+async def _fetch_third_party_security_async(token_addr: str) -> Optional[dict]:
     url = (
         "https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses="
         f"{token_addr}"
@@ -1861,15 +1895,22 @@ async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
             async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
                 data = await resp.json()
         entry = data.get("result", {}).get(token_addr.lower())
-        if entry and "total_score" in entry:
-            return int(entry["total_score"])
+        if entry:
+            return _extract_goplus_security(entry)
     except Exception as e:
         logger.debug(f"third-party score error: {e}")
     return None
 
 
+def get_third_party_security(token_addr: str) -> Optional[dict]:
+    return asyncio.run(_fetch_third_party_security_async(token_addr))
+
+
 def get_third_party_risk_score(token_addr: str) -> Optional[int]:
-    return asyncio.run(_fetch_third_party_risk_score_async(token_addr))
+    security = get_third_party_security(token_addr)
+    if security:
+        return security.get("total_score")
+    return None
 
 
 def get_lp_total_supply(pair_addr: str) -> Optional[int]:
@@ -1951,6 +1992,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         "autoLiquidityAdd": False,
         "ownerPrivileges": False,
         "thirdPartyScore": None,
+        "thirdPartyWhitelist": False,
         "vestingOrTimelock": False,
         "privateSaleFunctions": False,
     }
@@ -2069,6 +2111,8 @@ def analyze_solidity_source(source_text: str) -> dict:
         risk_score += 1
     if flags["thirdPartyScore"] is not None:
         risk_score += max(0, (100 - flags["thirdPartyScore"]) // 20)
+    if flags["thirdPartyWhitelist"]:
+        risk_score += 4
 
     flags["score"] = risk_score
     return flags
@@ -2189,7 +2233,12 @@ def advanced_contract_check(token_addr: str) -> dict:
         renounced = True
     else:
         renounced = check_renounced_by_event(target)
-    third_score = get_third_party_risk_score(target)
+    third_party_security = get_third_party_security(target)
+    third_score = None
+    third_party_whitelist = None
+    if third_party_security:
+        third_score = third_party_security.get("total_score")
+        third_party_whitelist = third_party_security.get("is_whitelist")
     private_sale = detect_private_sale_indicators(target)
     onchain_metrics = fetch_onchain_metrics(target)
 
@@ -2208,6 +2257,8 @@ def advanced_contract_check(token_addr: str) -> dict:
         else:
             flags["renounced"] = False
         flags["thirdPartyScore"] = third_score
+        if third_party_whitelist:
+            flags["thirdPartyWhitelist"] = True
         score = flags.get("score", 0)
         if third_score is not None:
             score += max(0, (100 - third_score) // 20)
@@ -2237,6 +2288,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "ownerActivity": suspicious_activity,
             "privateSale": private_sale,
             "onChainMetrics": onchain_metrics,
+            "thirdPartySecurity": third_party_security,
         }
         return result
     elif info["status"] == ContractVerificationStatus.UNVERIFIED:
@@ -2251,6 +2303,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "thirdPartySecurity": third_party_security,
         }
     else:
         return {
@@ -2264,6 +2317,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "thirdPartySecurity": third_party_security,
         }
 
 
@@ -3234,7 +3288,7 @@ def check_owner_wallet_activity(token_addr: str, owner_addr: str) -> bool:
     return asyncio.run(_check_owner_wallet_activity_async(token_addr, owner_addr))
 
 
-async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
+async def _fetch_third_party_security_async(token_addr: str) -> Optional[dict]:
     url = (
         "https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses="
         f"{token_addr}"
@@ -3244,15 +3298,22 @@ async def _fetch_third_party_risk_score_async(token_addr: str) -> Optional[int]:
             async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
                 data = await resp.json()
         entry = data.get("result", {}).get(token_addr.lower())
-        if entry and "total_score" in entry:
-            return int(entry["total_score"])
+        if entry:
+            return _extract_goplus_security(entry)
     except Exception as e:
         logger.debug(f"third-party score error: {e}")
     return None
 
 
+def get_third_party_security(token_addr: str) -> Optional[dict]:
+    return asyncio.run(_fetch_third_party_security_async(token_addr))
+
+
 def get_third_party_risk_score(token_addr: str) -> Optional[int]:
-    return asyncio.run(_fetch_third_party_risk_score_async(token_addr))
+    security = get_third_party_security(token_addr)
+    if security:
+        return security.get("total_score")
+    return None
 
 
 def get_lp_total_supply(pair_addr: str) -> Optional[int]:
@@ -3334,6 +3395,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         "autoLiquidityAdd": False,
         "ownerPrivileges": False,
         "thirdPartyScore": None,
+        "thirdPartyWhitelist": False,
         "vestingOrTimelock": False,
         "privateSaleFunctions": False,
     }
@@ -3452,6 +3514,8 @@ def analyze_solidity_source(source_text: str) -> dict:
         risk_score += 1
     if flags["thirdPartyScore"] is not None:
         risk_score += max(0, (100 - flags["thirdPartyScore"]) // 20)
+    if flags["thirdPartyWhitelist"]:
+        risk_score += 4
 
     flags["score"] = risk_score
     return flags
