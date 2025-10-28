@@ -164,6 +164,20 @@ class RecheckStopTest(unittest.TestCase):
         flags = analyze_solidity_source(code)
         self.assertTrue(flags.get("walletDrainer"))
 
+    def test_emit_transfer_to_contract_not_flagged(self):
+        code = """
+        pragma solidity ^0.8.0;
+        contract Example {
+            event Transfer(address indexed from, address indexed to, uint256 amount);
+
+            function log(address from, uint256 amount) external {
+                emit Transfer(from, address(this), amount);
+            }
+        }
+        """
+        flags = analyze_solidity_source(code)
+        self.assertFalse(flags.get("walletDrainer"))
+
 
 if __name__ == "__main__":
     unittest.main()

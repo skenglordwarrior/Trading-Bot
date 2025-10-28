@@ -117,7 +117,7 @@ _SUSPICIOUS_DEST_TERMS = (
     "wallet",
     "tax",
 )
-_SUSPICIOUS_SOURCE_TERMS = ("msg.sender", "tx.origin")
+_SUSPICIOUS_SOURCE_TERMS = ("msg.sender", "tx.origin", "_msgsender", "_msgsender()")
 _CONTRACT_SELF_TERM = "address(this)"
 
 
@@ -143,6 +143,12 @@ def _has_wallet_drainer_pattern(source_text: str) -> bool:
     """Detect suspicious token transfer patterns that siphon wallets."""
 
     for match in _TRANSFER_NAME_REGEX.finditer(source_text):
+        prefix = source_text[: match.start()].rstrip()
+        lower_prefix = prefix.lower()
+        if lower_prefix.endswith("emit") or lower_prefix.endswith("event") or lower_prefix.endswith(
+            "function"
+        ):
+            continue
         open_paren_index = match.end() - 1
         raw_args = _extract_call_arguments(source_text, open_paren_index)
         if not raw_args:
