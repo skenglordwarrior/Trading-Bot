@@ -2,7 +2,7 @@ import unittest
 import asyncio
 from unittest.mock import patch, AsyncMock
 
-from TelegramBot import (
+from ethereumbotv2 import (
     analyze_solidity_source,
     check_liquidity_locked_etherscan,
     queue_recheck,
@@ -10,7 +10,7 @@ from TelegramBot import (
     pending_rechecks,
     RECHECK_DELAYS,
 )
-import TelegramBot
+import ethereumbotv2
 
 
 class TransferBlockingModifierTest(unittest.TestCase):
@@ -94,28 +94,25 @@ class TransferBlockingModifierTest(unittest.TestCase):
 
 class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_lock_detected(self):
-        fake_resp = AsyncMock()
-        fake_resp.__aenter__.return_value = fake_resp
-        fake_resp.json.return_value = {
-            "status": "1",
-            "result": [
-                {"from": "0xpair", "to": "0x000000000000000000000000000000000000dead"}
-            ],
-        }
-        fake_session = AsyncMock()
-        def fake_get(*args, **kwargs):
-            return fake_resp
-        fake_session.get = fake_get
-        fake_session.__aenter__.return_value = fake_session
-        with patch("aiohttp.ClientSession", return_value=fake_session), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}):
-            locked = await TelegramBot._check_liquidity_locked_etherscan_async("0xpair")
+        fake_tracker = AsyncMock(
+            return_value={
+                "status": "1",
+                "result": [
+                    {"from": "0xpair", "to": "0x000000000000000000000000000000000000dead"}
+                ],
+            }
+        )
+        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
+            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        ):
+            locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
 
 
 class RecheckStopTest(unittest.TestCase):
     def test_recheck_stops_after_three_attempts(self):
-        with patch("TelegramBot.RECHECK_DELAYS", [0, 0, 0]):
-            with patch("TelegramBot.recheck_logic_detail", return_value=(0, 10, {})):
+        with patch("ethereumbotv2.RECHECK_DELAYS", [0, 0, 0]):
+            with patch("ethereumbotv2.recheck_logic_detail", return_value=(0, 10, {})):
                 queue_recheck("0xPair", "0x1", "0x2")
                 for _ in range(4):
                     handle_rechecks()

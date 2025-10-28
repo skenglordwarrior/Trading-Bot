@@ -104,6 +104,70 @@ if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
+_TRANSFER_NAME_REGEX = re.compile(
+    r"\b(safeTransferFrom|transferFrom|safeTransfer|transfer)\s*\(",
+    re.IGNORECASE,
+)
+_SUSPICIOUS_DEST_TERMS = (
+    "owner",
+    "dev",
+    "marketing",
+    "team",
+    "treasury",
+    "wallet",
+    "tax",
+)
+_SUSPICIOUS_SOURCE_TERMS = ("msg.sender", "tx.origin")
+_CONTRACT_SELF_TERM = "address(this)"
+
+
+def _extract_call_arguments(source_text: str, open_paren_index: int) -> str:
+    depth = 0
+    args_chars: List[str] = []
+    for idx in range(open_paren_index + 1, len(source_text)):
+        ch = source_text[idx]
+        if ch == "(":
+            depth += 1
+            args_chars.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                return "".join(args_chars)
+            depth -= 1
+            args_chars.append(ch)
+        else:
+            args_chars.append(ch)
+    return ""
+
+
+def _has_wallet_drainer_pattern(source_text: str) -> bool:
+    """Detect suspicious token transfer patterns that siphon wallets."""
+
+    for match in _TRANSFER_NAME_REGEX.finditer(source_text):
+        open_paren_index = match.end() - 1
+        raw_args = _extract_call_arguments(source_text, open_paren_index)
+        if not raw_args:
+            continue
+        args = [a.strip().lower() for a in raw_args.split(",")]
+        if len(args) < 2:
+            continue
+        from_arg = args[0]
+        to_arg = args[1]
+
+        if any(term in to_arg for term in (_CONTRACT_SELF_TERM, *_SUSPICIOUS_SOURCE_TERMS)):
+            return True
+
+        keyword_to = any(term in to_arg for term in _SUSPICIOUS_DEST_TERMS)
+        from_matches_source = any(term in from_arg for term in _SUSPICIOUS_SOURCE_TERMS)
+        from_is_contract = _CONTRACT_SELF_TERM in from_arg
+        to_is_contract = _CONTRACT_SELF_TERM in to_arg
+
+        if to_is_contract and not from_is_contract:
+            return True
+        if keyword_to and (from_matches_source or from_is_contract):
+            return True
+    return False
+
+
 def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
     """Return an ``aiohttp`` session that honours environment proxy settings."""
 
@@ -2103,11 +2167,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
@@ -3506,11 +3566,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
