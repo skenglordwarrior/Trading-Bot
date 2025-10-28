@@ -3128,6 +3128,7 @@ def check_pair_criteria(
             "verified": contract_info.get("verified"),
             "contractCheckStatus": contract_info.get("status"),
             "riskScore": contract_info.get("riskScore"),
+            "riskFlags": contract_info.get("riskFlags", {}),
             "owner": contract_info.get("owner"),
             "ownerBalanceEth": contract_info.get("ownerBalanceEth"),
             "ownerTokenBalance": contract_info.get("ownerTokenBalance"),

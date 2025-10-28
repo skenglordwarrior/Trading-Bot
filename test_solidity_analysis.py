@@ -9,6 +9,7 @@ from ethereumbotv2 import (
     handle_rechecks,
     pending_rechecks,
     RECHECK_DELAYS,
+    check_pair_criteria,
 )
 import ethereumbotv2
 
@@ -177,6 +178,48 @@ class RecheckStopTest(unittest.TestCase):
         """
         flags = analyze_solidity_source(code)
         self.assertFalse(flags.get("walletDrainer"))
+
+
+class PairCriteriaRiskPropagationTest(unittest.TestCase):
+    def test_wallet_drainer_flag_clears_in_pair_extra(self):
+        dex_stub = {
+            "priceUsd": 1.0,
+            "liquidityUsd": 30000.0,
+            "volume24h": 50000.0,
+            "fdv": 100000.0,
+            "marketCap": 100000.0,
+            "buys": 120,
+            "sells": 40,
+            "lockedLiquidity": True,
+            "baseTokenName": "TestToken",
+            "baseTokenSymbol": "TT",
+        }
+        contract_stub = {
+            "verified": True,
+            "status": "OK",
+            "riskScore": 4,
+            "riskFlags": {"walletDrainer": False, "ownerFunctions": True},
+            "owner": "0xowner",
+            "ownerBalanceEth": 0,
+            "ownerTokenBalance": 0,
+            "implementation": None,
+            "renounced": True,
+            "slitherIssues": 0,
+            "privateSale": {},
+            "onChainMetrics": {},
+        }
+        with patch("ethereumbotv2.fetch_dexscreener_data", return_value=(dex_stub, None)), patch(
+            "ethereumbotv2.advanced_contract_check", return_value=contract_stub
+        ), patch("ethereumbotv2.check_honeypot_is", return_value=False), patch(
+            "ethereumbotv2.check_recent_liquidity_removal", return_value=False
+        ):
+            passes, total, extra = check_pair_criteria(
+                "0xPair", "0xToken", ethereumbotv2.WETH_ADDRESS
+            )
+        self.assertEqual(passes, total)
+        self.assertEqual(extra.get("riskScore"), contract_stub["riskScore"])
+        self.assertIn("riskFlags", extra)
+        self.assertFalse(extra["riskFlags"].get("walletDrainer"))
 
 
 if __name__ == "__main__":
