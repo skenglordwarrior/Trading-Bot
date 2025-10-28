@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     parser = None
 import contextlib
 import io
-from typing import Optional, Dict, Tuple, List, Union, Set
+from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
 import requests
@@ -102,6 +102,70 @@ except NameError:  # pragma: no cover - defensive
 # Selector policy avoids those spurious warnings.
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+_TRANSFER_NAME_REGEX = re.compile(
+    r"\b(safeTransferFrom|transferFrom|safeTransfer|transfer)\s*\(",
+    re.IGNORECASE,
+)
+_SUSPICIOUS_DEST_TERMS = (
+    "owner",
+    "dev",
+    "marketing",
+    "team",
+    "treasury",
+    "wallet",
+    "tax",
+)
+_SUSPICIOUS_SOURCE_TERMS = ("msg.sender", "tx.origin")
+_CONTRACT_SELF_TERM = "address(this)"
+
+
+def _extract_call_arguments(source_text: str, open_paren_index: int) -> str:
+    depth = 0
+    args_chars: List[str] = []
+    for idx in range(open_paren_index + 1, len(source_text)):
+        ch = source_text[idx]
+        if ch == "(":
+            depth += 1
+            args_chars.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                return "".join(args_chars)
+            depth -= 1
+            args_chars.append(ch)
+        else:
+            args_chars.append(ch)
+    return ""
+
+
+def _has_wallet_drainer_pattern(source_text: str) -> bool:
+    """Detect suspicious token transfer patterns that siphon wallets."""
+
+    for match in _TRANSFER_NAME_REGEX.finditer(source_text):
+        open_paren_index = match.end() - 1
+        raw_args = _extract_call_arguments(source_text, open_paren_index)
+        if not raw_args:
+            continue
+        args = [a.strip().lower() for a in raw_args.split(",")]
+        if len(args) < 2:
+            continue
+        from_arg = args[0]
+        to_arg = args[1]
+
+        if any(term in to_arg for term in (_CONTRACT_SELF_TERM, *_SUSPICIOUS_SOURCE_TERMS)):
+            return True
+
+        keyword_to = any(term in to_arg for term in _SUSPICIOUS_DEST_TERMS)
+        from_matches_source = any(term in from_arg for term in _SUSPICIOUS_SOURCE_TERMS)
+        from_is_contract = _CONTRACT_SELF_TERM in from_arg
+        to_is_contract = _CONTRACT_SELF_TERM in to_arg
+
+        if to_is_contract and not from_is_contract:
+            return True
+        if keyword_to and (from_matches_source or from_is_contract):
+            return True
+    return False
 
 
 def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
@@ -188,6 +252,8 @@ MIN_MARKETCAP_USD = 40_000
 MIN_BUYS_FIRST_HOUR = 20
 MIN_TRADES_REQUIRED = 20
 
+VERIFICATION_RETRY_DELAY = int(os.getenv("VERIFICATION_RETRY_DELAY", "300"))
+
 # Allow freshly-created pairs some time to appear on DexScreener before we give up
 DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW = int(
     os.getenv("DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW", "1800")
@@ -206,6 +272,15 @@ def critical_verification_failure(extra: Dict) -> Tuple[bool, str]:
     return False, ""
 
 
+def _format_retry_delay(seconds: int) -> str:
+    if seconds <= 0:
+        return "soon"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds} seconds"
+
+
 def _unique_urls(urls: List[Optional[str]]) -> List[str]:
     seen = set()
     result: List[str] = []
@@ -214,6 +289,38 @@ def _unique_urls(urls: List[Optional[str]]) -> List[str]:
             result.append(url)
             seen.add(url)
     return result
+
+
+def _schedule_verification_retry(
+    pair_addr: str,
+    store: Dict[str, Any],
+    extra: Dict,
+    context: str,
+    attempt_num: Optional[int] = None,
+) -> None:
+    """Record a verification warning, schedule a retry, and notify Telegram."""
+
+    now_ts = time.time()
+    store["verification_warning"] = True
+    store["verification_retry_at"] = now_ts + VERIFICATION_RETRY_DELAY
+    if "attempt_index" in store:
+        store["attempt_index"] = max(store.get("attempt_index", 0) - 1, 0)
+
+    delay_text = _format_retry_delay(VERIFICATION_RETRY_DELAY)
+    token_name = extra.get("tokenName") or "Unnamed"
+    status = extra.get("contractCheckStatus") or "ERROR"
+    risk_score = extra.get("riskScore", "unknown")
+    attempt_txt = f" (Attempt #{attempt_num})" if attempt_num else ""
+
+    warning_msg = (
+        f"⚠️ <b>{token_name}</b> verification warning{attempt_txt}\n"
+        f"Pair: <code>{pair_addr}</code>\n"
+        f"Context: {context}\n"
+        f"Status: {status}\n"
+        f"Risk Score: {risk_score}\n"
+        f"Rechecking contract verification in {delay_text}."
+    )
+    send_telegram_message(warning_msg)
 
 
 INFURA_EMERGENCY_URLS = _unique_urls(
@@ -2060,11 +2167,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
@@ -3463,11 +3566,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
@@ -3752,6 +3851,8 @@ def queue_passing_refresh(
             "last_lp_block": w3_read.eth.block_number,
             "first_sell_block": w3_read.eth.block_number,
             "first_sell_detected": False,
+            "verification_retry_at": 0,
+            "verification_warning": False,
         }
 
 
@@ -3858,8 +3959,16 @@ def send_ui_criteria_message(
             msg += f"\nLiquidity Locked: <b>{'Yes' if locked else 'No'}</b>"
         rscore = extra_stats.get("riskScore")
         verified_bool = bool(extra_stats.get("verified") is True)
+        risk_warning = extra_stats.get("riskWarning")
+        status_text = str(extra_stats.get("contractCheckStatus") or "")
+        if not risk_warning and status_text.upper() == "ERROR":
+            risk_warning = (
+                f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}"
+            )
         if rscore is not None:
             msg += f"\nVerified: <b>{'Yes' if verified_bool else 'No'}</b> | Risk Score: {rscore}"
+            if risk_warning:
+                msg += f" ⚠️ {risk_warning}"
         links = extra_stats.get("socialLinks", [])
         if links:
             msg += "\n\n<b>Links:</b>"
@@ -3972,28 +4081,48 @@ def handle_passing_refreshes():
         if idx < len(PASSING_REFRESH_DELAYS):
             delay = PASSING_REFRESH_DELAYS[idx]
             if (now_ts - data["last_attempt"]) >= delay:
-                data["attempt_index"] += 1
-                data["last_attempt"] = now_ts
-                attempt_num = data["attempt_index"]
-                logger.info(f"[Refresh] Attempt #{attempt_num} for {pair}")
+                retry_at = data.get("verification_retry_at", 0)
+                if retry_at and now_ts < retry_at:
+                    # Awaiting scheduled verification retry; skip refresh attempt this cycle.
+                    pass
+                else:
+                    data["attempt_index"] += 1
+                    data["last_attempt"] = now_ts
+                    attempt_num = data["attempt_index"]
+                    logger.info(f"[Refresh] Attempt #{attempt_num} for {pair}")
 
-                passes, total, xtra = recheck_logic_detail(
-                    pair, data["token0"], data["token1"], attempt_num, True
-                )
-                fail, reason = critical_verification_failure(xtra)
-                if fail:
-                    logger.info(f"[Remove] {pair} removed: {reason}")
-                    if reason not in ("verification error", "risk score 9999"):
-                        send_telegram_message(f"[Remove] {pair} removed: {reason}")
-                    remove_list.append(pair)
-                    continue
-                data["last_liquidity"] = xtra.get(
-                    "liquidityUsd", data.get("last_liquidity")
-                )
-                data["last_liq_check"] = now_ts
-                if passes < MIN_PASS_THRESHOLD:
-                    logger.info(f"[Refresh] => removing {pair} from passing.")
-                    remove_list.append(pair)
+                    passes, total, xtra = recheck_logic_detail(
+                        pair, data["token0"], data["token1"], attempt_num, True
+                    )
+                    fail, reason = critical_verification_failure(xtra)
+                    if fail:
+                        if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
+                            _schedule_verification_retry(
+                                pair,
+                                data,
+                                xtra,
+                                context="passing refresh",
+                                attempt_num=attempt_num,
+                            )
+                            continue
+                        logger.info(f"[Remove] {pair} removed: {reason}")
+                        if reason not in ("verification error", "risk score 9999"):
+                            send_telegram_message(f"[Remove] {pair} removed: {reason}")
+                        remove_list.append(pair)
+                        continue
+                    else:
+                        if data.get("verification_warning") and str(
+                            xtra.get("contractCheckStatus", "")
+                        ).upper() != "ERROR":
+                            data["verification_warning"] = False
+                            data["verification_retry_at"] = 0
+                    data["last_liquidity"] = xtra.get(
+                        "liquidityUsd", data.get("last_liquidity")
+                    )
+                    data["last_liq_check"] = now_ts
+                    if passes < MIN_PASS_THRESHOLD:
+                        logger.info(f"[Refresh] => removing {pair} from passing.")
+                        remove_list.append(pair)
         else:
             # no more attempts
             if not data["no_more_attempts_logged"]:
@@ -4018,11 +4147,26 @@ def handle_passing_refreshes():
                     )
                     fail, reason = critical_verification_failure(xtra)
                     if fail:
+                        if reason == "verification error" and p2 >= MIN_PASS_THRESHOLD:
+                            _schedule_verification_retry(
+                                pair,
+                                data,
+                                xtra,
+                                context="silent refresh",
+                            )
+                            data["last_silent_check"] = now_ts
+                            continue
                         logger.info(f"[Remove] {pair} removed: {reason}")
                         if reason not in ("verification error", "risk score 9999"):
                             send_telegram_message(f"[Remove] {pair} removed: {reason}")
                         remove_list.append(pair)
                         continue
+                    else:
+                        if data.get("verification_warning") and str(
+                            xtra.get("contractCheckStatus", "")
+                        ).upper() != "ERROR":
+                            data["verification_warning"] = False
+                            data["verification_retry_at"] = 0
                     cmc = xtra.get("marketCap", 0)
                     data["last_liquidity"] = xtra.get(
                         "liquidityUsd", data.get("last_liquidity")
@@ -4203,6 +4347,11 @@ def recheck_logic_detail(
     pair_addr: str, t0: str, t1: str, attempt_num: int, is_passing_refresh: bool
 ):
     passes, total, extra = check_pair_criteria(pair_addr, t0, t1)
+    status = str(extra.get("contractCheckStatus", "")).upper()
+    if status == "ERROR":
+        extra["riskWarning"] = (
+            f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}"
+        )
     mode = "Refresh" if is_passing_refresh else "Recheck"
     logger.info(
         f"[{mode}] => {pair_addr} => {passes}/{total} passes (attempt {attempt_num}). "
@@ -4266,6 +4415,8 @@ def queue_recheck(pair_addr: str, token0: str, token1: str):
             "last_attempt": time.time(),
             "created": time.time(),
             "fail_count": 0,
+            "verification_retry_at": 0,
+            "verification_warning": False,
         }
 
 
@@ -4281,6 +4432,9 @@ def handle_rechecks():
 
         delay = RECHECK_DELAYS[idx]
         if (now_ts - data["last_attempt"]) >= delay:
+            retry_at = data.get("verification_retry_at", 0)
+            if retry_at and now_ts < retry_at:
+                continue
             data["attempt_index"] += 1
             data["last_attempt"] = now_ts
             attempt_num = data["attempt_index"]
@@ -4313,11 +4467,24 @@ def handle_rechecks():
                 continue
             fail, reason = critical_verification_failure(extra)
             if fail:
+                if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
+                    _schedule_verification_retry(
+                        pair,
+                        data,
+                        extra,
+                        context="recheck",
+                        attempt_num=attempt_num,
+                    )
+                    continue
                 logger.info(f"[Remove] {pair} removed: {reason}")
                 if reason not in ("verification error", "risk score 9999"):
                     send_telegram_message(f"[Remove] {pair} removed: {reason}")
                 rm_list.append(pair)
                 continue
+            else:
+                if data.get("verification_warning"):
+                    data["verification_warning"] = False
+                    data["verification_retry_at"] = 0
             if passes >= MIN_PASS_THRESHOLD:
                 vol_now = extra.get("volume24h", 0)
                 trades_now = extra.get("buys", 0) + extra.get("sells", 0)
@@ -4479,19 +4646,36 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             )
             return
         fail, reason = critical_verification_failure(extra)
+        verification_error = False
         if fail:
-            status_message = "removed_by_verification"
-            outcome_context["remove_reason"] = reason
-            log_event(
-                logging.INFO,
-                "remove_pair",
-                f"{paddr} removed: {reason}",
-                pair=paddr,
-                context={"reason": reason},
-            )
-            if reason not in ("verification error", "risk score 9999"):
-                send_telegram_message(f"[Remove] {paddr} removed: {reason}")
-            return
+            if reason == "verification error":
+                verification_error = True
+                status_message = "verification_error_pending"
+                outcome_context["verification_warning"] = True
+                extra.setdefault(
+                    "riskWarning",
+                    f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}",
+                )
+                log_event(
+                    logging.INFO,
+                    "verification_warning",
+                    f"{paddr} contract verification error detected",
+                    pair=paddr,
+                    context={"reason": reason},
+                )
+            else:
+                status_message = "removed_by_verification"
+                outcome_context["remove_reason"] = reason
+                log_event(
+                    logging.INFO,
+                    "remove_pair",
+                    f"{paddr} removed: {reason}",
+                    pair=paddr,
+                    context={"reason": reason},
+                )
+                if reason not in ("verification error", "risk score 9999"):
+                    send_telegram_message(f"[Remove] {paddr} removed: {reason}")
+                return
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         log_event(
             logging.INFO,
@@ -4539,6 +4723,15 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 liq_now = extra.get("liquidityUsd", 0)
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
                 outcome_context["next_step"] = "passing_refresh"
+                if verification_error:
+                    data_ref = passing_pairs.get(paddr)
+                    if data_ref is not None:
+                        _schedule_verification_retry(
+                            paddr,
+                            data_ref,
+                            extra,
+                            context="initial pass",
+                        )
             else:
                 log_event(
                     logging.INFO,
