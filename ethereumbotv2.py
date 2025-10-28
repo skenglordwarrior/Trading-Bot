@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - optional dependency
     parser = None
 import contextlib
 import io
-from typing import Optional, Dict, Tuple, List, Union, Set
+from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
 import requests
@@ -102,6 +102,76 @@ except NameError:  # pragma: no cover - defensive
 # Selector policy avoids those spurious warnings.
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+_TRANSFER_NAME_REGEX = re.compile(
+    r"\b(safeTransferFrom|transferFrom|safeTransfer|transfer)\s*\(",
+    re.IGNORECASE,
+)
+_SUSPICIOUS_DEST_TERMS = (
+    "owner",
+    "dev",
+    "marketing",
+    "team",
+    "treasury",
+    "wallet",
+    "tax",
+)
+_SUSPICIOUS_SOURCE_TERMS = ("msg.sender", "tx.origin", "_msgsender", "_msgsender()")
+_CONTRACT_SELF_TERM = "address(this)"
+
+
+def _extract_call_arguments(source_text: str, open_paren_index: int) -> str:
+    depth = 0
+    args_chars: List[str] = []
+    for idx in range(open_paren_index + 1, len(source_text)):
+        ch = source_text[idx]
+        if ch == "(":
+            depth += 1
+            args_chars.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                return "".join(args_chars)
+            depth -= 1
+            args_chars.append(ch)
+        else:
+            args_chars.append(ch)
+    return ""
+
+
+def _has_wallet_drainer_pattern(source_text: str) -> bool:
+    """Detect suspicious token transfer patterns that siphon wallets."""
+
+    for match in _TRANSFER_NAME_REGEX.finditer(source_text):
+        prefix = source_text[: match.start()].rstrip()
+        lower_prefix = prefix.lower()
+        if lower_prefix.endswith("emit") or lower_prefix.endswith("event") or lower_prefix.endswith(
+            "function"
+        ):
+            continue
+        open_paren_index = match.end() - 1
+        raw_args = _extract_call_arguments(source_text, open_paren_index)
+        if not raw_args:
+            continue
+        args = [a.strip().lower() for a in raw_args.split(",")]
+        if len(args) < 2:
+            continue
+        from_arg = args[0]
+        to_arg = args[1]
+
+        if any(term in to_arg for term in (_CONTRACT_SELF_TERM, *_SUSPICIOUS_SOURCE_TERMS)):
+            return True
+
+        keyword_to = any(term in to_arg for term in _SUSPICIOUS_DEST_TERMS)
+        from_matches_source = any(term in from_arg for term in _SUSPICIOUS_SOURCE_TERMS)
+        from_is_contract = _CONTRACT_SELF_TERM in from_arg
+        to_is_contract = _CONTRACT_SELF_TERM in to_arg
+
+        if to_is_contract and not from_is_contract:
+            return True
+        if keyword_to and (from_matches_source or from_is_contract):
+            return True
+    return False
 
 
 def create_aiohttp_session(**kwargs: Dict) -> aiohttp.ClientSession:
@@ -188,6 +258,8 @@ MIN_MARKETCAP_USD = 40_000
 MIN_BUYS_FIRST_HOUR = 20
 MIN_TRADES_REQUIRED = 20
 
+VERIFICATION_RETRY_DELAY = int(os.getenv("VERIFICATION_RETRY_DELAY", "300"))
+
 # Allow freshly-created pairs some time to appear on DexScreener before we give up
 DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW = int(
     os.getenv("DEXSCREENER_NOT_LISTED_REQUEUE_WINDOW", "1800")
@@ -206,6 +278,15 @@ def critical_verification_failure(extra: Dict) -> Tuple[bool, str]:
     return False, ""
 
 
+def _format_retry_delay(seconds: int) -> str:
+    if seconds <= 0:
+        return "soon"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds} seconds"
+
+
 def _unique_urls(urls: List[Optional[str]]) -> List[str]:
     seen = set()
     result: List[str] = []
@@ -214,6 +295,38 @@ def _unique_urls(urls: List[Optional[str]]) -> List[str]:
             result.append(url)
             seen.add(url)
     return result
+
+
+def _schedule_verification_retry(
+    pair_addr: str,
+    store: Dict[str, Any],
+    extra: Dict,
+    context: str,
+    attempt_num: Optional[int] = None,
+) -> None:
+    """Record a verification warning, schedule a retry, and notify Telegram."""
+
+    now_ts = time.time()
+    store["verification_warning"] = True
+    store["verification_retry_at"] = now_ts + VERIFICATION_RETRY_DELAY
+    if "attempt_index" in store:
+        store["attempt_index"] = max(store.get("attempt_index", 0) - 1, 0)
+
+    delay_text = _format_retry_delay(VERIFICATION_RETRY_DELAY)
+    token_name = extra.get("tokenName") or "Unnamed"
+    status = extra.get("contractCheckStatus") or "ERROR"
+    risk_score = extra.get("riskScore", "unknown")
+    attempt_txt = f" (Attempt #{attempt_num})" if attempt_num else ""
+
+    warning_msg = (
+        f"⚠️ <b>{token_name}</b> verification warning{attempt_txt}\n"
+        f"Pair: <code>{pair_addr}</code>\n"
+        f"Context: {context}\n"
+        f"Status: {status}\n"
+        f"Risk Score: {risk_score}\n"
+        f"Rechecking contract verification in {delay_text}."
+    )
+    send_telegram_message(warning_msg)
 
 
 INFURA_EMERGENCY_URLS = _unique_urls(
@@ -1277,18 +1390,38 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
         j = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if j.get("status") != "1":
             return False
+
+        inspected_contracts: Dict[str, str] = {}
         for tx in j.get("result", []):
-            if tx.get("from", "").lower() == pair_addr.lower():
-                to_addr = tx.get("to", "").lower()
-                if to_addr in {
-                    ZERO_ADDRESS.lower(),
-                    "0x000000000000000000000000000000000000dead",
-                }:
-                    return True
+            to_addr = (tx.get("to") or "").lower()
+            from_addr = (tx.get("from") or "").lower()
+            func_name = (tx.get("functionName") or "").lower()
+
+            if to_addr in {
+                ZERO_ADDRESS.lower(),
+                "0x000000000000000000000000000000000000dead",
+            }:
+                return True
+
+            if "lock" in func_name and "unlock" not in func_name:
+                return True
+
+            if from_addr == pair_addr.lower():
+                continue
+
+            if not to_addr:
+                continue
+
+            cached_name = inspected_contracts.get(to_addr)
+            if cached_name is None:
                 info = fetch_contract_source_etherscan(to_addr)
-                name = info.get("contractName", "").lower()
-                if any(k in name for k in ["lock", "locker", "unicrypt", "team", "pink"]):
-                    return True
+                cached_name = (info.get("contractName") or "").lower()
+                inspected_contracts[to_addr] = cached_name
+
+            if any(
+                keyword in cached_name for keyword in ["lock", "locker", "unicrypt", "team", "pink"]
+            ):
+                return True
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"lock lookup failed: {e}")
     except Exception as e:
@@ -1632,99 +1765,142 @@ class ContractVerificationStatus:
 
 
 async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
-    """Return verified source code information from Etherscan.
+    """Return verified source code information from Etherscan with retries."""
 
-    The returned dictionary contains:
-        ``status``: ``verified`` | ``unverified`` | ``error``
-        ``source``: list of ``{"filename": str, "content": str}``
-        ``compilerVersion``: compiler version string
-        ``contractName``: contract name
-    """
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return {
             "status": ContractVerificationStatus.ERROR,
             "source": [],
             "compilerVersion": "",
             "contractName": "",
+            "error": ETHERSCAN_DISABLED_REASON or "Etherscan lookups disabled",
         }
+
     token_addr = token_addr.lower()
-    api_key = get_next_etherscan_key()
-    params = {
+    base_params = {
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
-        "apikey": api_key,
     }
-    try:
-        params = _prepare_etherscan_params(params)
-        async with create_aiohttp_session() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
-                j = await r.json()
-        status = j.get("status")
-        result = j.get("result", [])
+    urls = [url for url in ETHERSCAN_API_URL_CANDIDATES if url]
+    if ETHERSCAN_API_URL and ETHERSCAN_API_URL not in urls:
+        urls.insert(0, ETHERSCAN_API_URL)
+    if not urls:
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+            "error": "No Etherscan API URLs configured",
+        }
 
-        if status == "1" and len(result) > 0:
-            # Etherscan returns a list. If SourceCode is empty => unverified
-            if not result[0].get("SourceCode"):
-                return {
-                    "status": ContractVerificationStatus.UNVERIFIED,
-                    "source": [],
-                    "compilerVersion": "",
-                    "contractName": "",
-                }
-            else:
-                # Verified
-                scode = result[0].get("SourceCode", "")
-                cname = result[0].get("ContractName", "")
+    errors: List[str] = []
+    max_attempts = 3
+
+    for base_url in urls:
+        for attempt in range(max_attempts):
+            attempt_params = dict(base_params)
+            attempt_params["apikey"] = get_next_etherscan_key()
+            attempt_params = _prepare_etherscan_params(attempt_params, base_url)
+
+            try:
+                async with create_aiohttp_session() as session:
+                    async with session.get(base_url, params=attempt_params, timeout=20) as response:
+                        if response.status >= 500:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} {response.status}: {body or 'server error'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+
+                        try:
+                            payload = await response.json(content_type=None)
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} invalid JSON: {exc} :: {body or 'no body'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                errors.append(f"{base_url} attempt {attempt + 1}: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.warning("fetch_contract_source_etherscan unexpected error: %s", exc)
+                errors.append(f"{base_url} unexpected error: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+
+            status = payload.get("status")
+            result = payload.get("result", [])
+            message = (payload.get("message") or "").lower()
+
+            if status == "1" and result:
+                source_code = result[0].get("SourceCode", "")
+                if not source_code:
+                    return {
+                        "status": ContractVerificationStatus.UNVERIFIED,
+                        "source": [],
+                        "compilerVersion": "",
+                        "contractName": "",
+                    }
+
                 compiler = result[0].get("CompilerVersion", "")
-
-                sources_list = []
-                stripped = scode.strip()
+                contract_name = result[0].get("ContractName", "")
+                sources_list: List[dict] = []
+                stripped = source_code.strip()
                 if stripped.startswith("{"):
                     try:
-                        data = json.loads(scode)
+                        data = json.loads(source_code)
                         for fname, info in data.get("sources", {}).items():
                             content = info.get("content", "")
                             sources_list.append({"filename": fname, "content": content})
                     except Exception:
                         sources_list.append(
-                            {"filename": cname or "contract.sol", "content": scode}
+                            {
+                                "filename": contract_name or "contract.sol",
+                                "content": source_code,
+                            }
                         )
                 else:
                     sources_list.append(
-                        {"filename": cname or "contract.sol", "content": scode}
+                        {"filename": contract_name or "contract.sol", "content": source_code}
                     )
 
                 return {
                     "status": ContractVerificationStatus.VERIFIED,
                     "source": sources_list,
                     "compilerVersion": compiler,
-                    "contractName": cname,
+                    "contractName": contract_name,
                 }
-        else:
-            return {
-                "status": ContractVerificationStatus.ERROR,
-                "source": [],
-                "compilerVersion": "",
-                "contractName": "",
-            }
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"source fetch failed: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
-    except Exception as e:
-        logger.warning(f"fetch_contract_source_etherscan error: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
+            if message == "contract source code not verified":
+                return {
+                    "status": ContractVerificationStatus.UNVERIFIED,
+                    "source": [],
+                    "compilerVersion": "",
+                    "contractName": "",
+                }
+
+            errors.append(
+                f"{base_url} unexpected payload: status={status} message={payload.get('message')}"
+            )
+            await asyncio.sleep(min(2 ** attempt, 5))
+
+    if errors:
+        logger.warning(
+            "Etherscan source fetch failed for %s: %s", token_addr, errors[-1]
+        )
+
+    return {
+        "status": ContractVerificationStatus.ERROR,
+        "source": [],
+        "compilerVersion": "",
+        "contractName": "",
+        "error": "; ".join(errors) if errors else "unknown error",
+    }
 
 def fetch_contract_source_etherscan(token_addr: str) -> dict:
     return asyncio.run(_fetch_contract_source_etherscan_async(token_addr))
@@ -2060,11 +2236,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
@@ -2308,7 +2480,7 @@ def advanced_contract_check(token_addr: str) -> dict:
     else:
         return {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "riskFlags": {"ownerActivity": suspicious_activity},
             "status": "ERROR",
             "owner": owner_addr,
@@ -2318,6 +2490,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "renounced": renounced,
             "slitherIssues": None,
             "thirdPartySecurity": third_party_security,
+            "error": info.get("error"),
         }
 
 
@@ -2982,7 +3155,7 @@ def check_pair_criteria(
         logger.error("contract analysis failed for %s: %s", main_token, exc)
         contract_info = {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "status": "ERROR",
             "owner": None,
             "ownerBalanceEth": None,
@@ -2992,6 +3165,7 @@ def check_pair_criteria(
             "slitherIssues": None,
             "privateSale": {},
             "onChainMetrics": {},
+            "error": str(exc),
         }
 
     extra.update(
@@ -2999,6 +3173,7 @@ def check_pair_criteria(
             "verified": contract_info.get("verified"),
             "contractCheckStatus": contract_info.get("status"),
             "riskScore": contract_info.get("riskScore"),
+            "riskFlags": contract_info.get("riskFlags", {}),
             "owner": contract_info.get("owner"),
             "ownerBalanceEth": contract_info.get("ownerBalanceEth"),
             "ownerTokenBalance": contract_info.get("ownerTokenBalance"),
@@ -3007,6 +3182,7 @@ def check_pair_criteria(
             "slitherIssues": contract_info.get("slitherIssues"),
             "privateSale": contract_info.get("privateSale", {}),
             "onChainMetrics": contract_info.get("onChainMetrics", {}),
+            "contractAnalysisError": contract_info.get("error"),
         }
     )
 
@@ -3069,99 +3245,142 @@ class ContractVerificationStatus:
 
 
 async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
-    """Return verified source code information from Etherscan.
+    """Return verified source code information from Etherscan with retries."""
 
-    The returned dictionary contains:
-        ``status``: ``verified`` | ``unverified`` | ``error``
-        ``source``: list of ``{"filename": str, "content": str}``
-        ``compilerVersion``: compiler version string
-        ``contractName``: contract name
-    """
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return {
             "status": ContractVerificationStatus.ERROR,
             "source": [],
             "compilerVersion": "",
             "contractName": "",
+            "error": ETHERSCAN_DISABLED_REASON or "Etherscan lookups disabled",
         }
+
     token_addr = token_addr.lower()
-    api_key = get_next_etherscan_key()
-    params = {
+    base_params = {
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
-        "apikey": api_key,
     }
-    try:
-        params = _prepare_etherscan_params(params)
-        async with create_aiohttp_session() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
-                j = await r.json()
-        status = j.get("status")
-        result = j.get("result", [])
+    urls = [url for url in ETHERSCAN_API_URL_CANDIDATES if url]
+    if ETHERSCAN_API_URL and ETHERSCAN_API_URL not in urls:
+        urls.insert(0, ETHERSCAN_API_URL)
+    if not urls:
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+            "error": "No Etherscan API URLs configured",
+        }
 
-        if status == "1" and len(result) > 0:
-            # Etherscan returns a list. If SourceCode is empty => unverified
-            if not result[0].get("SourceCode"):
-                return {
-                    "status": ContractVerificationStatus.UNVERIFIED,
-                    "source": [],
-                    "compilerVersion": "",
-                    "contractName": "",
-                }
-            else:
-                # Verified
-                scode = result[0].get("SourceCode", "")
-                cname = result[0].get("ContractName", "")
+    errors: List[str] = []
+    max_attempts = 3
+
+    for base_url in urls:
+        for attempt in range(max_attempts):
+            attempt_params = dict(base_params)
+            attempt_params["apikey"] = get_next_etherscan_key()
+            attempt_params = _prepare_etherscan_params(attempt_params, base_url)
+
+            try:
+                async with create_aiohttp_session() as session:
+                    async with session.get(base_url, params=attempt_params, timeout=20) as response:
+                        if response.status >= 500:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} {response.status}: {body or 'server error'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+
+                        try:
+                            payload = await response.json(content_type=None)
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} invalid JSON: {exc} :: {body or 'no body'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                errors.append(f"{base_url} attempt {attempt + 1}: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.warning("fetch_contract_source_etherscan unexpected error: %s", exc)
+                errors.append(f"{base_url} unexpected error: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+
+            status = payload.get("status")
+            result = payload.get("result", [])
+            message = (payload.get("message") or "").lower()
+
+            if status == "1" and result:
+                source_code = result[0].get("SourceCode", "")
+                if not source_code:
+                    return {
+                        "status": ContractVerificationStatus.UNVERIFIED,
+                        "source": [],
+                        "compilerVersion": "",
+                        "contractName": "",
+                    }
+
                 compiler = result[0].get("CompilerVersion", "")
-
-                sources_list = []
-                stripped = scode.strip()
+                contract_name = result[0].get("ContractName", "")
+                sources_list: List[dict] = []
+                stripped = source_code.strip()
                 if stripped.startswith("{"):
                     try:
-                        data = json.loads(scode)
+                        data = json.loads(source_code)
                         for fname, info in data.get("sources", {}).items():
                             content = info.get("content", "")
                             sources_list.append({"filename": fname, "content": content})
                     except Exception:
                         sources_list.append(
-                            {"filename": cname or "contract.sol", "content": scode}
+                            {
+                                "filename": contract_name or "contract.sol",
+                                "content": source_code,
+                            }
                         )
                 else:
                     sources_list.append(
-                        {"filename": cname or "contract.sol", "content": scode}
+                        {"filename": contract_name or "contract.sol", "content": source_code}
                     )
 
                 return {
                     "status": ContractVerificationStatus.VERIFIED,
                     "source": sources_list,
                     "compilerVersion": compiler,
-                    "contractName": cname,
+                    "contractName": contract_name,
                 }
-        else:
-            return {
-                "status": ContractVerificationStatus.ERROR,
-                "source": [],
-                "compilerVersion": "",
-                "contractName": "",
-            }
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"source fetch failed: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
-    except Exception as e:
-        logger.warning(f"fetch_contract_source_etherscan error: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
+            if message == "contract source code not verified":
+                return {
+                    "status": ContractVerificationStatus.UNVERIFIED,
+                    "source": [],
+                    "compilerVersion": "",
+                    "contractName": "",
+                }
+
+            errors.append(
+                f"{base_url} unexpected payload: status={status} message={payload.get('message')}"
+            )
+            await asyncio.sleep(min(2 ** attempt, 5))
+
+    if errors:
+        logger.warning(
+            "Etherscan source fetch failed for %s: %s", token_addr, errors[-1]
+        )
+
+    return {
+        "status": ContractVerificationStatus.ERROR,
+        "source": [],
+        "compilerVersion": "",
+        "contractName": "",
+        "error": "; ".join(errors) if errors else "unknown error",
+    }
 
 def fetch_contract_source_etherscan(token_addr: str) -> dict:
     return asyncio.run(_fetch_contract_source_etherscan_async(token_addr))
@@ -3463,11 +3682,7 @@ def analyze_solidity_source(source_text: str) -> dict:
         flags["botWhitelist"] = True
 
     # 10) wallet drainer patterns
-    wallet_drainer_regex = re.compile(
-        r"\b(?:transfer|transferFrom|safeTransfer|safeTransferFrom)\s*\(\s*msg\.sender",
-        re.IGNORECASE,
-    )
-    if wallet_drainer_regex.search(source_text):
+    if _has_wallet_drainer_pattern(source_text):
         flags["walletDrainer"] = True
     if re.search(r"delegatecall\s*\(", source_text):
         flags["delegatecall"] = True
@@ -3702,7 +3917,7 @@ def advanced_contract_check(token_addr: str) -> dict:
     else:
         return {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "riskFlags": {"ownerActivity": suspicious_activity},
             "status": "ERROR",
             "owner": owner_addr,
@@ -3711,6 +3926,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "error": info.get("error"),
         }
 
 
@@ -3752,6 +3968,8 @@ def queue_passing_refresh(
             "last_lp_block": w3_read.eth.block_number,
             "first_sell_block": w3_read.eth.block_number,
             "first_sell_detected": False,
+            "verification_retry_at": 0,
+            "verification_warning": False,
         }
 
 
@@ -3858,8 +4076,16 @@ def send_ui_criteria_message(
             msg += f"\nLiquidity Locked: <b>{'Yes' if locked else 'No'}</b>"
         rscore = extra_stats.get("riskScore")
         verified_bool = bool(extra_stats.get("verified") is True)
+        risk_warning = extra_stats.get("riskWarning")
+        status_text = str(extra_stats.get("contractCheckStatus") or "")
+        if not risk_warning and status_text.upper() == "ERROR":
+            risk_warning = (
+                f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}"
+            )
         if rscore is not None:
             msg += f"\nVerified: <b>{'Yes' if verified_bool else 'No'}</b> | Risk Score: {rscore}"
+            if risk_warning:
+                msg += f" ⚠️ {risk_warning}"
         links = extra_stats.get("socialLinks", [])
         if links:
             msg += "\n\n<b>Links:</b>"
@@ -3972,28 +4198,48 @@ def handle_passing_refreshes():
         if idx < len(PASSING_REFRESH_DELAYS):
             delay = PASSING_REFRESH_DELAYS[idx]
             if (now_ts - data["last_attempt"]) >= delay:
-                data["attempt_index"] += 1
-                data["last_attempt"] = now_ts
-                attempt_num = data["attempt_index"]
-                logger.info(f"[Refresh] Attempt #{attempt_num} for {pair}")
+                retry_at = data.get("verification_retry_at", 0)
+                if retry_at and now_ts < retry_at:
+                    # Awaiting scheduled verification retry; skip refresh attempt this cycle.
+                    pass
+                else:
+                    data["attempt_index"] += 1
+                    data["last_attempt"] = now_ts
+                    attempt_num = data["attempt_index"]
+                    logger.info(f"[Refresh] Attempt #{attempt_num} for {pair}")
 
-                passes, total, xtra = recheck_logic_detail(
-                    pair, data["token0"], data["token1"], attempt_num, True
-                )
-                fail, reason = critical_verification_failure(xtra)
-                if fail:
-                    logger.info(f"[Remove] {pair} removed: {reason}")
-                    if reason not in ("verification error", "risk score 9999"):
-                        send_telegram_message(f"[Remove] {pair} removed: {reason}")
-                    remove_list.append(pair)
-                    continue
-                data["last_liquidity"] = xtra.get(
-                    "liquidityUsd", data.get("last_liquidity")
-                )
-                data["last_liq_check"] = now_ts
-                if passes < MIN_PASS_THRESHOLD:
-                    logger.info(f"[Refresh] => removing {pair} from passing.")
-                    remove_list.append(pair)
+                    passes, total, xtra = recheck_logic_detail(
+                        pair, data["token0"], data["token1"], attempt_num, True
+                    )
+                    fail, reason = critical_verification_failure(xtra)
+                    if fail:
+                        if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
+                            _schedule_verification_retry(
+                                pair,
+                                data,
+                                xtra,
+                                context="passing refresh",
+                                attempt_num=attempt_num,
+                            )
+                            continue
+                        logger.info(f"[Remove] {pair} removed: {reason}")
+                        if reason not in ("verification error", "risk score 9999"):
+                            send_telegram_message(f"[Remove] {pair} removed: {reason}")
+                        remove_list.append(pair)
+                        continue
+                    else:
+                        if data.get("verification_warning") and str(
+                            xtra.get("contractCheckStatus", "")
+                        ).upper() != "ERROR":
+                            data["verification_warning"] = False
+                            data["verification_retry_at"] = 0
+                    data["last_liquidity"] = xtra.get(
+                        "liquidityUsd", data.get("last_liquidity")
+                    )
+                    data["last_liq_check"] = now_ts
+                    if passes < MIN_PASS_THRESHOLD:
+                        logger.info(f"[Refresh] => removing {pair} from passing.")
+                        remove_list.append(pair)
         else:
             # no more attempts
             if not data["no_more_attempts_logged"]:
@@ -4018,11 +4264,26 @@ def handle_passing_refreshes():
                     )
                     fail, reason = critical_verification_failure(xtra)
                     if fail:
+                        if reason == "verification error" and p2 >= MIN_PASS_THRESHOLD:
+                            _schedule_verification_retry(
+                                pair,
+                                data,
+                                xtra,
+                                context="silent refresh",
+                            )
+                            data["last_silent_check"] = now_ts
+                            continue
                         logger.info(f"[Remove] {pair} removed: {reason}")
                         if reason not in ("verification error", "risk score 9999"):
                             send_telegram_message(f"[Remove] {pair} removed: {reason}")
                         remove_list.append(pair)
                         continue
+                    else:
+                        if data.get("verification_warning") and str(
+                            xtra.get("contractCheckStatus", "")
+                        ).upper() != "ERROR":
+                            data["verification_warning"] = False
+                            data["verification_retry_at"] = 0
                     cmc = xtra.get("marketCap", 0)
                     data["last_liquidity"] = xtra.get(
                         "liquidityUsd", data.get("last_liquidity")
@@ -4203,6 +4464,11 @@ def recheck_logic_detail(
     pair_addr: str, t0: str, t1: str, attempt_num: int, is_passing_refresh: bool
 ):
     passes, total, extra = check_pair_criteria(pair_addr, t0, t1)
+    status = str(extra.get("contractCheckStatus", "")).upper()
+    if status == "ERROR":
+        extra["riskWarning"] = (
+            f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}"
+        )
     mode = "Refresh" if is_passing_refresh else "Recheck"
     logger.info(
         f"[{mode}] => {pair_addr} => {passes}/{total} passes (attempt {attempt_num}). "
@@ -4266,6 +4532,8 @@ def queue_recheck(pair_addr: str, token0: str, token1: str):
             "last_attempt": time.time(),
             "created": time.time(),
             "fail_count": 0,
+            "verification_retry_at": 0,
+            "verification_warning": False,
         }
 
 
@@ -4281,6 +4549,9 @@ def handle_rechecks():
 
         delay = RECHECK_DELAYS[idx]
         if (now_ts - data["last_attempt"]) >= delay:
+            retry_at = data.get("verification_retry_at", 0)
+            if retry_at and now_ts < retry_at:
+                continue
             data["attempt_index"] += 1
             data["last_attempt"] = now_ts
             attempt_num = data["attempt_index"]
@@ -4313,11 +4584,24 @@ def handle_rechecks():
                 continue
             fail, reason = critical_verification_failure(extra)
             if fail:
+                if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
+                    _schedule_verification_retry(
+                        pair,
+                        data,
+                        extra,
+                        context="recheck",
+                        attempt_num=attempt_num,
+                    )
+                    continue
                 logger.info(f"[Remove] {pair} removed: {reason}")
                 if reason not in ("verification error", "risk score 9999"):
                     send_telegram_message(f"[Remove] {pair} removed: {reason}")
                 rm_list.append(pair)
                 continue
+            else:
+                if data.get("verification_warning"):
+                    data["verification_warning"] = False
+                    data["verification_retry_at"] = 0
             if passes >= MIN_PASS_THRESHOLD:
                 vol_now = extra.get("volume24h", 0)
                 trades_now = extra.get("buys", 0) + extra.get("sells", 0)
@@ -4479,19 +4763,36 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             )
             return
         fail, reason = critical_verification_failure(extra)
+        verification_error = False
         if fail:
-            status_message = "removed_by_verification"
-            outcome_context["remove_reason"] = reason
-            log_event(
-                logging.INFO,
-                "remove_pair",
-                f"{paddr} removed: {reason}",
-                pair=paddr,
-                context={"reason": reason},
-            )
-            if reason not in ("verification error", "risk score 9999"):
-                send_telegram_message(f"[Remove] {paddr} removed: {reason}")
-            return
+            if reason == "verification error":
+                verification_error = True
+                status_message = "verification_error_pending"
+                outcome_context["verification_warning"] = True
+                extra.setdefault(
+                    "riskWarning",
+                    f"Verification error - retrying in {_format_retry_delay(VERIFICATION_RETRY_DELAY)}",
+                )
+                log_event(
+                    logging.INFO,
+                    "verification_warning",
+                    f"{paddr} contract verification error detected",
+                    pair=paddr,
+                    context={"reason": reason},
+                )
+            else:
+                status_message = "removed_by_verification"
+                outcome_context["remove_reason"] = reason
+                log_event(
+                    logging.INFO,
+                    "remove_pair",
+                    f"{paddr} removed: {reason}",
+                    pair=paddr,
+                    context={"reason": reason},
+                )
+                if reason not in ("verification error", "risk score 9999"):
+                    send_telegram_message(f"[Remove] {paddr} removed: {reason}")
+                return
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         log_event(
             logging.INFO,
@@ -4539,6 +4840,15 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 liq_now = extra.get("liquidityUsd", 0)
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
                 outcome_context["next_step"] = "passing_refresh"
+                if verification_error:
+                    data_ref = passing_pairs.get(paddr)
+                    if data_ref is not None:
+                        _schedule_verification_retry(
+                            paddr,
+                            data_ref,
+                            extra,
+                            context="initial pass",
+                        )
             else:
                 log_event(
                     logging.INFO,

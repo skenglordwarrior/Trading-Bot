@@ -1,16 +1,18 @@
 import unittest
 import asyncio
+from collections import deque
 from unittest.mock import patch, AsyncMock
 
-from TelegramBot import (
+from ethereumbotv2 import (
     analyze_solidity_source,
     check_liquidity_locked_etherscan,
     queue_recheck,
     handle_rechecks,
     pending_rechecks,
     RECHECK_DELAYS,
+    check_pair_criteria,
 )
-import TelegramBot
+import ethereumbotv2
 
 
 class TransferBlockingModifierTest(unittest.TestCase):
@@ -94,28 +96,146 @@ class TransferBlockingModifierTest(unittest.TestCase):
 
 class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
     async def test_lock_detected(self):
-        fake_resp = AsyncMock()
-        fake_resp.__aenter__.return_value = fake_resp
-        fake_resp.json.return_value = {
-            "status": "1",
-            "result": [
-                {"from": "0xpair", "to": "0x000000000000000000000000000000000000dead"}
-            ],
-        }
-        fake_session = AsyncMock()
-        def fake_get(*args, **kwargs):
-            return fake_resp
-        fake_session.get = fake_get
-        fake_session.__aenter__.return_value = fake_session
-        with patch("aiohttp.ClientSession", return_value=fake_session), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}):
-            locked = await TelegramBot._check_liquidity_locked_etherscan_async("0xpair")
+        fake_tracker = AsyncMock(
+            return_value={
+                "status": "1",
+                "result": [
+                    {"from": "0xpair", "to": "0x000000000000000000000000000000000000dead"}
+                ],
+            }
+        )
+        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
+            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        ):
+            locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
+
+    async def test_lock_detected_via_function_name(self):
+        fake_tracker = AsyncMock(
+            return_value={
+                "status": "1",
+                "result": [
+                    {
+                        "from": "0xcreator",
+                        "to": "0xlocker",
+                        "functionName": "lockLPToken(address,uint256,uint256,address,bool,address)",
+                    }
+                ],
+            }
+        )
+        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
+            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        ):
+            locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
+        self.assertTrue(locked)
+
+
+class EtherscanFetchFallbackTest(unittest.IsolatedAsyncioTestCase):
+    class FakeResponse:
+        def __init__(self, status, payload=None, text="", json_exc=None):
+            self.status = status
+            self._payload = payload
+            self._text = text
+            self._json_exc = json_exc
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            if self._json_exc:
+                raise self._json_exc
+            return self._payload or {}
+
+        async def text(self):
+            return self._text
+
+    class FakeSession:
+        def __init__(self, queue):
+            self._queue = queue
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, params=None, timeout=None):
+            if not self._queue:
+                raise AssertionError("No more responses queued")
+            return self._queue.popleft()
+
+    async def test_fetch_recovers_after_server_error(self):
+        responses = deque(
+            [
+                self.FakeResponse(502, text="Bad Gateway", json_exc=ValueError("bad")),
+                self.FakeResponse(
+                    200,
+                    payload={
+                        "status": "1",
+                        "result": [
+                            {
+                                "SourceCode": "pragma solidity ^0.8.0; contract Foo {}",
+                                "ContractName": "Foo",
+                                "CompilerVersion": "v0.8.0",
+                            }
+                        ],
+                        "message": "OK",
+                    },
+                ),
+            ]
+        )
+
+        def fake_create_session(**kwargs):
+            return self.FakeSession(responses)
+
+        sleep_mock = AsyncMock()
+
+        with patch.object(ethereumbotv2, "create_aiohttp_session", side_effect=fake_create_session), patch(
+            "ethereumbotv2.asyncio.sleep", sleep_mock
+        ), patch.object(
+            ethereumbotv2, "ETHERSCAN_API_URL_CANDIDATES", ["https://api.etherscan.io/v2/api", "https://api.etherscan.io/api"], create=True
+        ), patch.object(ethereumbotv2, "ETHERSCAN_API_URL", "https://api.etherscan.io/v2/api", create=True), patch.object(
+            ethereumbotv2, "ETHERSCAN_LOOKUPS_ENABLED", True, create=True
+        ), patch.object(ethereumbotv2, "get_next_etherscan_key", return_value="KEY"):
+            result = await ethereumbotv2._fetch_contract_source_etherscan_async("0xtest")
+
+        self.assertEqual(result["status"], ethereumbotv2.ContractVerificationStatus.VERIFIED)
+        self.assertEqual(result["contractName"], "Foo")
+        self.assertTrue(result["source"])
+
+    async def test_fetch_reports_error_without_disabling(self):
+        responses = deque(
+            [self.FakeResponse(502, text="Bad Gateway", json_exc=ValueError("bad")) for _ in range(6)]
+        )
+
+        def fake_create_session(**kwargs):
+            return self.FakeSession(responses)
+
+        sleep_mock = AsyncMock()
+
+        with patch.object(ethereumbotv2, "create_aiohttp_session", side_effect=fake_create_session), patch(
+            "ethereumbotv2.asyncio.sleep", sleep_mock
+        ), patch.object(
+            ethereumbotv2, "ETHERSCAN_API_URL_CANDIDATES", ["https://api.etherscan.io/v2/api", "https://api.etherscan.io/api"], create=True
+        ), patch.object(ethereumbotv2, "ETHERSCAN_API_URL", "https://api.etherscan.io/v2/api", create=True), patch.object(
+            ethereumbotv2, "ETHERSCAN_LOOKUPS_ENABLED", True, create=True
+        ), patch.object(ethereumbotv2, "get_next_etherscan_key", return_value="KEY"), patch.object(
+            ethereumbotv2, "disable_etherscan_lookups"
+        ) as disable_mock:
+            result = await ethereumbotv2._fetch_contract_source_etherscan_async("0xerr")
+
+        self.assertEqual(result["status"], ethereumbotv2.ContractVerificationStatus.ERROR)
+        self.assertIn("Bad Gateway", result.get("error", ""))
+        disable_mock.assert_not_called()
 
 
 class RecheckStopTest(unittest.TestCase):
     def test_recheck_stops_after_three_attempts(self):
-        with patch("TelegramBot.RECHECK_DELAYS", [0, 0, 0]):
-            with patch("TelegramBot.recheck_logic_detail", return_value=(0, 10, {})):
+        with patch("ethereumbotv2.RECHECK_DELAYS", [0, 0, 0]):
+            with patch("ethereumbotv2.recheck_logic_detail", return_value=(0, 10, {})):
                 queue_recheck("0xPair", "0x1", "0x2")
                 for _ in range(4):
                     handle_rechecks()
@@ -147,6 +267,62 @@ class RecheckStopTest(unittest.TestCase):
         """
         flags = analyze_solidity_source(code)
         self.assertTrue(flags.get("walletDrainer"))
+
+    def test_emit_transfer_to_contract_not_flagged(self):
+        code = """
+        pragma solidity ^0.8.0;
+        contract Example {
+            event Transfer(address indexed from, address indexed to, uint256 amount);
+
+            function log(address from, uint256 amount) external {
+                emit Transfer(from, address(this), amount);
+            }
+        }
+        """
+        flags = analyze_solidity_source(code)
+        self.assertFalse(flags.get("walletDrainer"))
+
+
+class PairCriteriaRiskPropagationTest(unittest.TestCase):
+    def test_wallet_drainer_flag_clears_in_pair_extra(self):
+        dex_stub = {
+            "priceUsd": 1.0,
+            "liquidityUsd": 30000.0,
+            "volume24h": 50000.0,
+            "fdv": 100000.0,
+            "marketCap": 100000.0,
+            "buys": 120,
+            "sells": 40,
+            "lockedLiquidity": True,
+            "baseTokenName": "TestToken",
+            "baseTokenSymbol": "TT",
+        }
+        contract_stub = {
+            "verified": True,
+            "status": "OK",
+            "riskScore": 4,
+            "riskFlags": {"walletDrainer": False, "ownerFunctions": True},
+            "owner": "0xowner",
+            "ownerBalanceEth": 0,
+            "ownerTokenBalance": 0,
+            "implementation": None,
+            "renounced": True,
+            "slitherIssues": 0,
+            "privateSale": {},
+            "onChainMetrics": {},
+        }
+        with patch("ethereumbotv2.fetch_dexscreener_data", return_value=(dex_stub, None)), patch(
+            "ethereumbotv2.advanced_contract_check", return_value=contract_stub
+        ), patch("ethereumbotv2.check_honeypot_is", return_value=False), patch(
+            "ethereumbotv2.check_recent_liquidity_removal", return_value=False
+        ):
+            passes, total, extra = check_pair_criteria(
+                "0xPair", "0xToken", ethereumbotv2.WETH_ADDRESS
+            )
+        self.assertEqual(passes, total)
+        self.assertEqual(extra.get("riskScore"), contract_stub["riskScore"])
+        self.assertIn("riskFlags", extra)
+        self.assertFalse(extra["riskFlags"].get("walletDrainer"))
 
 
 if __name__ == "__main__":
