@@ -108,6 +108,25 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
 
+    async def test_lock_detected_via_function_name(self):
+        fake_tracker = AsyncMock(
+            return_value={
+                "status": "1",
+                "result": [
+                    {
+                        "from": "0xcreator",
+                        "to": "0xlocker",
+                        "functionName": "lockLPToken(address,uint256,uint256,address,bool,address)",
+                    }
+                ],
+            }
+        )
+        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
+            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        ):
+            locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
+        self.assertTrue(locked)
+
 
 class RecheckStopTest(unittest.TestCase):
     def test_recheck_stops_after_three_attempts(self):

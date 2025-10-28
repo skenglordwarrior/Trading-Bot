@@ -1384,18 +1384,38 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
         j = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if j.get("status") != "1":
             return False
+
+        inspected_contracts: Dict[str, str] = {}
         for tx in j.get("result", []):
-            if tx.get("from", "").lower() == pair_addr.lower():
-                to_addr = tx.get("to", "").lower()
-                if to_addr in {
-                    ZERO_ADDRESS.lower(),
-                    "0x000000000000000000000000000000000000dead",
-                }:
-                    return True
+            to_addr = (tx.get("to") or "").lower()
+            from_addr = (tx.get("from") or "").lower()
+            func_name = (tx.get("functionName") or "").lower()
+
+            if to_addr in {
+                ZERO_ADDRESS.lower(),
+                "0x000000000000000000000000000000000000dead",
+            }:
+                return True
+
+            if "lock" in func_name and "unlock" not in func_name:
+                return True
+
+            if from_addr == pair_addr.lower():
+                continue
+
+            if not to_addr:
+                continue
+
+            cached_name = inspected_contracts.get(to_addr)
+            if cached_name is None:
                 info = fetch_contract_source_etherscan(to_addr)
-                name = info.get("contractName", "").lower()
-                if any(k in name for k in ["lock", "locker", "unicrypt", "team", "pink"]):
-                    return True
+                cached_name = (info.get("contractName") or "").lower()
+                inspected_contracts[to_addr] = cached_name
+
+            if any(
+                keyword in cached_name for keyword in ["lock", "locker", "unicrypt", "team", "pink"]
+            ):
+                return True
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"lock lookup failed: {e}")
     except Exception as e:
