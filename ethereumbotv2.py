@@ -1765,99 +1765,142 @@ class ContractVerificationStatus:
 
 
 async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
-    """Return verified source code information from Etherscan.
+    """Return verified source code information from Etherscan with retries."""
 
-    The returned dictionary contains:
-        ``status``: ``verified`` | ``unverified`` | ``error``
-        ``source``: list of ``{"filename": str, "content": str}``
-        ``compilerVersion``: compiler version string
-        ``contractName``: contract name
-    """
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return {
             "status": ContractVerificationStatus.ERROR,
             "source": [],
             "compilerVersion": "",
             "contractName": "",
+            "error": ETHERSCAN_DISABLED_REASON or "Etherscan lookups disabled",
         }
+
     token_addr = token_addr.lower()
-    api_key = get_next_etherscan_key()
-    params = {
+    base_params = {
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
-        "apikey": api_key,
     }
-    try:
-        params = _prepare_etherscan_params(params)
-        async with create_aiohttp_session() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
-                j = await r.json()
-        status = j.get("status")
-        result = j.get("result", [])
+    urls = [url for url in ETHERSCAN_API_URL_CANDIDATES if url]
+    if ETHERSCAN_API_URL and ETHERSCAN_API_URL not in urls:
+        urls.insert(0, ETHERSCAN_API_URL)
+    if not urls:
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+            "error": "No Etherscan API URLs configured",
+        }
 
-        if status == "1" and len(result) > 0:
-            # Etherscan returns a list. If SourceCode is empty => unverified
-            if not result[0].get("SourceCode"):
-                return {
-                    "status": ContractVerificationStatus.UNVERIFIED,
-                    "source": [],
-                    "compilerVersion": "",
-                    "contractName": "",
-                }
-            else:
-                # Verified
-                scode = result[0].get("SourceCode", "")
-                cname = result[0].get("ContractName", "")
+    errors: List[str] = []
+    max_attempts = 3
+
+    for base_url in urls:
+        for attempt in range(max_attempts):
+            attempt_params = dict(base_params)
+            attempt_params["apikey"] = get_next_etherscan_key()
+            attempt_params = _prepare_etherscan_params(attempt_params, base_url)
+
+            try:
+                async with create_aiohttp_session() as session:
+                    async with session.get(base_url, params=attempt_params, timeout=20) as response:
+                        if response.status >= 500:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} {response.status}: {body or 'server error'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+
+                        try:
+                            payload = await response.json(content_type=None)
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} invalid JSON: {exc} :: {body or 'no body'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                errors.append(f"{base_url} attempt {attempt + 1}: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.warning("fetch_contract_source_etherscan unexpected error: %s", exc)
+                errors.append(f"{base_url} unexpected error: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+
+            status = payload.get("status")
+            result = payload.get("result", [])
+            message = (payload.get("message") or "").lower()
+
+            if status == "1" and result:
+                source_code = result[0].get("SourceCode", "")
+                if not source_code:
+                    return {
+                        "status": ContractVerificationStatus.UNVERIFIED,
+                        "source": [],
+                        "compilerVersion": "",
+                        "contractName": "",
+                    }
+
                 compiler = result[0].get("CompilerVersion", "")
-
-                sources_list = []
-                stripped = scode.strip()
+                contract_name = result[0].get("ContractName", "")
+                sources_list: List[dict] = []
+                stripped = source_code.strip()
                 if stripped.startswith("{"):
                     try:
-                        data = json.loads(scode)
+                        data = json.loads(source_code)
                         for fname, info in data.get("sources", {}).items():
                             content = info.get("content", "")
                             sources_list.append({"filename": fname, "content": content})
                     except Exception:
                         sources_list.append(
-                            {"filename": cname or "contract.sol", "content": scode}
+                            {
+                                "filename": contract_name or "contract.sol",
+                                "content": source_code,
+                            }
                         )
                 else:
                     sources_list.append(
-                        {"filename": cname or "contract.sol", "content": scode}
+                        {"filename": contract_name or "contract.sol", "content": source_code}
                     )
 
                 return {
                     "status": ContractVerificationStatus.VERIFIED,
                     "source": sources_list,
                     "compilerVersion": compiler,
-                    "contractName": cname,
+                    "contractName": contract_name,
                 }
-        else:
-            return {
-                "status": ContractVerificationStatus.ERROR,
-                "source": [],
-                "compilerVersion": "",
-                "contractName": "",
-            }
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"source fetch failed: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
-    except Exception as e:
-        logger.warning(f"fetch_contract_source_etherscan error: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
+            if message == "contract source code not verified":
+                return {
+                    "status": ContractVerificationStatus.UNVERIFIED,
+                    "source": [],
+                    "compilerVersion": "",
+                    "contractName": "",
+                }
+
+            errors.append(
+                f"{base_url} unexpected payload: status={status} message={payload.get('message')}"
+            )
+            await asyncio.sleep(min(2 ** attempt, 5))
+
+    if errors:
+        logger.warning(
+            "Etherscan source fetch failed for %s: %s", token_addr, errors[-1]
+        )
+
+    return {
+        "status": ContractVerificationStatus.ERROR,
+        "source": [],
+        "compilerVersion": "",
+        "contractName": "",
+        "error": "; ".join(errors) if errors else "unknown error",
+    }
 
 def fetch_contract_source_etherscan(token_addr: str) -> dict:
     return asyncio.run(_fetch_contract_source_etherscan_async(token_addr))
@@ -2437,7 +2480,7 @@ def advanced_contract_check(token_addr: str) -> dict:
     else:
         return {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "riskFlags": {"ownerActivity": suspicious_activity},
             "status": "ERROR",
             "owner": owner_addr,
@@ -2447,6 +2490,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "renounced": renounced,
             "slitherIssues": None,
             "thirdPartySecurity": third_party_security,
+            "error": info.get("error"),
         }
 
 
@@ -3111,7 +3155,7 @@ def check_pair_criteria(
         logger.error("contract analysis failed for %s: %s", main_token, exc)
         contract_info = {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "status": "ERROR",
             "owner": None,
             "ownerBalanceEth": None,
@@ -3121,6 +3165,7 @@ def check_pair_criteria(
             "slitherIssues": None,
             "privateSale": {},
             "onChainMetrics": {},
+            "error": str(exc),
         }
 
     extra.update(
@@ -3137,6 +3182,7 @@ def check_pair_criteria(
             "slitherIssues": contract_info.get("slitherIssues"),
             "privateSale": contract_info.get("privateSale", {}),
             "onChainMetrics": contract_info.get("onChainMetrics", {}),
+            "contractAnalysisError": contract_info.get("error"),
         }
     )
 
@@ -3199,99 +3245,142 @@ class ContractVerificationStatus:
 
 
 async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
-    """Return verified source code information from Etherscan.
+    """Return verified source code information from Etherscan with retries."""
 
-    The returned dictionary contains:
-        ``status``: ``verified`` | ``unverified`` | ``error``
-        ``source``: list of ``{"filename": str, "content": str}``
-        ``compilerVersion``: compiler version string
-        ``contractName``: contract name
-    """
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return {
             "status": ContractVerificationStatus.ERROR,
             "source": [],
             "compilerVersion": "",
             "contractName": "",
+            "error": ETHERSCAN_DISABLED_REASON or "Etherscan lookups disabled",
         }
+
     token_addr = token_addr.lower()
-    api_key = get_next_etherscan_key()
-    params = {
+    base_params = {
         "module": "contract",
         "action": "getsourcecode",
         "address": token_addr,
-        "apikey": api_key,
     }
-    try:
-        params = _prepare_etherscan_params(params)
-        async with create_aiohttp_session() as session:
-            async with session.get(ETHERSCAN_API_URL, params=params, timeout=20) as r:
-                j = await r.json()
-        status = j.get("status")
-        result = j.get("result", [])
+    urls = [url for url in ETHERSCAN_API_URL_CANDIDATES if url]
+    if ETHERSCAN_API_URL and ETHERSCAN_API_URL not in urls:
+        urls.insert(0, ETHERSCAN_API_URL)
+    if not urls:
+        return {
+            "status": ContractVerificationStatus.ERROR,
+            "source": [],
+            "compilerVersion": "",
+            "contractName": "",
+            "error": "No Etherscan API URLs configured",
+        }
 
-        if status == "1" and len(result) > 0:
-            # Etherscan returns a list. If SourceCode is empty => unverified
-            if not result[0].get("SourceCode"):
-                return {
-                    "status": ContractVerificationStatus.UNVERIFIED,
-                    "source": [],
-                    "compilerVersion": "",
-                    "contractName": "",
-                }
-            else:
-                # Verified
-                scode = result[0].get("SourceCode", "")
-                cname = result[0].get("ContractName", "")
+    errors: List[str] = []
+    max_attempts = 3
+
+    for base_url in urls:
+        for attempt in range(max_attempts):
+            attempt_params = dict(base_params)
+            attempt_params["apikey"] = get_next_etherscan_key()
+            attempt_params = _prepare_etherscan_params(attempt_params, base_url)
+
+            try:
+                async with create_aiohttp_session() as session:
+                    async with session.get(base_url, params=attempt_params, timeout=20) as response:
+                        if response.status >= 500:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} {response.status}: {body or 'server error'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+
+                        try:
+                            payload = await response.json(content_type=None)
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
+                            body = (await response.text())[:120].strip()
+                            errors.append(
+                                f"{base_url} invalid JSON: {exc} :: {body or 'no body'}"
+                            )
+                            await asyncio.sleep(min(2 ** attempt, 5))
+                            continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                errors.append(f"{base_url} attempt {attempt + 1}: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.warning("fetch_contract_source_etherscan unexpected error: %s", exc)
+                errors.append(f"{base_url} unexpected error: {exc}")
+                await asyncio.sleep(min(2 ** attempt, 5))
+                continue
+
+            status = payload.get("status")
+            result = payload.get("result", [])
+            message = (payload.get("message") or "").lower()
+
+            if status == "1" and result:
+                source_code = result[0].get("SourceCode", "")
+                if not source_code:
+                    return {
+                        "status": ContractVerificationStatus.UNVERIFIED,
+                        "source": [],
+                        "compilerVersion": "",
+                        "contractName": "",
+                    }
+
                 compiler = result[0].get("CompilerVersion", "")
-
-                sources_list = []
-                stripped = scode.strip()
+                contract_name = result[0].get("ContractName", "")
+                sources_list: List[dict] = []
+                stripped = source_code.strip()
                 if stripped.startswith("{"):
                     try:
-                        data = json.loads(scode)
+                        data = json.loads(source_code)
                         for fname, info in data.get("sources", {}).items():
                             content = info.get("content", "")
                             sources_list.append({"filename": fname, "content": content})
                     except Exception:
                         sources_list.append(
-                            {"filename": cname or "contract.sol", "content": scode}
+                            {
+                                "filename": contract_name or "contract.sol",
+                                "content": source_code,
+                            }
                         )
                 else:
                     sources_list.append(
-                        {"filename": cname or "contract.sol", "content": scode}
+                        {"filename": contract_name or "contract.sol", "content": source_code}
                     )
 
                 return {
                     "status": ContractVerificationStatus.VERIFIED,
                     "source": sources_list,
                     "compilerVersion": compiler,
-                    "contractName": cname,
+                    "contractName": contract_name,
                 }
-        else:
-            return {
-                "status": ContractVerificationStatus.ERROR,
-                "source": [],
-                "compilerVersion": "",
-                "contractName": "",
-            }
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"source fetch failed: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
-    except Exception as e:
-        logger.warning(f"fetch_contract_source_etherscan error: {e}")
-        return {
-            "status": ContractVerificationStatus.ERROR,
-            "source": [],
-            "compilerVersion": "",
-            "contractName": "",
-        }
+            if message == "contract source code not verified":
+                return {
+                    "status": ContractVerificationStatus.UNVERIFIED,
+                    "source": [],
+                    "compilerVersion": "",
+                    "contractName": "",
+                }
+
+            errors.append(
+                f"{base_url} unexpected payload: status={status} message={payload.get('message')}"
+            )
+            await asyncio.sleep(min(2 ** attempt, 5))
+
+    if errors:
+        logger.warning(
+            "Etherscan source fetch failed for %s: %s", token_addr, errors[-1]
+        )
+
+    return {
+        "status": ContractVerificationStatus.ERROR,
+        "source": [],
+        "compilerVersion": "",
+        "contractName": "",
+        "error": "; ".join(errors) if errors else "unknown error",
+    }
 
 def fetch_contract_source_etherscan(token_addr: str) -> dict:
     return asyncio.run(_fetch_contract_source_etherscan_async(token_addr))
@@ -3828,7 +3917,7 @@ def advanced_contract_check(token_addr: str) -> dict:
     else:
         return {
             "verified": False,
-            "riskScore": 9999,
+            "riskScore": None,
             "riskFlags": {"ownerActivity": suspicious_activity},
             "status": "ERROR",
             "owner": owner_addr,
@@ -3837,6 +3926,7 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "error": info.get("error"),
         }
 
 

@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+from collections import deque
 from unittest.mock import patch, AsyncMock
 
 from ethereumbotv2 import (
@@ -127,6 +128,108 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         ):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
+
+
+class EtherscanFetchFallbackTest(unittest.IsolatedAsyncioTestCase):
+    class FakeResponse:
+        def __init__(self, status, payload=None, text="", json_exc=None):
+            self.status = status
+            self._payload = payload
+            self._text = text
+            self._json_exc = json_exc
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            if self._json_exc:
+                raise self._json_exc
+            return self._payload or {}
+
+        async def text(self):
+            return self._text
+
+    class FakeSession:
+        def __init__(self, queue):
+            self._queue = queue
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, params=None, timeout=None):
+            if not self._queue:
+                raise AssertionError("No more responses queued")
+            return self._queue.popleft()
+
+    async def test_fetch_recovers_after_server_error(self):
+        responses = deque(
+            [
+                self.FakeResponse(502, text="Bad Gateway", json_exc=ValueError("bad")),
+                self.FakeResponse(
+                    200,
+                    payload={
+                        "status": "1",
+                        "result": [
+                            {
+                                "SourceCode": "pragma solidity ^0.8.0; contract Foo {}",
+                                "ContractName": "Foo",
+                                "CompilerVersion": "v0.8.0",
+                            }
+                        ],
+                        "message": "OK",
+                    },
+                ),
+            ]
+        )
+
+        def fake_create_session(**kwargs):
+            return self.FakeSession(responses)
+
+        sleep_mock = AsyncMock()
+
+        with patch.object(ethereumbotv2, "create_aiohttp_session", side_effect=fake_create_session), patch(
+            "ethereumbotv2.asyncio.sleep", sleep_mock
+        ), patch.object(
+            ethereumbotv2, "ETHERSCAN_API_URL_CANDIDATES", ["https://api.etherscan.io/v2/api", "https://api.etherscan.io/api"], create=True
+        ), patch.object(ethereumbotv2, "ETHERSCAN_API_URL", "https://api.etherscan.io/v2/api", create=True), patch.object(
+            ethereumbotv2, "ETHERSCAN_LOOKUPS_ENABLED", True, create=True
+        ), patch.object(ethereumbotv2, "get_next_etherscan_key", return_value="KEY"):
+            result = await ethereumbotv2._fetch_contract_source_etherscan_async("0xtest")
+
+        self.assertEqual(result["status"], ethereumbotv2.ContractVerificationStatus.VERIFIED)
+        self.assertEqual(result["contractName"], "Foo")
+        self.assertTrue(result["source"])
+
+    async def test_fetch_reports_error_without_disabling(self):
+        responses = deque(
+            [self.FakeResponse(502, text="Bad Gateway", json_exc=ValueError("bad")) for _ in range(6)]
+        )
+
+        def fake_create_session(**kwargs):
+            return self.FakeSession(responses)
+
+        sleep_mock = AsyncMock()
+
+        with patch.object(ethereumbotv2, "create_aiohttp_session", side_effect=fake_create_session), patch(
+            "ethereumbotv2.asyncio.sleep", sleep_mock
+        ), patch.object(
+            ethereumbotv2, "ETHERSCAN_API_URL_CANDIDATES", ["https://api.etherscan.io/v2/api", "https://api.etherscan.io/api"], create=True
+        ), patch.object(ethereumbotv2, "ETHERSCAN_API_URL", "https://api.etherscan.io/v2/api", create=True), patch.object(
+            ethereumbotv2, "ETHERSCAN_LOOKUPS_ENABLED", True, create=True
+        ), patch.object(ethereumbotv2, "get_next_etherscan_key", return_value="KEY"), patch.object(
+            ethereumbotv2, "disable_etherscan_lookups"
+        ) as disable_mock:
+            result = await ethereumbotv2._fetch_contract_source_etherscan_async("0xerr")
+
+        self.assertEqual(result["status"], ethereumbotv2.ContractVerificationStatus.ERROR)
+        self.assertIn("Bad Gateway", result.get("error", ""))
+        disable_mock.assert_not_called()
 
 
 class RecheckStopTest(unittest.TestCase):
