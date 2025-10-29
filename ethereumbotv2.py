@@ -1638,6 +1638,67 @@ def _env_flag(name: str, default: bool = True) -> bool:
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
 USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", False)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
+ETHERSCAN_RECOVERY_DELAY_SECONDS = int(
+    os.getenv("ETHERSCAN_RECOVERY_DELAY_SECONDS", "300") or "0"
+)
+_ETHERSCAN_RECOVERY_LOCK = threading.Lock()
+_ETHERSCAN_RECOVERY_TIMER: Optional[threading.Timer] = None
+
+
+def _attempt_etherscan_recovery() -> None:
+    """Try to re-enable Etherscan lookups after a cooldown."""
+
+    global ETHERSCAN_LOOKUPS_ENABLED, ETHERSCAN_DISABLED_REASON, _ETHERSCAN_RECOVERY_TIMER
+
+    with _ETHERSCAN_RECOVERY_LOCK:
+        _ETHERSCAN_RECOVERY_TIMER = None
+
+    if ETHERSCAN_LOOKUPS_ENABLED:
+        return
+
+    previous_reason = ETHERSCAN_DISABLED_REASON
+    logger.info("Attempting to re-enable Etherscan lookups after cooldown")
+
+    ETHERSCAN_LOOKUPS_ENABLED = True
+    ETHERSCAN_DISABLED_REASON = None
+
+    try:
+        set_tracker_etherscan_enabled(True, "Etherscan recovery attempt")
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Failed to propagate Etherscan recovery to tracker", exc_info=True)
+
+    try:
+        ensure_etherscan_connectivity()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Etherscan recovery health check raised: %s", exc, exc_info=True)
+
+    if ETHERSCAN_LOOKUPS_ENABLED:
+        log_event(
+            logging.INFO,
+            "etherscan_recovery",
+            "Etherscan lookups re-enabled",
+            context={"previous_reason": previous_reason or ""},
+        )
+    else:
+        logger.warning("Etherscan recovery attempt failed; rescheduling")
+        schedule_etherscan_recovery()
+
+
+def schedule_etherscan_recovery() -> None:
+    """Schedule a cooldown task to retry enabling Etherscan lookups."""
+
+    if ETHERSCAN_RECOVERY_DELAY_SECONDS <= 0:
+        return
+
+    with _ETHERSCAN_RECOVERY_LOCK:
+        global _ETHERSCAN_RECOVERY_TIMER
+        if _ETHERSCAN_RECOVERY_TIMER is not None:
+            _ETHERSCAN_RECOVERY_TIMER.cancel()
+        timer = threading.Timer(ETHERSCAN_RECOVERY_DELAY_SECONDS, _attempt_etherscan_recovery)
+        timer.daemon = True
+        _ETHERSCAN_RECOVERY_TIMER = timer
+
+    timer.start()
 
 
 def disable_etherscan_lookups(reason: str) -> None:
@@ -1650,6 +1711,10 @@ def disable_etherscan_lookups(reason: str) -> None:
             set_tracker_etherscan_enabled(False, reason)
         except Exception:  # pragma: no cover - defensive
             logger.debug("Failed to propagate Etherscan disable to tracker", exc_info=True)
+    else:
+        ETHERSCAN_DISABLED_REASON = reason
+
+    schedule_etherscan_recovery()
 
 
 def ensure_etherscan_connectivity() -> None:
