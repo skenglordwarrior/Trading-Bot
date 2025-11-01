@@ -46,6 +46,7 @@ import aiohttp
 import threading
 from collections import Counter, deque
 from concurrent.futures import Future
+from itertools import cycle
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
@@ -228,7 +229,31 @@ GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzf
 GRAPH_BEARER = "6ab18515ae540220006db77a4472de7a"
 
 ETHPLORER_BASE_URL = os.getenv("ETHPLORER_BASE_URL", "https://api.ethplorer.io")
-ETHPLORER_API_KEY = os.getenv("ETHPLORER_API_KEY", "freekey")
+_DEFAULT_ETHPLORER_KEYS = [
+    "EK-siGhL-4qx9Cy7-Uhqwh",
+    "EK-sAJiB-RAC8sYw-bNwAE",
+]
+_ethplorer_keys_env = os.getenv("ETHPLORER_API_KEYS")
+if _ethplorer_keys_env:
+    ETHPLORER_API_KEYS = [key.strip() for key in _ethplorer_keys_env.split(",") if key.strip()]
+else:
+    single_key = os.getenv("ETHPLORER_API_KEY", "").strip()
+    if single_key:
+        ETHPLORER_API_KEYS = [single_key]
+    else:
+        ETHPLORER_API_KEYS = _DEFAULT_ETHPLORER_KEYS.copy()
+
+if not ETHPLORER_API_KEYS:
+    ETHPLORER_API_KEYS = _DEFAULT_ETHPLORER_KEYS.copy()
+
+ETHPLORER_API_KEY = ETHPLORER_API_KEYS[0]
+_ETHPLORER_KEY_LOCK = threading.Lock()
+_ETHPLORER_KEY_CYCLE = cycle(ETHPLORER_API_KEYS)
+
+
+def get_next_ethplorer_key() -> str:
+    with _ETHPLORER_KEY_LOCK:
+        return next(_ETHPLORER_KEY_CYCLE)
 
 UNISWAP_V2_FACTORY_ADDRESS = to_checksum_address(
     "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
@@ -2640,39 +2665,47 @@ def _normalise_holder_entry(entry: dict) -> Optional[dict]:
 async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List[dict]:
     base_url = ETHPLORER_BASE_URL.rstrip("/")
     url = f"{base_url}/getTopTokenHolders/{token_addr}"
-    params = {"apiKey": ETHPLORER_API_KEY or "freekey", "limit": limit}
     timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT)
-    try:
-        async with create_aiohttp_session(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-        log_event(
-            logging.WARNING,
-            "ethplorer_api",
-            "Failed to fetch holder distribution",
-            error=str(exc),
-            context={"token": token_addr},
-        )
-        return []
-    except Exception as exc:
-        logger.debug(f"ethplorer holder fetch error: {exc}")
-        return []
+    max_attempts = max(len(ETHPLORER_API_KEYS), 1)
 
-    holders = []
-    for item in payload.get("holders", []):
-        normalised = _normalise_holder_entry(item)
-        if normalised:
-            holders.append(normalised)
-    if holders:
-        log_event(
-            logging.INFO,
-            "ethplorer_api",
-            "Fetched holder distribution via Ethplorer",
-            context={"token": token_addr, "count": len(holders)},
-        )
-    return holders
+    for attempt in range(max_attempts):
+        api_key = get_next_ethplorer_key()
+        if not api_key:
+            api_key = _DEFAULT_ETHPLORER_KEYS[0]
+        params = {"apiKey": api_key, "limit": limit}
+        try:
+            async with create_aiohttp_session(timeout=timeout) as session:
+                async with session.get(url, params=params) as resp:
+                    resp.raise_for_status()
+                    payload = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            log_event(
+                logging.WARNING,
+                "ethplorer_api",
+                "Failed to fetch holder distribution",
+                error=str(exc),
+                context={"token": token_addr, "attempt": attempt + 1, "api_key": "***"},
+            )
+            continue
+        except Exception as exc:
+            logger.debug(f"ethplorer holder fetch error: {exc}")
+            continue
+
+        holders = []
+        for item in payload.get("holders", []):
+            normalised = _normalise_holder_entry(item)
+            if normalised:
+                holders.append(normalised)
+        if holders:
+            log_event(
+                logging.INFO,
+                "ethplorer_api",
+                "Fetched holder distribution via Ethplorer",
+                context={"token": token_addr, "count": len(holders)},
+            )
+        return holders
+
+    return []
 
 
 async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
