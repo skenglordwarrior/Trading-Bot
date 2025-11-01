@@ -229,15 +229,22 @@ GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzf
 GRAPH_BEARER = "6ab18515ae540220006db77a4472de7a"
 
 ETHPLORER_BASE_URL = os.getenv("ETHPLORER_BASE_URL", "https://api.ethplorer.io")
+_DEFAULT_ETHPLORER_KEYS = [
+    "EK-siGhL-4qx9Cy7-Uhqwh",
+    "EK-sAJiB-RAC8sYw-bNwAE",
+]
 _ethplorer_keys_env = os.getenv("ETHPLORER_API_KEYS")
 if _ethplorer_keys_env:
     ETHPLORER_API_KEYS = [key.strip() for key in _ethplorer_keys_env.split(",") if key.strip()]
 else:
-    single_key = os.getenv("ETHPLORER_API_KEY", "freekey")
-    ETHPLORER_API_KEYS = [single_key.strip()] if single_key.strip() else []
+    single_key = os.getenv("ETHPLORER_API_KEY", "").strip()
+    if single_key:
+        ETHPLORER_API_KEYS = [single_key]
+    else:
+        ETHPLORER_API_KEYS = _DEFAULT_ETHPLORER_KEYS.copy()
 
 if not ETHPLORER_API_KEYS:
-    ETHPLORER_API_KEYS = ["freekey"]
+    ETHPLORER_API_KEYS = _DEFAULT_ETHPLORER_KEYS.copy()
 
 ETHPLORER_API_KEY = ETHPLORER_API_KEYS[0]
 _ETHPLORER_KEY_LOCK = threading.Lock()
