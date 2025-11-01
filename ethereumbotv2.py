@@ -2670,7 +2670,9 @@ async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List
 
     for attempt in range(max_attempts):
         api_key = get_next_ethplorer_key()
-        params = {"apiKey": api_key or "freekey", "limit": limit}
+        if not api_key:
+            api_key = _DEFAULT_ETHPLORER_KEYS[0]
+        params = {"apiKey": api_key, "limit": limit}
         try:
             async with create_aiohttp_session(timeout=timeout) as session:
                 async with session.get(url, params=params) as resp:
