@@ -1986,11 +1986,13 @@ async def _fetch_dexscreener_data_async(
                 DEXSCREENER_CACHE[pkey] = (now, pdata)
             reason = pair_reason or reason
 
-        plist = pdata.get("pairs", []) if pdata else []
-        if plist:
-            pair_info = plist[0]
-        elif not reason:
-            reason = "not_listed"
+    plist = pdata.get("pairs", []) if pdata else []
+    if plist:
+        pair_info = plist[0]
+    elif not reason:
+        reason = "not_listed"
+
+    locked = await _check_liquidity_locked_etherscan_async(pair_addr)
 
     if not pair_info:
         return None, reason or "not_listed"
@@ -2012,13 +2014,10 @@ async def _fetch_dexscreener_data_async(
     logo_url = info_section.get("imageUrl", "")
     websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
     socials = [s.get("url") for s in info_section.get("socials", []) if s.get("url")]
-    # Determine locked liquidity via DexScreener label and Etherscan data
-    locked = False
+    # Determine locked liquidity prioritising our internal checks before DexScreener labels
     labels = pair_info.get("labels", [])
-    if "locked" in labels:
+    if not locked and "locked" in labels:
         locked = True
-    else:
-        locked = await _check_liquidity_locked_etherscan_async(pair_addr)
 
     # Detect paid promotions/trending on Dex platforms
     dex_paid = any(lbl.lower() in {"promoted", "boosted", "paid"} for lbl in labels)
