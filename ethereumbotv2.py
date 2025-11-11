@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - optional dependency
 import contextlib
 import io
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
@@ -1397,6 +1397,11 @@ DEXSCREENER_CACHE: Dict[str, Tuple[float, dict]] = {}
 DEXSCREENER_CACHE_TTL = 300  # 5 minutes
 DEXSCREENER_PAIR_TTL = 10  # short TTL for pair endpoint
 
+UNCX_API_BASE_URL = os.getenv("UNCX_API_BASE_URL", "https://api.uncx.network/api/v1")
+UNCX_LOCKS_ENDPOINT = os.getenv(
+    "UNCX_LOCKS_ENDPOINT", f"{UNCX_API_BASE_URL.rstrip('/')}/locks/token"
+)
+
 BURN_ADDRESSES: Set[str] = {
     ZERO_ADDRESS.lower(),
     "0x000000000000000000000000000000000000dead",
@@ -1855,6 +1860,10 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
     if holder_based is not None:
         return holder_based
 
+    uncx_based = await _check_liquidity_locked_uncx_async(pair_addr)
+    if uncx_based is not None:
+        return uncx_based
+
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return False
     api_key = get_next_etherscan_key()
@@ -2198,6 +2207,327 @@ def disable_etherscan_lookups(reason: str) -> None:
         ETHERSCAN_DISABLED_REASON = reason
 
     schedule_etherscan_recovery()
+
+
+###########################################################
+# UNCX LOCK LOOKUPS
+###########################################################
+
+UNCX_LOOKUPS_ENABLED = _env_flag("ENABLE_UNCX_LOOKUPS", True)
+UNCX_DISABLED_REASON: Optional[str] = None
+UNCX_RECOVERY_DELAY_SECONDS = int(os.getenv("UNCX_RECOVERY_DELAY_SECONDS", "300") or "0")
+_UNCX_RECOVERY_LOCK = threading.Lock()
+_UNCX_RECOVERY_TIMER: Optional[threading.Timer] = None
+
+
+def _attempt_uncx_recovery() -> None:
+    """Attempt to re-enable Uncx lookups after a cooldown."""
+
+    global UNCX_LOOKUPS_ENABLED, UNCX_DISABLED_REASON, _UNCX_RECOVERY_TIMER
+
+    with _UNCX_RECOVERY_LOCK:
+        _UNCX_RECOVERY_TIMER = None
+
+    if UNCX_LOOKUPS_ENABLED:
+        return
+
+    logger.info("Re-enabling Uncx lookups after cooldown")
+    UNCX_LOOKUPS_ENABLED = True
+    UNCX_DISABLED_REASON = None
+
+
+def schedule_uncx_recovery() -> None:
+    """Schedule a background task to re-enable Uncx lookups."""
+
+    if UNCX_RECOVERY_DELAY_SECONDS <= 0:
+        return
+
+    with _UNCX_RECOVERY_LOCK:
+        global _UNCX_RECOVERY_TIMER
+        if _UNCX_RECOVERY_TIMER is not None:
+            _UNCX_RECOVERY_TIMER.cancel()
+        timer = threading.Timer(UNCX_RECOVERY_DELAY_SECONDS, _attempt_uncx_recovery)
+        timer.daemon = True
+        _UNCX_RECOVERY_TIMER = timer
+
+    timer.start()
+
+
+def disable_uncx_lookups(reason: str) -> None:
+    """Disable Uncx lookups following persistent errors."""
+
+    global UNCX_LOOKUPS_ENABLED, UNCX_DISABLED_REASON
+    if UNCX_LOOKUPS_ENABLED:
+        UNCX_LOOKUPS_ENABLED = False
+        UNCX_DISABLED_REASON = reason
+        logger.warning("Disabling Uncx lookups: %s", reason)
+    else:
+        UNCX_DISABLED_REASON = reason
+
+    schedule_uncx_recovery()
+
+
+def enable_uncx_lookups(reason: str = "") -> None:
+    """Manually re-enable Uncx lookups."""
+
+    global UNCX_LOOKUPS_ENABLED, UNCX_DISABLED_REASON
+    if not UNCX_LOOKUPS_ENABLED:
+        UNCX_LOOKUPS_ENABLED = True
+        UNCX_DISABLED_REASON = None
+        if reason:
+            logger.info("Re-enabled Uncx lookups: %s", reason)
+
+
+def _coerce_uncx_timestamp(value: Any) -> Optional[float]:
+    """Convert a variety of timestamp representations to seconds."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        try:
+            return float(Decimal(trimmed))
+        except (InvalidOperation, ValueError):
+            try:
+                return datetime.fromisoformat(trimmed.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+
+    try:
+        return float(Decimal(str(value)))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _extract_uncx_unlock_timestamp(lock: dict) -> Optional[float]:
+    """Return the unlock timestamp (in seconds) for an Uncx lock entry."""
+
+    timestamp_keys = (
+        "unlockDate",
+        "unlock_date",
+        "unlockTimestamp",
+        "unlockTs",
+        "unlock_time",
+        "unlockTime",
+        "unlockAt",
+        "unlock_at",
+        "unlockTimeStamp",
+        "unlock",  # sometimes used as shorthand
+    )
+
+    for key in timestamp_keys:
+        if key in lock:
+            ts = _coerce_uncx_timestamp(lock.get(key))
+            if ts is not None:
+                return ts
+
+    # Some responses may include ISO8601 strings under alternative keys
+    for key in ("unlockDateISO", "unlock_date_iso", "unlockTimeISO"):
+        if key in lock:
+            ts = _coerce_uncx_timestamp(lock.get(key))
+            if ts is not None:
+                return ts
+
+    return None
+
+
+def _extract_uncx_amount(lock: dict) -> Optional[Decimal]:
+    """Return the locked token amount from an Uncx lock entry."""
+
+    amount_keys = (
+        "amount",
+        "amountLocked",
+        "locked_amount",
+        "tokensLocked",
+        "tokenAmount",
+        "lockAmount",
+        "amount_total",
+        "amount_locked",
+        "amountToken",
+        "lpTokensLocked",
+    )
+
+    for key in amount_keys:
+        if key not in lock:
+            continue
+        raw_value = lock.get(key)
+        if raw_value in (None, ""):
+            continue
+        try:
+            amount = Decimal(str(raw_value))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if amount <= 0:
+            continue
+
+        # Normalize values that include a decimals hint when supplied as integers
+        decimals_hint = lock.get("decimals") or lock.get("tokenDecimals")
+        if (
+            isinstance(decimals_hint, (int, float))
+            or (isinstance(decimals_hint, str) and decimals_hint.isdigit())
+        ):
+            try:
+                decimals_int = int(decimals_hint)
+            except (TypeError, ValueError):
+                decimals_int = None
+            else:
+                if decimals_int and amount == amount.to_integral_value():
+                    try:
+                        scaled = amount / (Decimal(10) ** decimals_int)
+                    except (InvalidOperation, OverflowError):
+                        scaled = None
+                    else:
+                        if scaled is not None and scaled > 0:
+                            amount = scaled
+
+        return amount
+
+    formatted = lock.get("amountFormatted") or lock.get("amount_formatted")
+    if formatted:
+        try:
+            amount = Decimal(str(formatted))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        return amount if amount > 0 else None
+
+    return None
+
+
+def _extract_uncx_locks(payload: Any) -> Optional[List[dict]]:
+    """Extract the list of lock entries from a Uncx API response."""
+
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        for key in ("locks", "result", "data", "items", "rows"):
+            if key not in payload:
+                continue
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                return nested
+            if isinstance(nested, dict):
+                extracted = _extract_uncx_locks(nested)
+                if extracted is not None:
+                    return extracted
+        return []
+
+    return None
+
+
+async def _check_liquidity_locked_uncx_async(pair_addr: str) -> Optional[bool]:
+    """Return True/False when Uncx provides a definitive liquidity status."""
+
+    if not UNCX_LOOKUPS_ENABLED:
+        return None
+
+    endpoint = UNCX_LOCKS_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/{pair_addr}"
+
+    try:
+        async with create_aiohttp_session() as session:
+            async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
+                if resp.status == 404:
+                    metrics.record_api_call(error=False)
+                    logger.debug("Uncx reports no locks for %s", pair_addr)
+                    return False
+                if resp.status == 429:
+                    metrics.record_api_call(error=True)
+                    disable_uncx_lookups("Uncx rate limited")
+                    return None
+                if resp.status >= 500:
+                    metrics.record_api_call(error=True)
+                    disable_uncx_lookups(f"Uncx service error: {resp.status}")
+                    return None
+
+                resp.raise_for_status()
+                data = await resp.json()
+        metrics.record_api_call(error=False)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        metrics.record_api_call(error=True)
+        disable_uncx_lookups(f"Uncx lookup failed: {exc}")
+        return None
+    except Exception as exc:  # pragma: no cover - unexpected parser issues
+        metrics.record_api_call(error=True)
+        logger.debug("Uncx lock check error: %s", exc, exc_info=True)
+        return None
+
+    locks = _extract_uncx_locks(data)
+    if locks is None:
+        return None
+
+    if not locks:
+        return False
+
+    now_ts = time.time()
+    active_amount = Decimal(0)
+    total_amount = Decimal(0)
+    inconclusive = False
+    entries = 0
+
+    for lock in locks:
+        if not isinstance(lock, dict):
+            inconclusive = True
+            continue
+
+        entries += 1
+
+        amount = _extract_uncx_amount(lock)
+        if amount is None:
+            inconclusive = True
+            continue
+
+        status_text = str(lock.get("status") or "").lower()
+        unlocked_flag = lock.get("isUnlocked")
+        is_locked_flag = lock.get("isLocked")
+
+        if unlocked_flag is True or "withdrawn" in status_text:
+            continue
+
+        total_amount += amount
+
+        if is_locked_flag is True or ("lock" in status_text and "unlock" not in status_text):
+            active_amount += amount
+            continue
+
+        unlock_ts = _extract_uncx_unlock_timestamp(lock)
+        if unlock_ts is None:
+            inconclusive = True
+            continue
+
+        if unlock_ts > 1e12:
+            unlock_ts = unlock_ts / 1000.0
+
+        if unlock_ts == 0:
+            active_amount += amount
+            continue
+
+        if unlock_ts > now_ts:
+            active_amount += amount
+
+    if active_amount > 0:
+        logger.debug(
+            "Uncx lock snapshot for %s => active_amount=%s total=%s entries=%s",
+            pair_addr,
+            str(active_amount),
+            str(total_amount) if total_amount else "0",
+            entries,
+        )
+        return True
+
+    if inconclusive:
+        return None
+
+    return False
 
 
 def ensure_etherscan_connectivity() -> None:
