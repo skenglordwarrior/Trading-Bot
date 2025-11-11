@@ -137,6 +137,21 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
 
+    async def test_uncx_short_circuits_when_locked(self):
+        with patch.object(
+            ethereumbotv2,
+            "_check_liquidity_locked_holder_analysis",
+            AsyncMock(return_value=None),
+        ), patch.object(
+            ethereumbotv2,
+            "_check_liquidity_locked_uncx_async",
+            AsyncMock(return_value=True),
+        ) as uncx_mock:
+            locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
+
+        self.assertTrue(locked)
+        uncx_mock.assert_awaited_once_with("0xpair")
+
 
     async def test_holder_snapshot_reports_locked(self):
         burn_addr = "0x000000000000000000000000000000000000dEaD"
@@ -408,6 +423,19 @@ class PairCriteriaRiskPropagationTest(unittest.TestCase):
         self.assertEqual(extra.get("riskScore"), contract_stub["riskScore"])
         self.assertIn("riskFlags", extra)
         self.assertFalse(extra["riskFlags"].get("walletDrainer"))
+
+
+class UncxDiagnosticsTest(unittest.TestCase):
+    def test_lookup_status_matches_globals(self):
+        from ethereumbotv2 import (
+            UNCX_DISABLED_REASON,
+            UNCX_LOOKUPS_ENABLED,
+            get_uncx_lookup_status,
+        )
+
+        status = get_uncx_lookup_status()
+        self.assertEqual(status["enabled"], UNCX_LOOKUPS_ENABLED)
+        self.assertEqual(status["disabled_reason"], UNCX_DISABLED_REASON)
 
 
 if __name__ == "__main__":
