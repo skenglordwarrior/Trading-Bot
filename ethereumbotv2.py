@@ -28,6 +28,8 @@ except ImportError:  # pragma: no cover - optional dependency
     parser = None
 import contextlib
 import io
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
@@ -46,7 +48,7 @@ import aiohttp
 import threading
 from collections import Counter, deque
 from concurrent.futures import Future
-from itertools import cycle
+from itertools import cycle, product
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
@@ -1395,8 +1397,464 @@ DEXSCREENER_CACHE: Dict[str, Tuple[float, dict]] = {}
 DEXSCREENER_CACHE_TTL = 300  # 5 minutes
 DEXSCREENER_PAIR_TTL = 10  # short TTL for pair endpoint
 
+BURN_ADDRESSES: Set[str] = {
+    ZERO_ADDRESS.lower(),
+    "0x000000000000000000000000000000000000dead",
+    "0x0000000000000000000000000000000000000001",
+}
+
+LOCKER_ADDRESS_HINTS: Dict[str, str] = {}
+LOCKER_KEYWORDS: Tuple[str, ...] = (
+    "locker",
+    "liquiditylock",
+    "liquidity lock",
+    "unicrypt",
+    "team finance",
+    "teamfinance",
+    "pinklock",
+    "pink lock",
+    "pinksale",
+    "mudra",
+    "deeplock",
+    "gempad",
+    "safeswap",
+)
+LP_HOLDER_SNAPSHOT_LIMIT = 20
+LOCKER_FRESHNESS_BUFFER_SECONDS = 60
+
+
+@dataclass
+class LPHolderAnalysis:
+    address: str
+    balance: int
+    status: str
+    reason: str
+    unlock_timestamp: Optional[int] = None
+
+
+_LP_CONTRACT_NAME_CACHE: Dict[str, Optional[str]] = {}
+_LP_IS_CONTRACT_CACHE: Dict[str, bool] = {}
+
+
+async def _fetch_lp_total_supply_async(pair_addr: str) -> Optional[int]:
+    try:
+        checksum = to_checksum_address(pair_addr)
+    except ValueError:
+        return None
+
+    abi = [
+        {
+            "constant": True,
+            "inputs": [],
+            "name": "totalSupply",
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+
+    contract = w3_read.eth.contract(checksum, abi=abi)
+    loop = asyncio.get_running_loop()
+    try:
+        total_supply = await loop.run_in_executor(
+            None, lambda: contract.functions.totalSupply().call()
+        )
+    except Exception as exc:
+        logger.debug(f"lp totalSupply fetch failed for %s: %s", pair_addr, exc)
+        return None
+
+    if isinstance(total_supply, int) and total_supply > 0:
+        return total_supply
+    return None
+
+
+PAIR_TOKEN_ABI = [
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "token0",
+        "outputs": [{"name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "token1",
+        "outputs": [{"name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+
+async def _fetch_pair_tokens_async(pair_addr: str) -> Tuple[Optional[str], Optional[str]]:
+    cached = known_pairs.get(pair_addr.lower())
+    if cached:
+        return cached
+
+    try:
+        checksum = to_checksum_address(pair_addr)
+    except ValueError:
+        return None, None
+
+    contract = w3_read.eth.contract(checksum, abi=PAIR_TOKEN_ABI)
+    loop = asyncio.get_running_loop()
+
+    try:
+        token0 = await loop.run_in_executor(
+            None, lambda: contract.functions.token0().call()
+        )
+        token1 = await loop.run_in_executor(
+            None, lambda: contract.functions.token1().call()
+        )
+        token0 = to_checksum_address(token0)
+        token1 = to_checksum_address(token1)
+        known_pairs[pair_addr.lower()] = (token0, token1)
+        return token0, token1
+    except Exception as exc:
+        logger.debug(f"pair token fetch failed for %s: %s", pair_addr, exc)
+        return None, None
+
+
+def _extract_int_from_result(value: Any) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 16) if value.startswith("0x") else int(value)
+        except ValueError:
+            return None
+    if isinstance(value, HexBytes):
+        return int.from_bytes(value, "big")
+    if isinstance(value, (list, tuple)):
+        extracted: List[int] = []
+        for item in value:
+            inner = _extract_int_from_result(item)
+            if inner is not None:
+                extracted.append(inner)
+        if extracted:
+            return max(extracted)
+    return None
+
+
+async def _is_contract_async(address: str) -> bool:
+    lowered = address.lower()
+    cached = _LP_IS_CONTRACT_CACHE.get(lowered)
+    if cached is not None:
+        return cached
+
+    try:
+        checksum = to_checksum_address(address)
+    except ValueError:
+        _LP_IS_CONTRACT_CACHE[lowered] = False
+        return False
+
+    loop = asyncio.get_running_loop()
+    try:
+        code = await loop.run_in_executor(None, lambda: w3_read.eth.get_code(checksum))
+        is_contract = bool(code and code != HexBytes(b""))
+    except Exception as exc:
+        logger.debug(f"is_contract check failed for %s: %s", address, exc)
+        is_contract = False
+
+    _LP_IS_CONTRACT_CACHE[lowered] = is_contract
+    return is_contract
+
+
+async def _get_contract_name_async(address: str) -> Optional[str]:
+    lowered = address.lower()
+    if lowered in _LP_CONTRACT_NAME_CACHE:
+        return _LP_CONTRACT_NAME_CACHE[lowered]
+
+    info = await _fetch_contract_source_etherscan_async(address)
+    name = (info.get("contractName") or info.get("ContractName") or "").strip()
+    if not name:
+        name = None
+    _LP_CONTRACT_NAME_CACHE[lowered] = name
+    return name
+
+
+def _generate_locker_arguments(
+    arg_types: Tuple[str, ...],
+    pair_addr: Optional[str],
+    main_token: Optional[str],
+) -> List[List[Any]]:
+    if not arg_types:
+        return [[]]
+
+    options: List[List[Any]] = []
+    for arg_type in arg_types:
+        if arg_type == "address":
+            candidates: List[str] = []
+            if pair_addr:
+                candidates.append(pair_addr)
+            if main_token:
+                lower_set = {c.lower() for c in candidates}
+                if main_token.lower() not in lower_set:
+                    candidates.append(main_token)
+            if not candidates:
+                return []
+            options.append(candidates)
+        elif arg_type.startswith("uint"):
+            options.append([0])
+        else:
+            return []
+
+    combos: List[List[Any]] = []
+    for combination in product(*options):
+        combos.append(list(combination))
+    return combos
+
+
+async def _call_locker_uint_function_async(
+    contract_addr: str, fn_name: str, arg_types: Tuple[str, ...], args: List[Any]
+) -> Optional[int]:
+    try:
+        checksum = to_checksum_address(contract_addr)
+    except ValueError:
+        return None
+
+    abi_inputs = []
+    for idx, arg_type in enumerate(arg_types):
+        abi_inputs.append({"name": f"arg{idx}", "type": arg_type})
+
+    abi = [
+        {
+            "constant": True,
+            "inputs": abi_inputs,
+            "name": fn_name,
+            "outputs": [{"name": "", "type": "uint256"}],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+
+    prepared_args: List[Any] = []
+    for arg_type, raw_value in zip(arg_types, args):
+        if arg_type == "address":
+            try:
+                prepared_args.append(to_checksum_address(raw_value))
+            except ValueError:
+                return None
+        else:
+            prepared_args.append(raw_value)
+
+    contract = w3_read.eth.contract(checksum, abi=abi)
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: getattr(contract.functions, fn_name)(*prepared_args).call()
+        )
+    except Exception:
+        return None
+
+    return _extract_int_from_result(result)
+
+
+LOCKER_TIME_METHODS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("unlockDate", tuple()),
+    ("unlockTime", tuple()),
+    ("getUnlockTime", tuple()),
+    ("getUnlockTime", ("address",)),
+    ("getUnlockTime", ("address", "address")),
+    ("releaseTime", tuple()),
+    ("lockReleaseTime", tuple()),
+    ("unlockTimestamp", tuple()),
+    ("unlockAt", tuple()),
+    ("lockTime", tuple()),
+    ("endTime", tuple()),
+)
+
+
+async def _get_locker_unlock_timestamp_async(
+    locker_addr: str, pair_addr: str, main_token: Optional[str]
+) -> Optional[int]:
+    for method_name, arg_types in LOCKER_TIME_METHODS:
+        argument_sets = _generate_locker_arguments(arg_types, pair_addr, main_token)
+        for args in argument_sets:
+            ts = await _call_locker_uint_function_async(locker_addr, method_name, arg_types, args)
+            if ts is None:
+                continue
+            if ts > 0:
+                return ts
+    return None
+
+
+async def _analyze_lp_holder_async(
+    holder_addr: str,
+    balance: int,
+    pair_addr: str,
+    main_token: Optional[str],
+) -> LPHolderAnalysis:
+    lowered = holder_addr.lower()
+    if lowered in BURN_ADDRESSES:
+        return LPHolderAnalysis(holder_addr, balance, "locked", "burn_address")
+
+    if lowered == pair_addr.lower():
+        return LPHolderAnalysis(holder_addr, balance, "unknown", "pair_contract")
+
+    hinted = LOCKER_ADDRESS_HINTS.get(lowered)
+
+    if hinted:
+        unlock_ts = await _get_locker_unlock_timestamp_async(holder_addr, pair_addr, main_token)
+        if unlock_ts is not None and unlock_ts <= int(time.time()) + LOCKER_FRESHNESS_BUFFER_SECONDS:
+            return LPHolderAnalysis(
+                holder_addr,
+                balance,
+                "unlocked",
+                f"{hinted}_locker_expired",
+                unlock_ts,
+            )
+        return LPHolderAnalysis(
+            holder_addr,
+            balance,
+            "locked",
+            f"{hinted}_locker",
+            unlock_ts,
+        )
+
+    is_contract = await _is_contract_async(holder_addr)
+    if not is_contract:
+        return LPHolderAnalysis(holder_addr, balance, "unlocked", "externally_owned_account")
+
+    contract_name = await _get_contract_name_async(holder_addr)
+    lowered_name = contract_name.lower() if contract_name else ""
+
+    if lowered_name:
+        if any(keyword in lowered_name for keyword in LOCKER_KEYWORDS):
+            unlock_ts = await _get_locker_unlock_timestamp_async(
+                holder_addr, pair_addr, main_token
+            )
+            if unlock_ts is not None and unlock_ts <= int(time.time()) + LOCKER_FRESHNESS_BUFFER_SECONDS:
+                return LPHolderAnalysis(
+                    holder_addr,
+                    balance,
+                    "unlocked",
+                    "locker_unlock_expired",
+                    unlock_ts,
+                )
+            return LPHolderAnalysis(
+                holder_addr,
+                balance,
+                "locked",
+                "locker_detected",
+                unlock_ts,
+            )
+        if "burn" in lowered_name:
+            return LPHolderAnalysis(holder_addr, balance, "locked", "burn_contract")
+
+    return LPHolderAnalysis(holder_addr, balance, "unknown", "unclassified_contract")
+
+
+async def _check_liquidity_locked_holder_analysis(pair_addr: str) -> Optional[bool]:
+    total_supply = await _fetch_lp_total_supply_async(pair_addr)
+    if not total_supply:
+        return None
+
+    holders_raw = await _fetch_holder_distribution_async(
+        pair_addr, LP_HOLDER_SNAPSHOT_LIMIT
+    )
+    if not holders_raw:
+        return None
+
+    token0, token1 = await _fetch_pair_tokens_async(pair_addr)
+    main_token: Optional[str] = None
+    if token0 and token1:
+        try:
+            main_token = get_non_weth_token(token0, token1)
+        except Exception:
+            main_token = token0
+
+    analyses: List[LPHolderAnalysis] = []
+    for entry in holders_raw:
+        address = entry.get("address")
+        if not address:
+            continue
+
+        balance_value = entry.get("balance")
+        balance_int: Optional[int] = None
+        if balance_value is not None:
+            try:
+                balance_int = int(balance_value)
+            except (TypeError, ValueError):
+                balance_int = _parse_holder_balance(balance_value)
+
+        if balance_int is None:
+            share = entry.get("share")
+            if share is not None:
+                try:
+                    balance_int = int(Decimal(total_supply) * Decimal(str(share)))
+                except Exception:
+                    balance_int = None
+
+        if balance_int is None or balance_int <= 0:
+            continue
+
+        try:
+            analysis = await _analyze_lp_holder_async(
+                address, balance_int, pair_addr, main_token
+            )
+        except Exception as exc:
+            logger.debug(
+                "lp holder analysis failed for %s on %s: %s",
+                address,
+                pair_addr,
+                exc,
+            )
+            analysis = LPHolderAnalysis(address, balance_int, "unknown", "analysis_error")
+
+        analyses.append(analysis)
+
+    if not analyses:
+        return None
+
+    locked_balance = sum(a.balance for a in analyses if a.status == "locked")
+    unlocked_balance = sum(a.balance for a in analyses if a.status == "unlocked")
+    unknown_balance = sum(a.balance for a in analyses if a.status == "unknown")
+
+    covered = locked_balance + unlocked_balance + unknown_balance
+    if covered < total_supply:
+        unknown_balance += total_supply - covered
+
+    snapshot = [
+        {
+            "address": a.address,
+            "status": a.status,
+            "balance": a.balance,
+            "reason": a.reason,
+            "unlock": a.unlock_timestamp,
+        }
+        for a in analyses
+    ]
+    logger.debug(
+        "LP holder snapshot for %s => locked=%s unlocked=%s unknown=%s total=%s details=%s",
+        pair_addr,
+        locked_balance,
+        unlocked_balance,
+        unknown_balance,
+        total_supply,
+        snapshot,
+    )
+
+    if locked_balance * 100 >= total_supply * 95:
+        logger.debug("LP supply for %s considered locked via holder analysis", pair_addr)
+        return True
+
+    if unlocked_balance * 100 >= total_supply * 5:
+        logger.debug(
+            "LP supply for %s considered unlocked via holder analysis", pair_addr
+        )
+        return False
+
+    return None
+
 
 async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
+    holder_based = await _check_liquidity_locked_holder_analysis(pair_addr)
+    if holder_based is not None:
+        return holder_based
+
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return False
     api_key = get_next_etherscan_key()
@@ -1661,7 +2119,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
-USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", False)
+USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", True)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
 ETHERSCAN_RECOVERY_DELAY_SECONDS = int(
     os.getenv("ETHERSCAN_RECOVERY_DELAY_SECONDS", "300") or "0"
