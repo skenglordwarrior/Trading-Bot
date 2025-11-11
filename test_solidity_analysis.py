@@ -104,8 +104,12 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
                 ],
             }
         )
-        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
-            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        with patch.object(
+            ethereumbotv2, "tracker_etherscan_get_async", fake_tracker
+        ), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}), patch.object(
+            ethereumbotv2,
+            "_check_liquidity_locked_holder_analysis",
+            AsyncMock(return_value=None),
         ):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
@@ -123,11 +127,92 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
                 ],
             }
         )
-        with patch.object(ethereumbotv2, "tracker_etherscan_get_async", fake_tracker), patch.dict(
-            "os.environ", {"ETHERSCAN_API_KEY": "X"}
+        with patch.object(
+            ethereumbotv2, "tracker_etherscan_get_async", fake_tracker
+        ), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}), patch.object(
+            ethereumbotv2,
+            "_check_liquidity_locked_holder_analysis",
+            AsyncMock(return_value=None),
         ):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
+
+
+    async def test_holder_snapshot_reports_locked(self):
+        burn_addr = "0x000000000000000000000000000000000000dEaD"
+        other_addr = "0x1111111111111111111111111111111111111111"
+        holders = [
+            {"address": burn_addr, "balance": 950},
+            {"address": other_addr, "balance": 50},
+        ]
+
+        analyses = [
+            ethereumbotv2.LPHolderAnalysis(
+                burn_addr, 950, "locked", "burn_address"
+            ),
+            ethereumbotv2.LPHolderAnalysis(
+                other_addr, 50, "unknown", "residual_holder"
+            ),
+        ]
+
+        with patch.object(
+            ethereumbotv2,
+            "_fetch_holder_distribution_async",
+            AsyncMock(return_value=holders),
+        ), patch.object(
+            ethereumbotv2,
+            "_fetch_lp_total_supply_async",
+            AsyncMock(return_value=1000),
+        ), patch.object(
+            ethereumbotv2,
+            "_fetch_pair_tokens_async",
+            AsyncMock(return_value=(None, None)),
+        ), patch.object(
+            ethereumbotv2,
+            "_analyze_lp_holder_async",
+            AsyncMock(side_effect=analyses),
+        ):
+            result = await ethereumbotv2._check_liquidity_locked_holder_analysis("0xPAIR")
+
+        self.assertTrue(result)
+
+    async def test_holder_snapshot_reports_unlocked(self):
+        locker_addr = "0x2222222222222222222222222222222222222222"
+        whale_addr = "0x3333333333333333333333333333333333333333"
+        holders = [
+            {"address": locker_addr, "balance": 400},
+            {"address": whale_addr, "balance": 600},
+        ]
+
+        analyses = [
+            ethereumbotv2.LPHolderAnalysis(
+                locker_addr, 400, "locked", "locker_detected"
+            ),
+            ethereumbotv2.LPHolderAnalysis(
+                whale_addr, 600, "unlocked", "externally_owned_account"
+            ),
+        ]
+
+        with patch.object(
+            ethereumbotv2,
+            "_fetch_holder_distribution_async",
+            AsyncMock(return_value=holders),
+        ), patch.object(
+            ethereumbotv2,
+            "_fetch_lp_total_supply_async",
+            AsyncMock(return_value=1000),
+        ), patch.object(
+            ethereumbotv2,
+            "_fetch_pair_tokens_async",
+            AsyncMock(return_value=(None, None)),
+        ), patch.object(
+            ethereumbotv2,
+            "_analyze_lp_holder_async",
+            AsyncMock(side_effect=analyses),
+        ):
+            result = await ethereumbotv2._check_liquidity_locked_holder_analysis("0xPAIR")
+
+        self.assertFalse(result)
 
 
 class EtherscanFetchFallbackTest(unittest.IsolatedAsyncioTestCase):
