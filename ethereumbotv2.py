@@ -1401,6 +1401,18 @@ UNCX_API_BASE_URL = os.getenv("UNCX_API_BASE_URL", "https://api.uncx.network/api
 UNCX_LOCKS_ENDPOINT = os.getenv(
     "UNCX_LOCKS_ENDPOINT", f"{UNCX_API_BASE_URL.rstrip('/')}/locks/token"
 )
+UNCX_GRAPH_API_KEY = os.getenv(
+    "UNCX_GRAPH_API_KEY",
+    "5efb383687746448f735da8954047c4f",
+)
+UNCX_GRAPH_SUBGRAPH_ID = os.getenv(
+    "UNCX_GRAPH_SUBGRAPH_ID",
+    "5gByjbCu558gLVwzvWiYD8JPQC8KLk6PSe9AVFy8LC69",
+)
+UNCX_GRAPH_ENDPOINT_TEMPLATE = os.getenv(
+    "UNCX_GRAPH_ENDPOINT_TEMPLATE",
+    "https://gateway-arbitrum.network.thegraph.com/api/{api_key}/subgraphs/id/{subgraph_id}",
+)
 
 BURN_ADDRESSES: Set[str] = {
     ZERO_ADDRESS.lower(),
@@ -2423,8 +2435,8 @@ def _extract_uncx_locks(payload: Any) -> Optional[List[dict]]:
     return None
 
 
-async def _check_liquidity_locked_uncx_async(pair_addr: str) -> Optional[bool]:
-    """Return True/False when Uncx provides a definitive liquidity status."""
+async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bool]:
+    """Query the legacy Uncx REST API for liquidity locks."""
 
     if not UNCX_LOOKUPS_ENABLED:
         return None
@@ -2527,6 +2539,162 @@ async def _check_liquidity_locked_uncx_async(pair_addr: str) -> Optional[bool]:
         return None
 
     return False
+
+
+def _format_uncx_graph_endpoint() -> Optional[str]:
+    api_key = (UNCX_GRAPH_API_KEY or "").strip()
+    subgraph_id = (UNCX_GRAPH_SUBGRAPH_ID or "").strip()
+    template = (UNCX_GRAPH_ENDPOINT_TEMPLATE or "").strip()
+
+    if not api_key or not subgraph_id or "{api_key}" not in template or "{subgraph_id}" not in template:
+        return None
+
+    try:
+        return template.format(api_key=api_key, subgraph_id=subgraph_id)
+    except Exception:  # pragma: no cover - defensive format issues
+        return None
+
+
+def _decimal_from_graph(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _int_from_graph(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value), 0)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[bool]:
+    endpoint = _format_uncx_graph_endpoint()
+    if not endpoint:
+        return None
+
+    payload = {
+        "query": """
+            query ($poolId: ID!, $limit: Int!) {
+              pool(id: $poolId) {
+                id
+                lockedPools {
+                  id
+                  lockedLiquidity
+                  lockedPercent
+                  lockedCoreUSD
+                  lockedAmount0
+                  lockedAmount1
+                  numberOfLocks
+                }
+              }
+              locks(where: { pool: $poolId }, first: $limit) {
+                id
+                lockedLiquidity
+                lockedPercent
+                lockedCoreUSD
+                lockedAmount0
+                lockedAmount1
+                lockDate
+                unlockDate
+              }
+            }
+        """,
+        "variables": {"poolId": pair_addr.lower(), "limit": 200},
+    }
+
+    try:
+        async with create_aiohttp_session() as session:
+            async with session.post(endpoint, json=payload, timeout=FETCH_TIMEOUT) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+        metrics.record_api_call(error=False)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        metrics.record_api_call(error=True)
+        logger.debug("Uncx graph lookup failed for %s: %s", pair_addr, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - unexpected parser issues
+        metrics.record_api_call(error=True)
+        logger.debug("Uncx graph processing error for %s: %s", pair_addr, exc, exc_info=True)
+        return None
+
+    if not isinstance(result, dict):
+        return None
+
+    if result.get("errors"):
+        logger.debug("Uncx graph returned errors for %s: %s", pair_addr, result["errors"])
+        return None
+
+    data = result.get("data") or {}
+    pool_info = data.get("pool") or {}
+    lock_entries = data.get("locks") or []
+
+    now_ts = int(time.time())
+    active_liquidity = Decimal(0)
+    total_liquidity = Decimal(0)
+    parsed_any = False
+
+    for entry in lock_entries:
+        if not isinstance(entry, dict):
+            continue
+        locked_liq = _decimal_from_graph(entry.get("lockedLiquidity"))
+        if locked_liq is None:
+            continue
+        parsed_any = True
+        if locked_liq <= 0:
+            continue
+
+        total_liquidity += locked_liq
+        unlock_ts = _int_from_graph(entry.get("unlockDate"))
+        if unlock_ts in (None, 0) or unlock_ts > now_ts:
+            active_liquidity += locked_liq
+
+    if active_liquidity > 0:
+        logger.debug(
+            "Uncx graph snapshot for %s => active_liquidity=%s total_liquidity=%s entries=%s",
+            pair_addr,
+            str(active_liquidity),
+            str(total_liquidity) if total_liquidity else "0",
+            len(lock_entries),
+        )
+        return True
+
+    if parsed_any:
+        return False
+
+    locked_pools = pool_info.get("lockedPools") or []
+    for locked_pool in locked_pools:
+        if not isinstance(locked_pool, dict):
+            continue
+        locked_liq = _decimal_from_graph(locked_pool.get("lockedLiquidity"))
+        locked_pct = _decimal_from_graph(locked_pool.get("lockedPercent"))
+        if locked_liq is not None and locked_liq > 0:
+            return True
+        if locked_pct is not None and locked_pct > 0:
+            return True
+
+    return False if pool_info else None
+
+
+async def _check_liquidity_locked_uncx_async(pair_addr: str) -> Optional[bool]:
+    """Return True/False when Uncx provides a definitive liquidity status."""
+
+    rest_result: Optional[bool] = None
+    if UNCX_LOOKUPS_ENABLED:
+        rest_result = await _check_liquidity_locked_uncx_rest_async(pair_addr)
+        if rest_result is True:
+            return True
+
+    graph_result = await _check_liquidity_locked_uncx_graph_async(pair_addr)
+    if graph_result is not None:
+        return graph_result
+
+    return rest_result
 
 
 def ensure_etherscan_connectivity() -> None:
