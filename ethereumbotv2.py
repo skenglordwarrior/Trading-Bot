@@ -1473,6 +1473,72 @@ class LPHolderAnalysis:
     unlock_timestamp: Optional[int] = None
 
 
+@dataclass
+class LiquidityLockDetails:
+    source: str
+    coverage_pct: Optional[float] = None
+    locked_at: Optional[int] = None
+    unlock_at: Optional[int] = None
+
+    def as_dict(self) -> Dict[str, Optional[Union[str, float, int]]]:
+        duration: Optional[int] = None
+        if self.locked_at and self.unlock_at and self.unlock_at > self.locked_at:
+            duration = int(self.unlock_at - self.locked_at)
+        return {
+            "source": self.source,
+            "coveragePct": self.coverage_pct,
+            "lockedAt": self.locked_at,
+            "unlockAt": self.unlock_at,
+            "lockDurationSeconds": duration,
+        }
+
+
+def _normalize_timestamp_seconds(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            ts = float(Decimal(trimmed))
+        else:
+            ts = float(value)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+    if ts <= 0:
+        return None
+
+    if ts > 1e12:  # milliseconds
+        ts = ts / 1000.0
+
+    try:
+        return int(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_percent_ratio(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, str):
+            pct = float(Decimal(value.strip()))
+        else:
+            pct = float(value)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+    if pct > 1:
+        pct = pct / 100.0
+
+    if pct < 0 or pct > 1:
+        return None
+
+    return pct
+
+
 _LP_CONTRACT_NAME_CACHE: Dict[str, Optional[str]] = {}
 _LP_IS_CONTRACT_CACHE: Dict[str, bool] = {}
 
@@ -1788,16 +1854,18 @@ async def _analyze_lp_holder_async(
     return LPHolderAnalysis(holder_addr, balance, "unknown", "unclassified_contract")
 
 
-async def _check_liquidity_locked_holder_analysis(pair_addr: str) -> Optional[bool]:
+async def _check_liquidity_locked_holder_analysis(
+    pair_addr: str,
+) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     total_supply = await _fetch_lp_total_supply_async(pair_addr)
     if not total_supply:
-        return None
+        return None, None
 
     holders_raw = await _fetch_holder_distribution_async(
         pair_addr, LP_HOLDER_SNAPSHOT_LIMIT
     )
     if not holders_raw:
-        return None
+        return None, None
 
     token0, token1 = await _fetch_pair_tokens_async(pair_addr)
     main_token: Optional[str] = None
@@ -1848,7 +1916,7 @@ async def _check_liquidity_locked_holder_analysis(pair_addr: str) -> Optional[bo
         analyses.append(analysis)
 
     if not analyses:
-        return None
+        return None, None
 
     locked_balance = sum(a.balance for a in analyses if a.status == "locked")
     unlocked_balance = sum(a.balance for a in analyses if a.status == "unlocked")
@@ -1878,33 +1946,56 @@ async def _check_liquidity_locked_holder_analysis(pair_addr: str) -> Optional[bo
         snapshot,
     )
 
+    coverage_pct: Optional[float] = None
+    if total_supply:
+        try:
+            coverage_pct = locked_balance / float(total_supply)
+        except ZeroDivisionError:
+            coverage_pct = None
+
+    future_unlocks: List[int] = []
+    for analysis in analyses:
+        if analysis.status != "locked":
+            continue
+        ts = _normalize_timestamp_seconds(analysis.unlock_timestamp)
+        if ts:
+            future_unlocks.append(ts)
+    unlock_ts = min(future_unlocks) if future_unlocks else None
+
     if locked_balance * 100 >= total_supply * 95:
         logger.debug("LP supply for %s considered locked via holder analysis", pair_addr)
-        return True
+        details = LiquidityLockDetails(
+            source="holder_analysis",
+            coverage_pct=coverage_pct,
+            unlock_at=unlock_ts,
+        )
+        return True, details
 
     if unlocked_balance * 100 >= total_supply * 5:
         logger.debug(
             "LP supply for %s considered unlocked via holder analysis", pair_addr
         )
-        return False
+        return False, None
 
-    return None
+    return None, None
 
 
-async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
-    holder_based = await _check_liquidity_locked_holder_analysis(pair_addr)
+async def _check_liquidity_locked_etherscan_async(
+    pair_addr: str,
+) -> Tuple[bool, Optional[LiquidityLockDetails]]:
+    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
     if holder_based is not None:
-        return holder_based
+        return holder_based, holder_details
 
-    uncx_based = await _check_liquidity_locked_uncx_async(pair_addr)
+    uncx_based, uncx_details = await _check_liquidity_locked_uncx_async(pair_addr)
     if uncx_based is not None:
-        return uncx_based
+        return uncx_based, uncx_details
 
     if not ETHERSCAN_LOOKUPS_ENABLED:
-        return False
+        return False, None
     api_key = get_next_etherscan_key()
     if not api_key:
-        return False
+        return False, None
     params = {
         "module": "account",
         "action": "tokentx",
@@ -1917,22 +2008,31 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
     try:
         j = await _etherscan_get_async(params, FETCH_TIMEOUT)
         if j.get("status") != "1":
-            return False
+            return False, None
 
         inspected_contracts: Dict[str, str] = {}
         for tx in j.get("result", []):
             to_addr = (tx.get("to") or "").lower()
             from_addr = (tx.get("from") or "").lower()
             func_name = (tx.get("functionName") or "").lower()
+            lock_ts = _normalize_timestamp_seconds(tx.get("timeStamp"))
 
             if to_addr in {
                 ZERO_ADDRESS.lower(),
                 "0x000000000000000000000000000000000000dead",
             }:
-                return True
+                details = LiquidityLockDetails(
+                    source="etherscan_tokentx",
+                    locked_at=lock_ts,
+                )
+                return True, details
 
             if "lock" in func_name and "unlock" not in func_name:
-                return True
+                details = LiquidityLockDetails(
+                    source="etherscan_tokentx",
+                    locked_at=lock_ts,
+                )
+                return True, details
 
             if from_addr == pair_addr.lower():
                 continue
@@ -1949,15 +2049,20 @@ async def _check_liquidity_locked_etherscan_async(pair_addr: str) -> bool:
             if any(
                 keyword in cached_name for keyword in ["lock", "locker", "unicrypt", "team", "pink"]
             ):
-                return True
+                details = LiquidityLockDetails(
+                    source="etherscan_tokentx",
+                    locked_at=lock_ts,
+                )
+                return True, details
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
         disable_etherscan_lookups(f"lock lookup failed: {e}")
     except Exception as e:
         logger.debug(f"etherscan lock check error: {e}")
-    return False
+    return False, None
 
 def check_liquidity_locked_etherscan(pair_addr: str) -> bool:
-    return asyncio.run(_check_liquidity_locked_etherscan_async(pair_addr))
+    locked, _ = asyncio.run(_check_liquidity_locked_etherscan_async(pair_addr))
+    return locked
 
 
 async def _fetch_dexscreener_data_async(
@@ -2029,7 +2134,7 @@ async def _fetch_dexscreener_data_async(
     elif not reason:
         reason = "not_listed"
 
-    locked = await _check_liquidity_locked_etherscan_async(pair_addr)
+    locked, lock_details = await _check_liquidity_locked_etherscan_async(pair_addr)
 
     if not pair_info:
         return None, reason or "not_listed"
@@ -2048,6 +2153,7 @@ async def _fetch_dexscreener_data_async(
     base_name = base_token.get("name", "").strip()
     base_symbol = base_token.get("symbol", "").strip()
     info_section = pair_info.get("info", {})
+    pair_created_at = _normalize_timestamp_seconds(pair_info.get("pairCreatedAt"))
     logo_url = info_section.get("imageUrl", "")
     websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
     socials = [s.get("url") for s in info_section.get("socials", []) if s.get("url")]
@@ -2072,6 +2178,8 @@ async def _fetch_dexscreener_data_async(
         "baseTokenLogo": logo_url,
         "socialLinks": websites + socials,
         "lockedLiquidity": locked,
+        "lockedLiquidityDetails": lock_details.as_dict() if lock_details else None,
+        "pairCreatedAt": pair_created_at,
         "dexPaid": dex_paid,
     }, None
 
@@ -2433,6 +2541,48 @@ def _extract_uncx_unlock_timestamp(lock: dict) -> Optional[float]:
     return None
 
 
+def _extract_uncx_lock_timestamp(lock: dict) -> Optional[float]:
+    timestamp_keys = (
+        "lockDate",
+        "lock_date",
+        "lockTimestamp",
+        "lockTs",
+        "lock_time",
+        "lockTime",
+        "lockAt",
+        "lock_at",
+        "lockTimeStamp",
+    )
+
+    for key in timestamp_keys:
+        if key in lock:
+            ts = _coerce_uncx_timestamp(lock.get(key))
+            if ts is not None:
+                return ts
+
+    return None
+
+
+def _extract_uncx_percent(lock: dict) -> Optional[float]:
+    percent_keys = (
+        "lockedPercent",
+        "percent",
+        "percentLocked",
+        "lockPercent",
+        "lpPercent",
+        "share",
+    )
+
+    for key in percent_keys:
+        if key not in lock:
+            continue
+        pct = _normalize_percent_ratio(lock.get(key))
+        if pct is not None:
+            return pct
+
+    return None
+
+
 def _extract_uncx_amount(lock: dict) -> Optional[Decimal]:
     """Return the locked token amount from an Uncx lock entry."""
 
@@ -2520,11 +2670,13 @@ def _extract_uncx_locks(payload: Any) -> Optional[List[dict]]:
     return None
 
 
-async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bool]:
+async def _check_liquidity_locked_uncx_rest_async(
+    pair_addr: str,
+) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     """Query the legacy Uncx REST API for liquidity locks."""
 
     if not UNCX_LOOKUPS_ENABLED:
-        return None
+        return None, None
 
     endpoint = UNCX_LOCKS_ENDPOINT.rstrip("/")
     url = f"{endpoint}/{pair_addr}"
@@ -2535,15 +2687,15 @@ async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bo
                 if resp.status == 404:
                     metrics.record_api_call(error=False)
                     logger.debug("Uncx reports no locks for %s", pair_addr)
-                    return False
+                    return False, None
                 if resp.status == 429:
                     metrics.record_api_call(error=True)
                     disable_uncx_lookups("Uncx rate limited")
-                    return None
+                    return None, None
                 if resp.status >= 500:
                     metrics.record_api_call(error=True)
                     disable_uncx_lookups(f"Uncx service error: {resp.status}")
-                    return None
+                    return None, None
 
                 resp.raise_for_status()
                 data = await resp.json()
@@ -2551,24 +2703,27 @@ async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bo
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         metrics.record_api_call(error=True)
         disable_uncx_lookups(f"Uncx lookup failed: {exc}")
-        return None
+        return None, None
     except Exception as exc:  # pragma: no cover - unexpected parser issues
         metrics.record_api_call(error=True)
         logger.debug("Uncx lock check error: %s", exc, exc_info=True)
-        return None
+        return None, None
 
     locks = _extract_uncx_locks(data)
     if locks is None:
-        return None
+        return None, None
 
     if not locks:
-        return False
+        return False, None
 
     now_ts = time.time()
     active_amount = Decimal(0)
     total_amount = Decimal(0)
     inconclusive = False
     entries = 0
+    lock_times: List[int] = []
+    unlock_times: List[int] = []
+    coverage_values: List[float] = []
 
     for lock in locks:
         if not isinstance(lock, dict):
@@ -2600,15 +2755,25 @@ async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bo
             inconclusive = True
             continue
 
-        if unlock_ts > 1e12:
-            unlock_ts = unlock_ts / 1000.0
+        normalized_unlock = _normalize_timestamp_seconds(unlock_ts)
+        if normalized_unlock:
+            unlock_times.append(normalized_unlock)
 
-        if unlock_ts == 0:
+        if normalized_unlock is None:
             active_amount += amount
             continue
 
-        if unlock_ts > now_ts:
+        if normalized_unlock > now_ts:
             active_amount += amount
+
+        lock_ts = _extract_uncx_lock_timestamp(lock)
+        normalized_lock = _normalize_timestamp_seconds(lock_ts)
+        if normalized_lock:
+            lock_times.append(normalized_lock)
+
+        pct = _extract_uncx_percent(lock)
+        if pct is not None:
+            coverage_values.append(pct)
 
     if active_amount > 0:
         logger.debug(
@@ -2618,12 +2783,18 @@ async def _check_liquidity_locked_uncx_rest_async(pair_addr: str) -> Optional[bo
             str(total_amount) if total_amount else "0",
             entries,
         )
-        return True
+        details = LiquidityLockDetails(
+            source="uncx_rest",
+            coverage_pct=max(coverage_values) if coverage_values else None,
+            locked_at=min(lock_times) if lock_times else None,
+            unlock_at=max(unlock_times) if unlock_times else None,
+        )
+        return True, details
 
     if inconclusive:
-        return None
+        return None, None
 
-    return False
+    return False, None
 
 
 def _format_uncx_graph_endpoint() -> Optional[str]:
@@ -2658,10 +2829,12 @@ def _int_from_graph(value: Any) -> Optional[int]:
         return None
 
 
-async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[bool]:
+async def _check_liquidity_locked_uncx_graph_async(
+    pair_addr: str,
+) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     endpoint = _format_uncx_graph_endpoint()
     if not endpoint:
-        return None
+        return None, None
 
     payload = {
         "query": """
@@ -2702,14 +2875,14 @@ async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[b
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         metrics.record_api_call(error=True)
         logger.debug("Uncx graph lookup failed for %s: %s", pair_addr, exc)
-        return None
+        return None, None
     except Exception as exc:  # pragma: no cover - unexpected parser issues
         metrics.record_api_call(error=True)
         logger.debug("Uncx graph processing error for %s: %s", pair_addr, exc, exc_info=True)
-        return None
+        return None, None
 
     if not isinstance(result, dict):
-        return None
+        return None, None
 
     if result.get("errors"):
         logger.debug("Uncx graph returned errors for %s: %s", pair_addr, result["errors"])
@@ -2723,6 +2896,9 @@ async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[b
     active_liquidity = Decimal(0)
     total_liquidity = Decimal(0)
     parsed_any = False
+    lock_times: List[int] = []
+    unlock_times: List[int] = []
+    coverage_values: List[float] = []
 
     for entry in lock_entries:
         if not isinstance(entry, dict):
@@ -2736,8 +2912,20 @@ async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[b
 
         total_liquidity += locked_liq
         unlock_ts = _int_from_graph(entry.get("unlockDate"))
-        if unlock_ts in (None, 0) or unlock_ts > now_ts:
+        normalized_unlock = _normalize_timestamp_seconds(unlock_ts)
+        if normalized_unlock:
+            unlock_times.append(normalized_unlock)
+        if normalized_unlock in (None, 0) or normalized_unlock > now_ts:
             active_liquidity += locked_liq
+
+        lock_ts = _int_from_graph(entry.get("lockDate"))
+        normalized_lock = _normalize_timestamp_seconds(lock_ts)
+        if normalized_lock:
+            lock_times.append(normalized_lock)
+
+        pct = _normalize_percent_ratio(entry.get("lockedPercent"))
+        if pct is not None:
+            coverage_values.append(pct)
 
     if active_liquidity > 0:
         logger.debug(
@@ -2747,39 +2935,56 @@ async def _check_liquidity_locked_uncx_graph_async(pair_addr: str) -> Optional[b
             str(total_liquidity) if total_liquidity else "0",
             len(lock_entries),
         )
-        return True
+        details = LiquidityLockDetails(
+            source="uncx_graph",
+            coverage_pct=max(coverage_values) if coverage_values else None,
+            locked_at=min(lock_times) if lock_times else None,
+            unlock_at=max(unlock_times) if unlock_times else None,
+        )
+        return True, details
 
     if parsed_any:
-        return False
+        return False, None
 
     locked_pools = pool_info.get("lockedPools") or []
     for locked_pool in locked_pools:
         if not isinstance(locked_pool, dict):
             continue
         locked_liq = _decimal_from_graph(locked_pool.get("lockedLiquidity"))
-        locked_pct = _decimal_from_graph(locked_pool.get("lockedPercent"))
+        locked_pct = _normalize_percent_ratio(locked_pool.get("lockedPercent"))
         if locked_liq is not None and locked_liq > 0:
-            return True
+            details = LiquidityLockDetails(
+                source="uncx_graph",
+                coverage_pct=locked_pct,
+            )
+            return True, details
         if locked_pct is not None and locked_pct > 0:
-            return True
+            details = LiquidityLockDetails(
+                source="uncx_graph",
+                coverage_pct=locked_pct,
+            )
+            return True, details
 
-    return False if pool_info else None
+    return (False, None) if pool_info else (None, None)
 
 
-async def _check_liquidity_locked_uncx_async(pair_addr: str) -> Optional[bool]:
+async def _check_liquidity_locked_uncx_async(
+    pair_addr: str,
+) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     """Return True/False when Uncx provides a definitive liquidity status."""
 
     rest_result: Optional[bool] = None
+    rest_details: Optional[LiquidityLockDetails] = None
     if UNCX_LOOKUPS_ENABLED:
-        rest_result = await _check_liquidity_locked_uncx_rest_async(pair_addr)
+        rest_result, rest_details = await _check_liquidity_locked_uncx_rest_async(pair_addr)
         if rest_result is True:
-            return True
+            return True, rest_details
 
-    graph_result = await _check_liquidity_locked_uncx_graph_async(pair_addr)
+    graph_result, graph_details = await _check_liquidity_locked_uncx_graph_async(pair_addr)
     if graph_result is not None:
-        return graph_result
+        return graph_result, graph_details
 
-    return rest_result
+    return rest_result, rest_details
 
 
 def ensure_etherscan_connectivity() -> None:
@@ -5135,6 +5340,61 @@ def queue_volume_check(
         }
 
 
+def _format_utc_timestamp(ts: int) -> str:
+    return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _format_duration_brief(seconds: int) -> str:
+    if seconds <= 0:
+        return ""
+    parts: List[str] = []
+    days, remainder = divmod(seconds, 86400)
+    if days:
+        parts.append(f"{days}d")
+    hours, remainder = divmod(remainder, 3600)
+    if hours:
+        parts.append(f"{hours}h")
+    minutes, _ = divmod(remainder, 60)
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _build_lock_info_line(
+    created_at: Optional[int], lock_details: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    segments: List[str] = []
+    if created_at:
+        segments.append(f"Pair Created: {_format_utc_timestamp(created_at)}")
+
+    details = lock_details or {}
+    locked_at = _normalize_timestamp_seconds(details.get("lockedAt")) if details else None
+    unlock_at = _normalize_timestamp_seconds(details.get("unlockAt")) if details else None
+    raw_duration = details.get("lockDurationSeconds")
+    duration_value: Optional[int] = None
+    if raw_duration is not None:
+        try:
+            duration_value = int(raw_duration)
+        except (ValueError, TypeError):
+            duration_value = None
+    if duration_value is None and locked_at and unlock_at and unlock_at > locked_at:
+        duration_value = unlock_at - locked_at
+
+    if locked_at:
+        segments.append(f"Locked: {_format_utc_timestamp(locked_at)}")
+    if duration_value and duration_value > 0:
+        segments.append(f"Duration: {_format_duration_brief(duration_value)}")
+
+    coverage = details.get("coveragePct")
+    if isinstance(coverage, (int, float)):
+        segments.append(f"Coverage: {coverage * 100:.2f}%")
+
+    if not segments:
+        return None
+
+    return "Lock Info: " + " | ".join(segments)
+
+
 def send_ui_criteria_message(
     pair_addr: str,
     passes: int,
@@ -5189,6 +5449,8 @@ def send_ui_criteria_message(
         buys = extra_stats.get("buys")
         sells = extra_stats.get("sells")
         locked = extra_stats.get("lockedLiquidity", False)
+        lock_details = extra_stats.get("lockedLiquidityDetails")
+        pair_created_at = _normalize_timestamp_seconds(extra_stats.get("pairCreatedAt"))
         owner_addr = extra_stats.get("owner")
         owner_bal = extra_stats.get("ownerBalanceEth")
         owner_tok = extra_stats.get("ownerTokenBalance")
@@ -5212,6 +5474,9 @@ def send_ui_criteria_message(
         msg += f"\nBuys/Sells: {buys}/{sells}"
         if locked is not None:
             msg += f"\nLiquidity Locked: <b>{'Yes' if locked else 'No'}</b>"
+            lock_info_line = _build_lock_info_line(pair_created_at, lock_details)
+            if lock_info_line:
+                msg += f"\n{lock_info_line}"
         rscore = extra_stats.get("riskScore")
         verified_bool = bool(extra_stats.get("verified") is True)
         risk_warning = extra_stats.get("riskWarning")
