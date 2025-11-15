@@ -75,21 +75,33 @@ async def _etherscan_get_async(params: dict, timeout: int = 20) -> dict:
             "result": [],
         }
 
+    loop = asyncio.get_running_loop()
+
+    def _do_request() -> dict:
+        resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     try:
-        loop = asyncio.get_running_loop()
-
-        def _do_request():
-            resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json()
-
         return await loop.run_in_executor(None, _do_request)
-    except (requests.RequestException, asyncio.TimeoutError, OSError) as exc:
+    except requests.Timeout as exc:
+        logger.warning("Etherscan request timed out: %s", exc)
+        raise
+    except requests.ConnectionError as exc:
+        logger.warning("Etherscan connection error: %s", exc)
+        raise
+    except requests.HTTPError as exc:
+        set_etherscan_lookup_enabled(False, f"etherscan HTTP error: {exc}")
+        raise
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.warning("Async Etherscan request failed: %s", exc)
+        raise
+    except requests.RequestException as exc:  # pragma: no cover - defensive
         set_etherscan_lookup_enabled(False, f"etherscan request failed: {exc}")
-        return {"status": "0", "message": str(exc), "result": []}
+        raise
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Unexpected Etherscan error: %s", exc)
-        return {"status": "0", "message": str(exc), "result": []}
+        raise
 
 # ------------------------------------------------------------------
 # Patch A: notifier injection so this module doesn't depend on a
