@@ -5264,14 +5264,40 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
     """Return list of failure reasons based on statistics."""
 
     reasons: List[str] = []
-    mc = extra.get("marketCap", 0)
-    liq = extra.get("liquidityUsd", 0)
-    fdv = extra.get("fdv", 0)
-    buys = extra.get("buys", 0)
-    sells = extra.get("sells", 0)
-    risk = extra.get("riskScore", 0)
+
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return default
+        return default
+
+    def _to_int(value: Any, default: int = 0) -> int:
+        return int(_to_float(value, float(default)))
+
+    mc = _to_float(extra.get("marketCap"))
+    liq = _to_float(extra.get("liquidityUsd"))
+    fdv = _to_float(extra.get("fdv"))
+    buys = _to_int(extra.get("buys"))
+    sells = _to_int(extra.get("sells"))
+    risk = _to_float(extra.get("riskScore"))
     renounced_contract = extra.get("contractRenounced")
-    slither_issues = extra.get("slitherIssues")
+
+    slither_raw = extra.get("slitherIssues")
+    if isinstance(slither_raw, int):
+        slither_issues: Optional[int] = slither_raw
+    elif isinstance(slither_raw, str):
+        try:
+            slither_issues = int(slither_raw.strip())
+        except ValueError:
+            slither_issues = None
+    else:
+        slither_issues = None
 
     if mc >= 100_000 and (buys + sells) < 10:
         reasons.append("High market cap with <10 buys/sells")
@@ -5283,7 +5309,7 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
         reasons.append("Contract high risk")
     if renounced_contract is False:
         reasons.append("Contract not renounced")
-    if isinstance(slither_issues, int) and slither_issues >= 5:
+    if slither_issues is not None and slither_issues >= 5:
         reasons.append(f"Slither issues {slither_issues}")
 
     return reasons
