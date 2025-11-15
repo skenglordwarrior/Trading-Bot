@@ -1009,52 +1009,76 @@ async def _etherscan_get_async(params: dict, timeout: int = FETCH_TIMEOUT) -> di
     """Instrumented wrapper around the tracker Etherscan helper."""
 
     start = time.perf_counter()
+    base_params = dict(params)
+    prepared_params = _prepare_etherscan_params(base_params)
     success = False
-    prepared_params = _prepare_etherscan_params(params)
-    try:
-        if tracker_etherscan_get_async is not None:
-            result = await tracker_etherscan_get_async(prepared_params, timeout)
-        else:
-            async with create_aiohttp_session() as session:
-                async with session.get(
-                    ETHERSCAN_API_URL, params=prepared_params, timeout=timeout
-                ) as resp:
-                    resp.raise_for_status()
-                    result = await resp.json()
-        success = str(result.get("status")) == "1"
-        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        if not success:
+    result: dict = {}
+    last_error: Optional[Exception] = None
+    max_attempts = ETHERSCAN_MAX_RETRIES + 1
+    delay = ETHERSCAN_RETRY_BACKOFF_SECONDS
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_start = time.perf_counter()
+        try:
+            result = await _perform_etherscan_request(prepared_params, timeout)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, requests.RequestException) as exc:
+            last_error = exc
+            latency_ms = round((time.perf_counter() - attempt_start) * 1000, 2)
+            metrics.record_exception()
+            should_retry = attempt < max_attempts
             log_event(
-                logging.WARNING,
+                logging.WARNING if should_retry else logging.ERROR,
                 "etherscan_api",
-                "Etherscan returned non-success status",
-                error=result.get("message"),
+                "Etherscan request failed" + ("; retrying" if should_retry else ""),
+                error=str(exc),
                 context={
                     "module": prepared_params.get("module"),
                     "action": prepared_params.get("action"),
-                    "result": result.get("result"),
+                    "attempt": attempt,
                 },
                 latency_ms=latency_ms,
             )
-        return result
-    except Exception as exc:
-        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        metrics.record_exception()
-        log_event(
-            logging.ERROR,
-            "etherscan_api",
-            f"Etherscan request failed: {exc}",
-            error=str(exc),
-            context={
-                "module": prepared_params.get("module"),
-                "action": prepared_params.get("action"),
-            },
-            latency_ms=latency_ms,
-        )
-        raise
-    finally:
-        latency_ms = round((time.perf_counter() - start) * 1000, 2)
-        metrics.record_api_call(error=not success)
+            if not should_retry:
+                break
+        else:
+            success = str(result.get("status")) == "1"
+            latency_ms = round((time.perf_counter() - attempt_start) * 1000, 2)
+            retriable = not success and attempt < max_attempts and _is_retriable_etherscan_response(result)
+            message = result.get("message")
+            if not success:
+                log_event(
+                    logging.WARNING,
+                    "etherscan_api",
+                    "Etherscan returned non-success status" + ("; retrying" if retriable else ""),
+                    error=message,
+                    context={
+                        "module": prepared_params.get("module"),
+                        "action": prepared_params.get("action"),
+                        "result": result.get("result"),
+                        "attempt": attempt,
+                    },
+                    latency_ms=latency_ms,
+                )
+            if success or not retriable:
+                break
+
+        if attempt >= max_attempts:
+            break
+
+        if "apikey" in base_params and ETHERSCAN_API_KEY_LIST:
+            base_params["apikey"] = get_next_etherscan_key()
+        prepared_params = _prepare_etherscan_params(base_params)
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, ETHERSCAN_RETRY_BACKOFF_MAX_SECONDS)
+
+    metrics.record_api_call(error=not success)
+
+    if not success and not result and last_error is not None:
+        raise last_error
+
+    return result
 
 
 def safe_block_number(is_v3: bool = False) -> int:
@@ -1941,6 +1965,7 @@ async def _fetch_dexscreener_data_async(
 ) -> Tuple[Optional[dict], Optional[str]]:
     now = time.time()
     pair_info = None
+    pdata: Optional[dict] = None
     reason: Optional[str] = None
 
     async def _get_json(url: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -2120,6 +2145,23 @@ ETHERSCAN_API_URL = (
 )
 ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
+ETHERSCAN_MAX_RETRIES = int(os.getenv("ETHERSCAN_MAX_RETRIES", "2") or "0")
+ETHERSCAN_RETRY_BACKOFF_SECONDS = float(
+    os.getenv("ETHERSCAN_RETRY_BACKOFF_SECONDS", "0.5") or "0"
+)
+ETHERSCAN_RETRY_BACKOFF_MAX_SECONDS = float(
+    os.getenv("ETHERSCAN_RETRY_BACKOFF_MAX_SECONDS", "5") or "0"
+)
+_ETHERSCAN_RETRYABLE_TERMS = (
+    "max rate limit",
+    "rate limit reached",
+    "rate limit exceeded",
+    "busy",
+    "timeout",
+    "temporarily unavailable",
+    "please try again later",
+)
+
 
 def _prepare_etherscan_params(params: dict, url: Optional[str] = None) -> dict:
     """Return request parameters augmented with ``chainid`` when required."""
@@ -2129,6 +2171,49 @@ def _prepare_etherscan_params(params: dict, url: Optional[str] = None) -> dict:
     if "/v2/" in target_url and "chainid" not in prepared:
         prepared["chainid"] = ETHERSCAN_CHAIN_ID
     return prepared
+
+
+def _is_retriable_etherscan_response(payload: dict) -> bool:
+    """Return ``True`` when the payload suggests a transient Etherscan issue."""
+
+    message = str(payload.get("message") or "").lower()
+    result_field = payload.get("result")
+    if isinstance(result_field, str):
+        result_text = result_field.lower()
+    elif isinstance(result_field, list) and result_field and isinstance(result_field[0], str):
+        result_text = " ".join(str(item).lower() for item in result_field)
+    else:
+        result_text = str(result_field or "").lower()
+
+    combined = f"{message} {result_text}".strip()
+    return any(term in combined for term in _ETHERSCAN_RETRYABLE_TERMS)
+
+
+async def _perform_direct_etherscan_request(
+    params: dict, timeout: int
+) -> dict:
+    async with create_aiohttp_session() as session:
+        async with session.get(
+            ETHERSCAN_API_URL, params=params, timeout=timeout
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+async def _perform_etherscan_request(params: dict, timeout: int) -> dict:
+    """Execute a single Etherscan request using the tracker when available."""
+
+    if tracker_etherscan_get_async is not None:
+        result = await tracker_etherscan_get_async(params, timeout)
+        message = str(result.get("message") or "").lower()
+        if (
+            str(result.get("status")) != "1"
+            and "etherscan lookups disabled" in message
+        ):
+            return await _perform_direct_etherscan_request(params, timeout)
+        return result
+
+    return await _perform_direct_etherscan_request(params, timeout)
 
 
 def _env_flag(name: str, default: bool = True) -> bool:
@@ -5179,14 +5264,40 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
     """Return list of failure reasons based on statistics."""
 
     reasons: List[str] = []
-    mc = extra.get("marketCap", 0)
-    liq = extra.get("liquidityUsd", 0)
-    fdv = extra.get("fdv", 0)
-    buys = extra.get("buys", 0)
-    sells = extra.get("sells", 0)
-    risk = extra.get("riskScore", 0)
+
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return default
+        return default
+
+    def _to_int(value: Any, default: int = 0) -> int:
+        return int(_to_float(value, float(default)))
+
+    mc = _to_float(extra.get("marketCap"))
+    liq = _to_float(extra.get("liquidityUsd"))
+    fdv = _to_float(extra.get("fdv"))
+    buys = _to_int(extra.get("buys"))
+    sells = _to_int(extra.get("sells"))
+    risk = _to_float(extra.get("riskScore"))
     renounced_contract = extra.get("contractRenounced")
-    slither_issues = extra.get("slitherIssues")
+
+    slither_raw = extra.get("slitherIssues")
+    if isinstance(slither_raw, int):
+        slither_issues: Optional[int] = slither_raw
+    elif isinstance(slither_raw, str):
+        try:
+            slither_issues = int(slither_raw.strip())
+        except ValueError:
+            slither_issues = None
+    else:
+        slither_issues = None
 
     if mc >= 100_000 and (buys + sells) < 10:
         reasons.append("High market cap with <10 buys/sells")
@@ -5198,7 +5309,7 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
         reasons.append("Contract high risk")
     if renounced_contract is False:
         reasons.append("Contract not renounced")
-    if isinstance(slither_issues, int) and slither_issues >= 5:
+    if slither_issues is not None and slither_issues >= 5:
         reasons.append(f"Slither issues {slither_issues}")
 
     return reasons
