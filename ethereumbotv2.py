@@ -1983,13 +1983,16 @@ async def _check_liquidity_locked_holder_analysis(
 async def _check_liquidity_locked_etherscan_async(
     pair_addr: str,
 ) -> Tuple[bool, Optional[LiquidityLockDetails]]:
-    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
-    if holder_based is not None:
-        return holder_based, holder_details
-
+    # Prefer structured locker feeds (e.g. UNCX) so we retain precise lock/unlock
+    # timestamps and coverage data for downstream messaging before falling back to
+    # holder heuristics.
     uncx_based, uncx_details = await _check_liquidity_locked_uncx_async(pair_addr)
     if uncx_based is not None:
         return uncx_based, uncx_details
+
+    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
+    if holder_based is not None:
+        return holder_based, holder_details
 
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return False, None
@@ -2161,6 +2164,8 @@ async def _fetch_dexscreener_data_async(
     labels = pair_info.get("labels", [])
     if not locked and "locked" in labels:
         locked = True
+        if not lock_details:
+            lock_details = LiquidityLockDetails(source="dexscreener_label")
 
     # Detect paid promotions/trending on Dex platforms
     dex_paid = any(lbl.lower() in {"promoted", "boosted", "paid"} for lbl in labels)
@@ -5360,6 +5365,23 @@ def _format_duration_brief(seconds: int) -> str:
     return " ".join(parts)
 
 
+def _format_lock_source_name(source: Optional[str]) -> Optional[str]:
+    if not source:
+        return None
+    normalized = source.strip().lower()
+    mapping = {
+        "holder_analysis": "Holder snapshot",
+        "uncx_rest": "UNCX REST",
+        "uncx_graph": "UNCX Graph",
+        "etherscan_tokentx": "Etherscan token tx",
+        "dexscreener_label": "DexScreener label",
+        "ethplorer_api": "Ethplorer",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    return source.replace("_", " ").strip().title()
+
+
 def _build_lock_info_line(
     created_at: Optional[int], lock_details: Optional[Dict[str, Any]]
 ) -> Optional[str]:
@@ -5382,8 +5404,17 @@ def _build_lock_info_line(
 
     if locked_at:
         segments.append(f"Locked: {_format_utc_timestamp(locked_at)}")
+    elif details:
+        segments.append("Locked: Unknown")
+
+    if unlock_at:
+        segments.append(f"Unlock: {_format_utc_timestamp(unlock_at)}")
+    elif details:
+        segments.append("Unlock: Unknown")
     if duration_value and duration_value > 0:
         segments.append(f"Duration: {_format_duration_brief(duration_value)}")
+    elif details:
+        segments.append("Duration: Unknown")
 
     coverage = details.get("coveragePct")
     if isinstance(coverage, (int, float)):
@@ -5473,7 +5504,12 @@ def send_ui_criteria_message(
             msg += f"\nM.Cap: ${mc:,.0f}"
         msg += f"\nBuys/Sells: {buys}/{sells}"
         if locked is not None:
-            msg += f"\nLiquidity Locked: <b>{'Yes' if locked else 'No'}</b>"
+            method_text = ""
+            if lock_details:
+                source_label = _format_lock_source_name(lock_details.get("source"))
+                if source_label:
+                    method_text = f" ({source_label})"
+            msg += f"\nLiquidity Locked: <b>{'Yes' if locked else 'No'}</b>{method_text}"
             lock_info_line = _build_lock_info_line(pair_created_at, lock_details)
             if lock_info_line:
                 msg += f"\n{lock_info_line}"
