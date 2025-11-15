@@ -1965,6 +1965,7 @@ async def _fetch_dexscreener_data_async(
 ) -> Tuple[Optional[dict], Optional[str]]:
     now = time.time()
     pair_info = None
+    pdata: Optional[dict] = None
     reason: Optional[str] = None
 
     async def _get_json(url: str) -> Tuple[Optional[dict], Optional[str]]:
