@@ -1983,13 +1983,16 @@ async def _check_liquidity_locked_holder_analysis(
 async def _check_liquidity_locked_etherscan_async(
     pair_addr: str,
 ) -> Tuple[bool, Optional[LiquidityLockDetails]]:
-    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
-    if holder_based is not None:
-        return holder_based, holder_details
-
+    # Prefer structured locker feeds (e.g. UNCX) so we retain precise lock/unlock
+    # timestamps and coverage data for downstream messaging before falling back to
+    # holder heuristics.
     uncx_based, uncx_details = await _check_liquidity_locked_uncx_async(pair_addr)
     if uncx_based is not None:
         return uncx_based, uncx_details
+
+    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
+    if holder_based is not None:
+        return holder_based, holder_details
 
     if not ETHERSCAN_LOOKUPS_ENABLED:
         return False, None
@@ -5403,6 +5406,11 @@ def _build_lock_info_line(
         segments.append(f"Locked: {_format_utc_timestamp(locked_at)}")
     elif details:
         segments.append("Locked: Unknown")
+
+    if unlock_at:
+        segments.append(f"Unlock: {_format_utc_timestamp(unlock_at)}")
+    elif details:
+        segments.append("Unlock: Unknown")
     if duration_value and duration_value > 0:
         segments.append(f"Duration: {_format_duration_brief(duration_value)}")
     elif details:

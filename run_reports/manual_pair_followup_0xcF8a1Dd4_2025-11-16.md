@@ -1,5 +1,8 @@
 # Manual Pair Follow-Up: 0xcF8a1Dd4aDe08224812d8b8daf194Fa675815687 (Xera / WETH)
 
+## Bot Criteria Snapshot
+- Running `check_pair_criteria` against the pair (Xera vs WETH) currently returns **12 / 14** passes. The failing gates are the `risk_score` check (risk score reported as 11) and the `no_private_sale` check (Dex and contract heuristics see a `hasPresale` flag tied to multiple large transfers), so the bot would keep rechecking until those factors clear.【2b54b3†L1-L5】
+
 ## Pair Release Timing (Ethplorer)
 - Ethplorer records the Uniswap V2 LP token coming online at **2025-11-14 08:35:35 UTC** (`creationTimestamp` 1,763,109,335), minted via the router to the deployer wallet—this marks the pool’s release to the public.【9869dc†L1-L48】【d20b70†L1-L7】
 
