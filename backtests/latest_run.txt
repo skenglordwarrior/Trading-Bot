@@ -1,0 +1,33 @@
+Backtesting run on Thu Nov 20 23:01:50 UTC 2025
+Command: python backtesting.py
+
+Results:
+0xeCAa83bdC3d211e09194dc951880AC3B448d4e7f | pnl x1.00 | peak x1.05 | drawdown -0.43% | 1 bars
+0xeCAa83bdC3d211e09194dc951880AC3B448d4e7f | pnl x1.00 | peak x1.05 | drawdown -0.43% | 1 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x203.68 | peak x249.46 | drawdown 0.00% | 15 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x216.00 | peak x249.46 | drawdown 0.00% | 14 bars
+0xdEFFfecA5BA238D0C24D2B12694b0Eb7Fd91D196 | pnl x220.05 | peak x249.46 | drawdown 0.00% | 13 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.03 | peak x7.53 | drawdown -0.85% | 30 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.19 | peak x7.53 | drawdown -0.85% | 29 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.92 | peak x7.53 | drawdown -0.85% | 28 bars
+0xf9bFFB4ED5C459BEb9697b62c3142DD8b77b1663 | pnl x6.80 | peak x7.53 | drawdown -0.85% | 27 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.57 | peak x2.04 | drawdown 0.00% | 8 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.57 | peak x2.04 | drawdown 0.00% | 8 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.57 | peak x2.04 | drawdown 0.00% | 8 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.57 | peak x2.04 | drawdown 0.00% | 8 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.42 | peak x2.04 | drawdown 0.00% | 7 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.42 | peak x2.04 | drawdown 0.00% | 7 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.42 | peak x2.04 | drawdown 0.00% | 7 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.60 | peak x2.04 | drawdown 0.00% | 6 bars
+0xfd949Be65054d11E10f92eB5b8bdB763b25FC518 | pnl x1.83 | peak x2.04 | drawdown 0.00% | 5 bars

@@ -32,15 +32,6 @@ GECKOTERMINAL_NETWORKS = {
     "optimism": "op",
     "polygon": "matic",
 }
-GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
-GECKOTERMINAL_NETWORKS = {
-    "ethereum": "eth",
-    "bsc": "bsc",
-    "base": "base",
-    "arbitrum": "arb",
-    "optimism": "op",
-    "polygon": "matic",
-}
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "backtests"
 SNAPSHOT_FILENAME = "passing_snapshots.jsonl"
 
@@ -220,62 +211,6 @@ class BacktestEngine:
             close_session = True
 
         dex_error: Optional[Exception] = None
-        try:
-            async with session.get(url, params=params, timeout=30) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
-        finally:
-            if close_session:
-                await session.close()
-
-        ohlcvs = (
-            payload.get("data", {})
-            .get("attributes", {})
-            .get("ohlcv_list")
-            or []
-        )
-        candles: List[Candle] = []
-        for entry in ohlcvs:
-            try:
-                ts_val, open_, high, low, close_, volume = entry
-                candles.append(
-                    Candle(
-                        timestamp=int(ts_val),
-                        open=float(open_),
-                        high=float(high),
-                        low=float(low),
-                        close=float(close_),
-                        volume=float(volume),
-                    )
-                )
-            except (ValueError, TypeError, IndexError):
-                continue
-        return candles
-
-    async def _fetch_geckoterminal_candles(
-        self,
-        pair_address: str,
-        *,
-        chain: str,
-        resolution: str,
-        lookback_hours: int,
-        session: Optional[aiohttp.ClientSession] = None,
-    ) -> List[Candle]:
-        end_ts = int(time.time())
-        start_ts = end_ts - (lookback_hours * 3600)
-        aggregate = _safe_int(resolution) or 15
-        network = GECKOTERMINAL_NETWORKS.get(chain.lower(), chain.lower())
-        url = f"{GECKOTERMINAL_BASE}/networks/{network}/pools/{pair_address}/ohlcv/minute"
-        params = {
-            "aggregate": aggregate,
-            "from_timestamp": start_ts,
-            "to_timestamp": end_ts,
-        }
-
-        close_session = False
-        if session is None:
-            session = aiohttp.ClientSession(trust_env=True)
-            close_session = True
         try:
             async with session.get(url, params=params, timeout=30) as resp:
                 resp.raise_for_status()
