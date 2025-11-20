@@ -54,10 +54,14 @@ import sys
 from pathlib import Path
 import urllib.parse
 
+from backtesting import BacktestEngine
+
 # Add the script directory to sys.path for relative imports
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+
+BACKTEST_ENGINE = BacktestEngine(SCRIPT_DIR / "backtests")
 
 # Import wallet tracker with fallback for legacy filename
 tracker_etherscan_get_async = None
@@ -5467,6 +5471,25 @@ def send_ui_criteria_message(
         else "✅ Pair remains in passing status"
     )
     msg += f"\nStatus: {status_text}"
+
+    if extra_stats:
+        try:
+            ctx = (
+                "passing_refresh"
+                if is_passing_refresh
+                else ("recheck" if is_recheck else "new_pair")
+            )
+            BACKTEST_ENGINE.record_pass_snapshot(
+                pair_addr,
+                extra_stats,
+                passes,
+                total,
+                context=ctx,
+                token0=str(extra_stats.get("token0", "")),
+                token1=str(extra_stats.get("token1", "")),
+            )
+        except Exception:
+            logger.debug("backtest snapshot capture failed", exc_info=True)
 
     if clog_percent is not None:
         msg += f"\nClog: {clog_percent:.0f}% sells"
