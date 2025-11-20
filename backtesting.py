@@ -209,6 +209,8 @@ class BacktestEngine:
         if session is None:
             session = aiohttp.ClientSession(trust_env=True)
             close_session = True
+
+        dex_error: Optional[Exception] = None
         try:
             async with session.get(url, params=params, timeout=30) as resp:
                 resp.raise_for_status()
