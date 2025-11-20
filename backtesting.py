@@ -24,6 +24,12 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 DEXSCREENER_TV_URL = "https://io.dexscreener.com/dex/tradingview/history"
+DEXSCREENER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Origin": "https://dexscreener.com",
+    "Referer": "https://dexscreener.com/",
+}
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "backtests"
 SNAPSHOT_FILENAME = "passing_snapshots.jsonl"
 
@@ -169,11 +175,11 @@ class BacktestEngine:
         }
         close_session = False
         if session is None:
-            session = aiohttp.ClientSession(trust_env=True)
+            session = aiohttp.ClientSession(trust_env=True, headers=DEXSCREENER_HEADERS)
             close_session = True
         try:
             async with session.get(
-                DEXSCREENER_TV_URL, params=params, timeout=30
+                DEXSCREENER_TV_URL, params=params, timeout=30, headers=DEXSCREENER_HEADERS
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -218,12 +224,24 @@ class BacktestEngine:
     ) -> Optional[BacktestResult]:
         """Replay a single snapshot against historical candles."""
 
-        candles = await self.fetch_candles(
-            snapshot.pair_address,
-            chain=chain,
-            resolution=resolution,
-            lookback_hours=max(72, int(horizon_minutes / 60) + 6),
-        )
+        try:
+            candles = await self.fetch_candles(
+                snapshot.pair_address,
+                chain=chain,
+                resolution=resolution,
+                lookback_hours=max(72, int(horizon_minutes / 60) + 6),
+            )
+        except aiohttp.ClientResponseError as exc:
+            logger.warning(
+                "DexScreener rejected %s with status %s: %s",
+                snapshot.pair_address,
+                exc.status,
+                exc.message,
+            )
+            return None
+        except Exception:
+            logger.exception("Failed to fetch candles for %s", snapshot.pair_address)
+            return None
         if not candles:
             return None
         entry_ts = int(snapshot.timestamp)
@@ -286,7 +304,7 @@ class BacktestEngine:
         *,
         limit: Optional[int] = None,
         **kwargs,
-    ) -> List[BacktestResult]:
+    ) -> tuple[List[BacktestResult], int]:
         results: List[BacktestResult] = []
         selected = list(snapshots)
         if limit:
@@ -296,7 +314,7 @@ class BacktestEngine:
             res = await coro
             if res:
                 results.append(res)
-        return results
+        return results, len(selected)
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -347,7 +365,7 @@ def _run_cli(args: argparse.Namespace) -> None:
         return
 
     async def _run():
-        res = await engine.backtest_batch(
+        res, attempted = await engine.backtest_batch(
             snapshots,
             limit=args.limit,
             horizon_minutes=args.horizon,
@@ -358,6 +376,14 @@ def _run_cli(args: argparse.Namespace) -> None:
         )
         for r in sorted(res, key=lambda r: r.entry_time):
             print(_format_result(r))
+        if not res:
+            print(
+                "No backtest results produced. DexScreener may have rejected the candle fetch (see warnings) or returned no data."
+            )
+        elif len(res) < attempted:
+            print(
+                f"Skipped {attempted - len(res)} snapshot(s) due to missing candles or API rejections."
+            )
 
     asyncio.run(_run())
 
