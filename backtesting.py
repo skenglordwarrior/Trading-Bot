@@ -317,16 +317,21 @@ class BacktestEngine:
         chain: str = "ETHEREUM",
         take_profit_multiple: Optional[float] = None,
         stop_loss_multiple: Optional[float] = None,
+        preloaded_candles: Optional[List[Candle]] = None,
+        session: Optional[aiohttp.ClientSession] = None,
     ) -> Optional[BacktestResult]:
         """Replay a single snapshot against historical candles."""
 
         try:
-            candles = await self.fetch_candles(
-                snapshot.pair_address,
-                chain=chain,
-                resolution=resolution,
-                lookback_hours=max(72, int(horizon_minutes / 60) + 6),
-            )
+            candles = preloaded_candles
+            if candles is None:
+                candles = await self.fetch_candles(
+                    snapshot.pair_address,
+                    chain=chain,
+                    resolution=resolution,
+                    lookback_hours=max(72, int(horizon_minutes / 60) + 6),
+                    session=session,
+                )
         except aiohttp.ClientResponseError as exc:
             logger.warning(
                 "DexScreener rejected %s with status %s: %s",
@@ -405,11 +410,60 @@ class BacktestEngine:
         selected = list(snapshots)
         if limit:
             selected = selected[-limit:]
-        tasks = [self.backtest_snapshot(s, **kwargs) for s in selected]
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            if res:
-                results.append(res)
+        lookback_hours = max(72, int((kwargs.get("horizon_minutes", 240)) / 60) + 6)
+        candle_cache: dict[str, Optional[List[Candle]]] = {}
+        candle_tasks: dict[str, asyncio.Task[Optional[List[Candle]]]] = {}
+
+        close_session = False
+        session = kwargs.get("session")
+        if session is None:
+            session = aiohttp.ClientSession(trust_env=True, headers=DEXSCREENER_HEADERS)
+            close_session = True
+
+        async def _fetch_and_cache(pair_address: str) -> Optional[List[Candle]]:
+            try:
+                candles = await self.fetch_candles(
+                    pair_address,
+                    chain=kwargs.get("chain", "ETHEREUM"),
+                    resolution=kwargs.get("resolution", "15"),
+                    lookback_hours=lookback_hours,
+                    session=session,
+                )
+                candle_cache[pair_address.lower()] = candles
+                return candles
+            except Exception:
+                candle_cache[pair_address.lower()] = None
+                logger.exception("Failed to fetch candles for %s", pair_address)
+                return None
+
+        async def _get_candles(pair_address: str) -> Optional[List[Candle]]:
+            key = pair_address.lower()
+            if key in candle_cache:
+                return candle_cache[key]
+            task = candle_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(_fetch_and_cache(pair_address))
+                candle_tasks[key] = task
+            return await task
+
+        async def _run_snapshot(snapshot: PassingSnapshot) -> Optional[BacktestResult]:
+            candles = await _get_candles(snapshot.pair_address)
+            return await self.backtest_snapshot(
+                snapshot,
+                preloaded_candles=candles,
+                session=session,
+                **kwargs,
+            )
+
+        try:
+            tasks = [_run_snapshot(s) for s in selected]
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
+                if res:
+                    results.append(res)
+        finally:
+            if close_session:
+                await session.close()
         return results, len(selected)
 
 
