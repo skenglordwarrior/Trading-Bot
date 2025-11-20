@@ -5,7 +5,7 @@ This module focuses on two responsibilities:
 
 1. Persisting rich snapshots for every pair that reaches "passing" status so we
    can reconstruct the exact checklist context later.
-2. Replaying those snapshots against DexScreener's historical candles to
+2. Replaying those snapshots against GeckoTerminal's historical candles to
    compute PnL multiples, drawdowns, and other profitability metrics.
 """
 from __future__ import annotations
@@ -23,12 +23,14 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-DEXSCREENER_TV_URL = "https://io.dexscreener.com/dex/tradingview/history"
-DEXSCREENER_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Origin": "https://dexscreener.com",
-    "Referer": "https://dexscreener.com/",
+GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
+GECKOTERMINAL_NETWORKS = {
+    "ethereum": "eth",
+    "bsc": "bsc",
+    "base": "base",
+    "arbitrum": "arb",
+    "optimism": "op",
+    "polygon": "matic",
 }
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "backtests"
 SNAPSHOT_FILENAME = "passing_snapshots.jsonl"
@@ -84,7 +86,7 @@ class BacktestResult:
 
 
 class BacktestEngine:
-    """Persist snapshots and replay them using DexScreener candles."""
+    """Persist snapshots and replay them using GeckoTerminal candles."""
 
     def __init__(self, data_dir: Path = DEFAULT_DATA_DIR):
         self.data_dir = Path(data_dir)
@@ -163,51 +165,78 @@ class BacktestEngine:
         lookback_hours: int = 72,
         session: Optional[aiohttp.ClientSession] = None,
     ) -> List[Candle]:
-        """Return TradingView-style candles from DexScreener."""
+        """Return TradingView-style candles from GeckoTerminal."""
 
-        end_ts = int(time.time())
-        start_ts = end_ts - (lookback_hours * 3600)
-        params = {
-            "symbol": f"{chain.upper()}:{pair_address}",
-            "resolution": resolution,
-            "from": start_ts,
-            "to": end_ts,
-        }
         close_session = False
         if session is None:
-            session = aiohttp.ClientSession(trust_env=True, headers=DEXSCREENER_HEADERS)
+            session = aiohttp.ClientSession(trust_env=True)
             close_session = True
+
         try:
-            async with session.get(
-                DEXSCREENER_TV_URL, params=params, timeout=30, headers=DEXSCREENER_HEADERS
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            candles = await self._fetch_geckoterminal_candles(
+                pair_address,
+                chain=chain,
+                resolution=resolution,
+                lookback_hours=lookback_hours,
+                session=session,
+            )
+            return candles
         finally:
             if close_session:
                 await session.close()
 
-        if str(data.get("s", "")).lower() != "ok":
-            raise RuntimeError(f"DexScreener returned status {data.get('s')} for {pair_address}")
+    async def _fetch_geckoterminal_candles(
+        self,
+        pair_address: str,
+        *,
+        chain: str,
+        resolution: str,
+        lookback_hours: int,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> List[Candle]:
+        end_ts = int(time.time())
+        start_ts = end_ts - (lookback_hours * 3600)
+        aggregate = _safe_int(resolution) or 15
+        network = GECKOTERMINAL_NETWORKS.get(chain.lower(), chain.lower())
+        url = f"{GECKOTERMINAL_BASE}/networks/{network}/pools/{pair_address}/ohlcv/minute"
+        params = {
+            "aggregate": aggregate,
+            "from_timestamp": start_ts,
+            "to_timestamp": end_ts,
+        }
 
-        timestamps = data.get("t") or []
-        opens = data.get("o") or []
-        highs = data.get("h") or []
-        lows = data.get("l") or []
-        closes = data.get("c") or []
-        volumes = data.get("v") or []
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession(trust_env=True)
+            close_session = True
+        try:
+            async with session.get(url, params=params, timeout=30) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        finally:
+            if close_session:
+                await session.close()
+
+        ohlcvs = (
+            payload.get("data", {})
+            .get("attributes", {})
+            .get("ohlcv_list")
+            or []
+        )
         candles: List[Candle] = []
-        for idx, ts_val in enumerate(timestamps):
+        for entry in ohlcvs:
             try:
-                candle = Candle(
-                    timestamp=int(ts_val),
-                    open=float(opens[idx]),
-                    high=float(highs[idx]),
-                    low=float(lows[idx]),
-                    close=float(closes[idx]),
-                    volume=float(volumes[idx]) if idx < len(volumes) else 0.0,
+                ts_val, open_, high, low, close_, volume = entry
+                candles.append(
+                    Candle(
+                        timestamp=int(ts_val),
+                        open=float(open_),
+                        high=float(high),
+                        low=float(low),
+                        close=float(close_),
+                        volume=float(volume),
+                    )
                 )
-                candles.append(candle)
             except (ValueError, TypeError, IndexError):
                 continue
         return candles
@@ -221,19 +250,24 @@ class BacktestEngine:
         chain: str = "ETHEREUM",
         take_profit_multiple: Optional[float] = None,
         stop_loss_multiple: Optional[float] = None,
+        preloaded_candles: Optional[List[Candle]] = None,
+        session: Optional[aiohttp.ClientSession] = None,
     ) -> Optional[BacktestResult]:
         """Replay a single snapshot against historical candles."""
 
         try:
-            candles = await self.fetch_candles(
-                snapshot.pair_address,
-                chain=chain,
-                resolution=resolution,
-                lookback_hours=max(72, int(horizon_minutes / 60) + 6),
-            )
+            candles = preloaded_candles
+            if candles is None:
+                candles = await self.fetch_candles(
+                    snapshot.pair_address,
+                    chain=chain,
+                    resolution=resolution,
+                    lookback_hours=max(72, int(horizon_minutes / 60) + 6),
+                    session=session,
+                )
         except aiohttp.ClientResponseError as exc:
             logger.warning(
-                "DexScreener rejected %s with status %s: %s",
+                "GeckoTerminal rejected %s with status %s: %s",
                 snapshot.pair_address,
                 exc.status,
                 exc.message,
@@ -309,11 +343,60 @@ class BacktestEngine:
         selected = list(snapshots)
         if limit:
             selected = selected[-limit:]
-        tasks = [self.backtest_snapshot(s, **kwargs) for s in selected]
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            if res:
-                results.append(res)
+        lookback_hours = max(72, int((kwargs.get("horizon_minutes", 240)) / 60) + 6)
+        candle_cache: dict[str, Optional[List[Candle]]] = {}
+        candle_tasks: dict[str, asyncio.Task[Optional[List[Candle]]]] = {}
+
+        close_session = False
+        session = kwargs.get("session")
+        if session is None:
+            session = aiohttp.ClientSession(trust_env=True)
+            close_session = True
+
+        async def _fetch_and_cache(pair_address: str) -> Optional[List[Candle]]:
+            try:
+                candles = await self.fetch_candles(
+                    pair_address,
+                    chain=kwargs.get("chain", "ETHEREUM"),
+                    resolution=kwargs.get("resolution", "15"),
+                    lookback_hours=lookback_hours,
+                    session=session,
+                )
+                candle_cache[pair_address.lower()] = candles
+                return candles
+            except Exception:
+                candle_cache[pair_address.lower()] = None
+                logger.exception("Failed to fetch candles for %s", pair_address)
+                return None
+
+        async def _get_candles(pair_address: str) -> Optional[List[Candle]]:
+            key = pair_address.lower()
+            if key in candle_cache:
+                return candle_cache[key]
+            task = candle_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(_fetch_and_cache(pair_address))
+                candle_tasks[key] = task
+            return await task
+
+        async def _run_snapshot(snapshot: PassingSnapshot) -> Optional[BacktestResult]:
+            candles = await _get_candles(snapshot.pair_address)
+            return await self.backtest_snapshot(
+                snapshot,
+                preloaded_candles=candles,
+                session=session,
+                **kwargs,
+            )
+
+        try:
+            tasks = [_run_snapshot(s) for s in selected]
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
+                if res:
+                    results.append(res)
+        finally:
+            if close_session:
+                await session.close()
         return results, len(selected)
 
 
@@ -378,7 +461,7 @@ def _run_cli(args: argparse.Namespace) -> None:
             print(_format_result(r))
         if not res:
             print(
-                "No backtest results produced. DexScreener may have rejected the candle fetch (see warnings) or returned no data."
+                "No backtest results produced. GeckoTerminal may have rejected the candle fetch (see warnings) or returned no data."
             )
         elif len(res) < attempted:
             print(
@@ -394,7 +477,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, help="Limit number of snapshots", default=None)
     parser.add_argument("--horizon", type=int, help="Holding period in minutes", default=240)
     parser.add_argument(
-        "--resolution", type=str, help="DexScreener TradingView resolution", default="15"
+        "--resolution", type=str, help="GeckoTerminal TradingView resolution", default="15"
     )
     parser.add_argument("--chain", type=str, help="Chain (ETHEREUM, BSC, etc)", default="ETHEREUM")
     parser.add_argument("--take-profit", type=float, help="Optional take profit multiple", default=None)
