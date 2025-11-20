@@ -30,6 +30,15 @@ DEXSCREENER_HEADERS = {
     "Origin": "https://dexscreener.com",
     "Referer": "https://dexscreener.com/",
 }
+GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
+GECKOTERMINAL_NETWORKS = {
+    "ethereum": "eth",
+    "bsc": "bsc",
+    "base": "base",
+    "arbitrum": "arb",
+    "optimism": "op",
+    "polygon": "matic",
+}
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "backtests"
 SNAPSHOT_FILENAME = "passing_snapshots.jsonl"
 
@@ -163,7 +172,7 @@ class BacktestEngine:
         lookback_hours: int = 72,
         session: Optional[aiohttp.ClientSession] = None,
     ) -> List[Candle]:
-        """Return TradingView-style candles from DexScreener."""
+        """Return TradingView-style candles from DexScreener with GeckoTerminal fallback."""
 
         end_ts = int(time.time())
         start_ts = end_ts - (lookback_hours * 3600)
@@ -177,19 +186,50 @@ class BacktestEngine:
         if session is None:
             session = aiohttp.ClientSession(trust_env=True, headers=DEXSCREENER_HEADERS)
             close_session = True
+
+        dex_error: Optional[Exception] = None
         try:
-            async with session.get(
-                DEXSCREENER_TV_URL, params=params, timeout=30, headers=DEXSCREENER_HEADERS
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            try:
+                async with session.get(
+                    DEXSCREENER_TV_URL,
+                    params=params,
+                    timeout=30,
+                    headers=DEXSCREENER_HEADERS,
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                if str(data.get("s", "")).lower() == "ok":
+                    return self._parse_tradingview_payload(data)
+                dex_error = RuntimeError(
+                    f"DexScreener returned status {data.get('s')} for {pair_address}"
+                )
+            except Exception as exc:  # noqa: BLE001 - log & fall back
+                dex_error = exc
+                logger.warning(
+                    "DexScreener candle fetch failed for %s (%s); falling back to GeckoTerminal",
+                    pair_address,
+                    getattr(exc, "status", "n/a"),
+                )
+
+            candles = await self._fetch_geckoterminal_candles(
+                pair_address,
+                chain=chain,
+                resolution=resolution,
+                lookback_hours=lookback_hours,
+                session=session,
+            )
+            if candles:
+                return candles
         finally:
             if close_session:
                 await session.close()
 
-        if str(data.get("s", "")).lower() != "ok":
-            raise RuntimeError(f"DexScreener returned status {data.get('s')} for {pair_address}")
+        if dex_error:
+            raise dex_error
+        return []
 
+    @staticmethod
+    def _parse_tradingview_payload(data: Dict[str, object]) -> List[Candle]:
         timestamps = data.get("t") or []
         opens = data.get("o") or []
         highs = data.get("h") or []
@@ -208,6 +248,62 @@ class BacktestEngine:
                     volume=float(volumes[idx]) if idx < len(volumes) else 0.0,
                 )
                 candles.append(candle)
+            except (ValueError, TypeError, IndexError):
+                continue
+        return candles
+
+    async def _fetch_geckoterminal_candles(
+        self,
+        pair_address: str,
+        *,
+        chain: str,
+        resolution: str,
+        lookback_hours: int,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> List[Candle]:
+        end_ts = int(time.time())
+        start_ts = end_ts - (lookback_hours * 3600)
+        aggregate = _safe_int(resolution) or 15
+        network = GECKOTERMINAL_NETWORKS.get(chain.lower(), chain.lower())
+        url = f"{GECKOTERMINAL_BASE}/networks/{network}/pools/{pair_address}/ohlcv/minute"
+        params = {
+            "aggregate": aggregate,
+            "from_timestamp": start_ts,
+            "to_timestamp": end_ts,
+        }
+
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession(trust_env=True)
+            close_session = True
+        try:
+            async with session.get(url, params=params, timeout=30) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        finally:
+            if close_session:
+                await session.close()
+
+        ohlcvs = (
+            payload.get("data", {})
+            .get("attributes", {})
+            .get("ohlcv_list")
+            or []
+        )
+        candles: List[Candle] = []
+        for entry in ohlcvs:
+            try:
+                ts_val, open_, high, low, close_, volume = entry
+                candles.append(
+                    Candle(
+                        timestamp=int(ts_val),
+                        open=float(open_),
+                        high=float(high),
+                        low=float(low),
+                        close=float(close_),
+                        volume=float(volume),
+                    )
+                )
             except (ValueError, TypeError, IndexError):
                 continue
         return candles
