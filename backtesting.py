@@ -218,12 +218,24 @@ class BacktestEngine:
     ) -> Optional[BacktestResult]:
         """Replay a single snapshot against historical candles."""
 
-        candles = await self.fetch_candles(
-            snapshot.pair_address,
-            chain=chain,
-            resolution=resolution,
-            lookback_hours=max(72, int(horizon_minutes / 60) + 6),
-        )
+        try:
+            candles = await self.fetch_candles(
+                snapshot.pair_address,
+                chain=chain,
+                resolution=resolution,
+                lookback_hours=max(72, int(horizon_minutes / 60) + 6),
+            )
+        except aiohttp.ClientResponseError as exc:
+            logger.warning(
+                "DexScreener rejected %s with status %s: %s",
+                snapshot.pair_address,
+                exc.status,
+                exc.message,
+            )
+            return None
+        except Exception:
+            logger.exception("Failed to fetch candles for %s", snapshot.pair_address)
+            return None
         if not candles:
             return None
         entry_ts = int(snapshot.timestamp)
