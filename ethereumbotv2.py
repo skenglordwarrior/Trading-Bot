@@ -36,6 +36,8 @@ import traceback
 import requests
 import numpy as np
 
+import social_discovery
+
 # Web3 & dependencies
 from web3 import Web3, HTTPProvider
 from web3.types import HexBytes
@@ -2079,6 +2081,20 @@ async def _fetch_dexscreener_data_async(
     pair_info = None
     pdata: Optional[dict] = None
     reason: Optional[str] = None
+    extra_socials: List[str] = []
+
+    def _merge_links(primary: List[str], secondary: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for link in primary + secondary:
+            if not link:
+                continue
+            low = link.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            merged.append(link)
+        return merged
 
     async def _get_json(url: str) -> Tuple[Optional[dict], Optional[str]]:
         try:
@@ -2144,6 +2160,29 @@ async def _fetch_dexscreener_data_async(
     locked, lock_details = await _check_liquidity_locked_etherscan_async(pair_addr)
 
     if not pair_info:
+        extra_socials, social_reason = await social_discovery.fetch_social_links_async(
+            token_addr, pair_addr
+        )
+        reason = reason or social_reason
+        if extra_socials:
+            return {
+                "priceUsd": 0.0,
+                "liquidityUsd": 0.0,
+                "volume24h": 0.0,
+                "fdv": 0.0,
+                "marketCap": 0.0,
+                "buys": 0,
+                "sells": 0,
+                "baseTokenName": "",
+                "baseTokenSymbol": "",
+                "baseTokenLogo": "",
+                "socialLinks": extra_socials,
+                "lockedLiquidity": locked,
+                "lockedLiquidityDetails": lock_details.as_dict() if lock_details else None,
+                "pairCreatedAt": None,
+                "dexPaid": False,
+                "dexscreenerMissing": True,
+            }, reason or "not_listed"
         return None, reason or "not_listed"
 
     price_usd = float(pair_info.get("priceUsd", 0) or 0)
@@ -2164,6 +2203,12 @@ async def _fetch_dexscreener_data_async(
     logo_url = info_section.get("imageUrl", "")
     websites = [w.get("url") for w in info_section.get("websites", []) if w.get("url")]
     socials = [s.get("url") for s in info_section.get("socials", []) if s.get("url")]
+    if not websites and not socials:
+        extra_socials, social_reason = await social_discovery.fetch_social_links_async(
+            token_addr, pair_addr
+        )
+        reason = reason or social_reason
+    merged_socials = _merge_links(websites + socials, extra_socials)
     # Determine locked liquidity prioritising our internal checks before DexScreener labels
     labels = pair_info.get("labels", [])
     if not locked and "locked" in labels:
@@ -2185,7 +2230,7 @@ async def _fetch_dexscreener_data_async(
         "baseTokenName": base_name,
         "baseTokenSymbol": base_symbol,
         "baseTokenLogo": logo_url,
-        "socialLinks": websites + socials,
+        "socialLinks": merged_socials,
         "lockedLiquidity": locked,
         "lockedLiquidityDetails": lock_details.as_dict() if lock_details else None,
         "pairCreatedAt": pair_created_at,
