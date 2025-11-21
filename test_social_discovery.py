@@ -73,6 +73,41 @@ class SocialDiscoveryAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(reason)
         self.assertEqual(links, ["https://pair.example"])
 
+    async def test_fetch_social_links_fall_back_to_contract_source(self):
+        async def fake_meta(session, token_addr):
+            return ([], "not_listed")
+
+        async def fake_contract_source(session, token_addr):
+            self.assertEqual(token_addr, "0xToken")
+            return (["https://source.example", "https://t.me/source"], None)
+
+        with patch.object(social_discovery, "_fetch_etherscan_metadata", side_effect=fake_meta), patch.object(
+            social_discovery, "_fetch_github_socials_from_links", return_value=[]
+        ), patch.object(social_discovery, "_perform_web_search", return_value=[]), patch.object(
+            social_discovery, "_fetch_contract_source_socials", side_effect=fake_contract_source
+        ):
+            links, reason = await social_discovery.fetch_social_links_async("0xToken", "")
+
+        self.assertEqual(reason, "not_listed")
+        self.assertIn("https://source.example", links)
+        self.assertIn("https://t.me/source", links)
+
+    async def test_v2_requests_include_chainid(self):
+        captured = {}
+
+        async def fake_fetch_json(session, url, params=None):
+            captured["url"] = url
+            captured["params"] = params or {}
+            return {"status": "0", "message": "NOTOK"}, None
+
+        with patch.object(social_discovery, "ETHERSCAN_BASE_URLS", ["https://api.etherscan.io/v2/api"]), patch.object(
+            social_discovery, "_fetch_json", side_effect=fake_fetch_json
+        ):
+            async with social_discovery._create_session() as session:
+                await social_discovery._fetch_etherscan_metadata(session, "0xToken")
+
+        self.assertEqual(captured["params"].get("chainid"), social_discovery.ETHERSCAN_CHAIN_ID)
+
 
 if __name__ == "__main__":
     unittest.main()

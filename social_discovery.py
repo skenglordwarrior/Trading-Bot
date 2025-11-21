@@ -28,9 +28,11 @@ SOCIAL_RATE_LIMIT_COOLDOWN = int(os.getenv("SOCIAL_RATE_LIMIT_COOLDOWN", "30") o
 SOCIAL_FETCH_TIMEOUT = int(os.getenv("SOCIAL_FETCH_TIMEOUT", "15") or "0")
 ETHERSCAN_METADATA_URL = os.getenv("ETHERSCAN_METADATA_URL", "https://api.etherscan.io/api")
 ETHERSCAN_METADATA_ACTION = os.getenv("ETHERSCAN_METADATA_ACTION", "tokeninfo")
+ETHERSCAN_SOURCE_ACTION = os.getenv("ETHERSCAN_SOURCE_ACTION", "getsourcecode")
 LIGHTWEIGHT_SEARCH_URL = os.getenv("SOCIAL_SEARCH_URL", "")
+ETHERSCAN_CHAIN_ID = os.getenv("ETHERSCAN_CHAIN_ID", "1")
 
-ETHERSCAN_BASE_URLS = [u for u in load_etherscan_base_urls([ETHERSCAN_METADATA_URL]) if u]
+ETHERSCAN_BASE_URLS = [u for u in load_etherscan_base_urls() if u]
 _next_etherscan_key = make_key_getter(load_etherscan_keys())
 
 _TELEGRAM_RE = re.compile(r"https?://t(?:elegram)?\.me/[A-Za-z0-9_/-]+", re.IGNORECASE)
@@ -68,6 +70,12 @@ def _dedupe_links(links: Iterable[str]) -> List[str]:
         seen.add(norm.lower())
         ordered.append(norm)
     return ordered
+
+
+def _maybe_apply_chainid(params: dict, base_url: str) -> dict:
+    if "v2" in base_url and "chainid" not in params:
+        params = {**params, "chainid": ETHERSCAN_CHAIN_ID}
+    return params
 
 
 def _extract_links_from_text(text: str) -> List[str]:
@@ -145,12 +153,15 @@ async def _fetch_etherscan_metadata(session: aiohttp.ClientSession, token_addr: 
             reasons.append("missing_api_key")
             continue
 
-        params = {
-            "module": "token",
-            "action": ETHERSCAN_METADATA_ACTION,
-            "contractaddress": token_addr,
-            "apikey": api_key,
-        }
+        params = _maybe_apply_chainid(
+            {
+                "module": "token",
+                "action": ETHERSCAN_METADATA_ACTION,
+                "contractaddress": token_addr,
+                "apikey": api_key,
+            },
+            base_url,
+        )
         payload, reason = await _fetch_json(session, base_url, params=params)
         if not payload:
             reasons.append(reason)
@@ -197,6 +208,60 @@ async def _fetch_github_socials_from_links(
                 socials.extend(_extract_links_from_text(text))
                 break
     return _dedupe_links(socials)
+
+
+async def _fetch_contract_source_socials(
+    session: aiohttp.ClientSession, token_addr: str
+) -> Tuple[List[str], Optional[str]]:
+    reasons: List[Optional[str]] = []
+
+    for base_url in ETHERSCAN_BASE_URLS:
+        api_key = _next_etherscan_key()
+        if not api_key:
+            reasons.append("missing_api_key")
+            continue
+
+        params = _maybe_apply_chainid(
+            {
+                "module": "contract",
+                "action": ETHERSCAN_SOURCE_ACTION,
+                "address": token_addr,
+                "apikey": api_key,
+            },
+            base_url,
+        )
+
+        payload, reason = await _fetch_json(session, base_url, params=params)
+        if not payload:
+            reasons.append(reason)
+            if reason == "rate_limited":
+                break
+            continue
+
+        if str(payload.get("status")) != "1":
+            message = str(payload.get("message") or "").lower()
+            if "rate" in message:
+                return [], "rate_limited"
+            continue
+
+        entries = payload.get("result")
+        if not isinstance(entries, list):
+            continue
+
+        links: List[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for field in ("SourceCode", "ContractName", "CompilerVersion", "LicenseType"):
+                value = entry.get(field)
+                if isinstance(value, str):
+                    links.extend(_extract_links_from_text(value))
+        return _dedupe_links(links), None
+
+    for reason in reasons:
+        if reason:
+            return [], reason
+    return [], None
 
 
 async def _perform_web_search(
@@ -252,6 +317,12 @@ async def fetch_social_links_async(
             gh_links = await _fetch_github_socials_from_links(session, links)
             links = _dedupe_links([*links, *gh_links])
 
+        if not links:
+            source_links, source_reason = await _fetch_contract_source_socials(session, target_addr)
+            reason = reason or source_reason
+            if source_links:
+                links = _dedupe_links([*links, *source_links])
+
         search_links = await _perform_web_search(session, token_addr, pair_addr)
         if search_links:
             links = _dedupe_links([*links, *search_links])
@@ -260,4 +331,9 @@ async def fetch_social_links_async(
     return links, reason
 
 
-__all__ = ["fetch_social_links_async", "_extract_links_from_entry", "_extract_links_from_text"]
+__all__ = [
+    "fetch_social_links_async",
+    "_extract_links_from_entry",
+    "_extract_links_from_text",
+    "_fetch_contract_source_socials",
+]
