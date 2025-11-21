@@ -1,0 +1,65 @@
+import unittest
+from unittest.mock import patch
+
+import social_discovery
+
+
+class SocialDiscoveryExtractionTests(unittest.TestCase):
+    def setUp(self):
+        social_discovery.SOCIAL_CACHE.clear()
+
+    def test_extract_links_from_entry_collects_known_fields(self):
+        entry = {
+            "website": "https://example.org",
+            "telegram": "https://t.me/exampletoken",
+            "twitter": "https://x.com/exampletoken",
+            "description": "community at https://t.me/exampletoken",
+        }
+
+        links = social_discovery._extract_links_from_entry(entry)
+
+        self.assertIn("https://example.org", links)
+        self.assertIn("https://t.me/exampletoken", links)
+        self.assertIn("https://x.com/exampletoken", links)
+
+    def test_extract_links_from_text_captures_social_handles(self):
+        text = """
+        Visit our hub at https://tokenhub.io and chat via https://t.me/tokenchat.
+        Follow announcements on https://twitter.com/token and https://x.com/tokenalt.
+        """
+
+        links = social_discovery._extract_links_from_text(text)
+
+        self.assertTrue(any("tokenhub.io" in link for link in links))
+        self.assertTrue(any("t.me/tokenchat" in link for link in links))
+        self.assertTrue(any("twitter.com/token" in link or "x.com/tokenalt" in link for link in links))
+
+
+class SocialDiscoveryAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        social_discovery.SOCIAL_CACHE.clear()
+
+    async def test_fetch_social_links_merges_all_sources(self):
+        async def fake_meta(session, token_addr):
+            return ([{"website": "https://meta.example", "telegram": "https://t.me/meta"}], None)
+
+        async def fake_github(session, links):
+            return ["https://x.com/fromreadme"]
+
+        async def fake_search(session, token_addr, pair_addr):
+            return ["https://search.example"]
+
+        with patch.object(social_discovery, "_fetch_etherscan_metadata", side_effect=fake_meta), patch.object(
+            social_discovery, "_fetch_github_socials_from_links", side_effect=fake_github
+        ), patch.object(social_discovery, "_perform_web_search", side_effect=fake_search):
+            links, reason = await social_discovery.fetch_social_links_async("0xToken", "0xPair")
+
+        self.assertIsNone(reason)
+        self.assertIn("https://meta.example", links)
+        self.assertIn("https://t.me/meta", links)
+        self.assertIn("https://x.com/fromreadme", links)
+        self.assertIn("https://search.example", links)
+
+
+if __name__ == "__main__":
+    unittest.main()
