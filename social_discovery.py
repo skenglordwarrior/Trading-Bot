@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from etherscan_config import load_etherscan_base_urls, load_etherscan_keys, make_key_getter
+
 logger = logging.getLogger(__name__)
 
 SOCIAL_CACHE: Dict[str, Tuple[float, List[str], Optional[str]]] = {}
@@ -27,6 +29,9 @@ SOCIAL_FETCH_TIMEOUT = int(os.getenv("SOCIAL_FETCH_TIMEOUT", "15") or "0")
 ETHERSCAN_METADATA_URL = os.getenv("ETHERSCAN_METADATA_URL", "https://api.etherscan.io/api")
 ETHERSCAN_METADATA_ACTION = os.getenv("ETHERSCAN_METADATA_ACTION", "tokeninfo")
 LIGHTWEIGHT_SEARCH_URL = os.getenv("SOCIAL_SEARCH_URL", "")
+
+ETHERSCAN_BASE_URLS = [u for u in load_etherscan_base_urls([ETHERSCAN_METADATA_URL]) if u]
+_next_etherscan_key = make_key_getter(load_etherscan_keys())
 
 _TELEGRAM_RE = re.compile(r"https?://t(?:elegram)?\.me/[A-Za-z0-9_/-]+", re.IGNORECASE)
 _TWITTER_RE = re.compile(r"https?://(?:twitter|x)\.com/[A-Za-z0-9_/-]+", re.IGNORECASE)
@@ -132,27 +137,43 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str) -> Tuple[Optiona
 
 
 async def _fetch_etherscan_metadata(session: aiohttp.ClientSession, token_addr: str) -> Tuple[List[dict], Optional[str]]:
-    api_key = os.getenv("ETHERSCAN_API_KEY")
-    if not api_key:
+    reasons: List[Optional[str]] = []
+
+    for base_url in ETHERSCAN_BASE_URLS:
+        api_key = _next_etherscan_key()
+        if not api_key:
+            reasons.append("missing_api_key")
+            continue
+
+        params = {
+            "module": "token",
+            "action": ETHERSCAN_METADATA_ACTION,
+            "contractaddress": token_addr,
+            "apikey": api_key,
+        }
+        payload, reason = await _fetch_json(session, base_url, params=params)
+        if not payload:
+            reasons.append(reason)
+            if reason == "rate_limited":
+                _last_rate_limit_ts = time.time()
+                break
+            continue
+
+        if str(payload.get("status")) != "1":
+            message = str(payload.get("message") or "").lower()
+            if "rate" in message:
+                _last_rate_limit_ts = time.time()
+                return [], "rate_limited"
+            return [], "not_listed"
+
+        result = payload.get("result")
+        if isinstance(result, list):
+            return [r for r in result if isinstance(r, dict)], None
         return [], None
-    params = {
-        "module": "token",
-        "action": ETHERSCAN_METADATA_ACTION,
-        "contractaddress": token_addr,
-        "apikey": api_key,
-    }
-    payload, reason = await _fetch_json(session, ETHERSCAN_METADATA_URL, params=params)
-    if not payload:
-        return [], reason
-    if str(payload.get("status")) != "1":
-        message = str(payload.get("message") or "").lower()
-        if "rate" in message:
-            _last_rate_limit_ts = time.time()
-            return [], "rate_limited"
-        return [], "not_listed"
-    result = payload.get("result")
-    if isinstance(result, list):
-        return [r for r in result if isinstance(r, dict)], None
+
+    for reason in reasons:
+        if reason:
+            return [], reason
     return [], None
 
 
