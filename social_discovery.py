@@ -218,8 +218,10 @@ async def fetch_social_links_async(
     links: List[str] = []
     reason: Optional[str] = None
 
+    target_addr = token_addr or pair_addr
+
     async with _create_session() as session:
-        meta_entries, meta_reason = await _fetch_etherscan_metadata(session, token_addr)
+        meta_entries, meta_reason = await _fetch_etherscan_metadata(session, target_addr)
         reason = reason or meta_reason
         for entry in meta_entries:
             links.extend(_extract_links_from_entry(entry))

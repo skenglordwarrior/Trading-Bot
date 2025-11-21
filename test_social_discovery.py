@@ -60,6 +60,19 @@ class SocialDiscoveryAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://x.com/fromreadme", links)
         self.assertIn("https://search.example", links)
 
+    async def test_fetch_social_links_uses_pair_when_token_missing(self):
+        async def fake_meta(session, token_addr):
+            self.assertEqual(token_addr, "0xPair")
+            return ([{"website": "https://pair.example"}], None)
+
+        with patch.object(social_discovery, "_fetch_etherscan_metadata", side_effect=fake_meta), patch.object(
+            social_discovery, "_fetch_github_socials_from_links", return_value=[]
+        ), patch.object(social_discovery, "_perform_web_search", return_value=[]):
+            links, reason = await social_discovery.fetch_social_links_async("", "0xPair")
+
+        self.assertIsNone(reason)
+        self.assertEqual(links, ["https://pair.example"])
+
 
 if __name__ == "__main__":
     unittest.main()
