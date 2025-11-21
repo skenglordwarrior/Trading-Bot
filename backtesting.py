@@ -77,12 +77,16 @@ class BacktestResult:
     entry_price: float
     exit_price: float
     pnl_multiple: float
+    adjusted_pnl_multiple: float
+    effective_entry_price: float
+    effective_exit_price: float
     holding_minutes: int
     max_drawdown_pct: float
     peak_multiple: float
     bars: int
     take_profit_hit: bool
     stop_loss_hit: bool
+    data_truncated: bool
 
 
 class BacktestEngine:
@@ -252,6 +256,9 @@ class BacktestEngine:
         chain: str = "ETHEREUM",
         take_profit_multiple: Optional[float] = None,
         stop_loss_multiple: Optional[float] = None,
+        slippage_bps: float = 0.0,
+        entry_fee_bps: float = 0.0,
+        exit_fee_bps: float = 0.0,
         preloaded_candles: Optional[List[Candle]] = None,
         session: Optional[aiohttp.ClientSession] = None,
     ) -> Optional[BacktestResult]:
@@ -292,6 +299,8 @@ class BacktestEngine:
         else:
             exit_candle = relevant[-1]
 
+        data_truncated = exit_candle.timestamp < exit_ts
+
         entry_price = entry_candle.close
         exit_price = exit_candle.close
         high_water = entry_price
@@ -319,6 +328,12 @@ class BacktestEngine:
         drawdown_pct = ((low_water - entry_price) / entry_price) * 100 if entry_price else 0.0
         peak_multiple = high_water / entry_price if entry_price else 0.0
 
+        entry_markup = (slippage_bps + entry_fee_bps) / 10_000
+        exit_discount = (slippage_bps + exit_fee_bps) / 10_000
+        effective_entry = entry_price * (1 + entry_markup)
+        effective_exit = exit_price * max(0.0, 1 - exit_discount)
+        adjusted_pnl = effective_exit / effective_entry if effective_entry else 0.0
+
         return BacktestResult(
             pair_address=snapshot.pair_address,
             entry_time=entry_ts,
@@ -326,12 +341,16 @@ class BacktestEngine:
             entry_price=entry_price,
             exit_price=exit_price,
             pnl_multiple=pnl_multiple,
+            adjusted_pnl_multiple=adjusted_pnl,
+            effective_entry_price=effective_entry,
+            effective_exit_price=effective_exit,
             holding_minutes=horizon_minutes,
             max_drawdown_pct=drawdown_pct,
             peak_multiple=peak_multiple,
             bars=len(relevant),
             take_profit_hit=take_profit_hit,
             stop_loss_hit=stop_loss_hit,
+            data_truncated=data_truncated,
         )
 
     async def backtest_batch(
@@ -434,9 +453,10 @@ def _safe_bool(value: object) -> Optional[bool]:
 
 def _format_result(result: BacktestResult) -> str:
     return (
-        f"{result.pair_address} | pnl x{result.pnl_multiple:.2f} | "
+        f"{result.pair_address} | adj pnl x{result.adjusted_pnl_multiple:.2f} (raw x{result.pnl_multiple:.2f}) | "
         f"peak x{result.peak_multiple:.2f} | drawdown {result.max_drawdown_pct:.2f}% | "
         f"{result.bars} bars"
+        f"{' | truncated' if result.data_truncated else ''}"
     )
 
 
@@ -458,6 +478,9 @@ def _run_cli(args: argparse.Namespace) -> None:
             chain=args.chain,
             take_profit_multiple=args.take_profit,
             stop_loss_multiple=args.stop_loss,
+            slippage_bps=args.slippage_bps,
+            entry_fee_bps=args.entry_fee_bps,
+            exit_fee_bps=args.exit_fee_bps,
         )
         for r in sorted(res, key=lambda r: r.entry_time):
             print(_format_result(r))
@@ -484,6 +507,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chain", type=str, help="Chain (ETHEREUM, BSC, etc)", default="ETHEREUM")
     parser.add_argument("--take-profit", type=float, help="Optional take profit multiple", default=None)
     parser.add_argument("--stop-loss", type=float, help="Optional stop loss multiple", default=None)
+    parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        help="Round-trip slippage assumption in basis points applied to entry and exit",
+        default=0.0,
+    )
+    parser.add_argument(
+        "--entry-fee-bps",
+        type=float,
+        help="Entry fee (or price impact) assumption in basis points",
+        default=0.0,
+    )
+    parser.add_argument(
+        "--exit-fee-bps",
+        type=float,
+        help="Exit fee (or price impact) assumption in basis points",
+        default=0.0,
+    )
     return parser
 
 

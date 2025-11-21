@@ -22,10 +22,19 @@ passing.
 
 ## Running backtests
 Use the CLI helper to replay snapshots against DexScreener TradingView candles
-and compute PnL multiples, drawdowns, and optional stop/take hits:
+and compute PnL multiples, drawdowns, and optional stop/take hits. You can also
+layer in slippage/fee assumptions to get a more realistic PnL:
 
 ```bash
-python -m backtesting --pair 0xYourPair --horizon 360 --resolution 5 --take-profit 3 --stop-loss 0.7
+python -m backtesting \
+  --pair 0xYourPair \
+  --horizon 360 \
+  --resolution 5 \
+  --take-profit 3 \
+  --stop-loss 0.7 \
+  --slippage-bps 50 \
+  --entry-fee-bps 10 \
+  --exit-fee-bps 10
 ```
 
 Key flags:
@@ -35,8 +44,13 @@ Key flags:
 - `--resolution`: DexScreener TradingView resolution (default 15m)
 - `--take-profit`: Exit multiple vs. entry close if reached intrabar
 - `--stop-loss`: Stop multiple vs. entry close if reached intrabar
+- `--slippage-bps`: Round-trip slippage assumption applied to both entry/exit
+- `--entry-fee-bps`: Fee/price-impact bps added to the entry price
+- `--exit-fee-bps`: Fee/price-impact bps removed from the exit price
 
-CLI output summarizes each run as `pair | pnl xM | peak xM | drawdown D% | bars`.
+CLI output summarizes each run as
+`pair | adj pnl xM (raw xM) | peak xM | drawdown D% | bars` and marks entries
+that truncate early due to missing candles as `truncated`.
 
 ## Filesystem layout
 - `backtesting.py`: Backtest engine and CLI entrypoint
