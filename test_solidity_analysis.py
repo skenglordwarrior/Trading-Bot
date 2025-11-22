@@ -3,6 +3,8 @@ import asyncio
 from collections import deque
 from unittest.mock import patch, AsyncMock
 
+import aiohttp
+
 from ethereumbotv2 import (
     analyze_solidity_source,
     check_liquidity_locked_etherscan,
@@ -145,12 +147,84 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             ethereumbotv2,
             "_check_liquidity_locked_uncx_async",
-            AsyncMock(return_value=True),
+            AsyncMock(return_value=(True, None)),
         ) as uncx_mock:
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
 
         self.assertTrue(locked)
         uncx_mock.assert_awaited_once_with("0xpair")
+
+    async def test_uncx_rest_network_error_does_not_disable(self):
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                raise aiohttp.ClientConnectionError("dns lookup failed")
+
+        ethereumbotv2.UNCX_LOOKUPS_ENABLED = True
+
+        with patch.object(
+            ethereumbotv2, "create_aiohttp_session", return_value=FakeSession()
+        ), patch.object(ethereumbotv2, "disable_uncx_lookups") as disable_mock:
+            result = await ethereumbotv2._check_liquidity_locked_uncx_rest_async("0xpair")
+
+        self.assertEqual((None, None), result)
+        disable_mock.assert_not_called()
+
+    async def test_uncx_rest_switches_endpoint_after_dns_error(self):
+        calls: list[str] = []
+
+        class FakeResponse:
+            status = 404
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return {}
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                calls.append("attempt")
+                if len(calls) == 1:
+                    raise aiohttp.ClientConnectionError("dns lookup failed")
+                return FakeResponse()
+
+        ethereumbotv2.UNCX_LOCK_ENDPOINTS = [
+            "https://primary/locks/token",
+            "https://fallback/locks/token",
+        ]
+        ethereumbotv2._CURRENT_UNCX_ENDPOINT_INDEX = 0
+        ethereumbotv2.UNCX_LOCKS_ENDPOINT = ethereumbotv2.UNCX_LOCK_ENDPOINTS[0]
+        ethereumbotv2.UNCX_LOOKUPS_ENABLED = True
+
+        with patch.object(
+            ethereumbotv2, "create_aiohttp_session", return_value=FakeSession()
+        ), patch.object(ethereumbotv2, "disable_uncx_lookups") as disable_mock:
+            result = await ethereumbotv2._check_liquidity_locked_uncx_rest_async("0xpair")
+
+        self.assertEqual((False, None), result)
+        self.assertEqual(
+            "https://fallback/locks/token", ethereumbotv2.UNCX_LOCKS_ENDPOINT
+        )
+        self.assertEqual(["attempt", "attempt"], calls)
+        disable_mock.assert_not_called()
 
 
     async def test_holder_snapshot_reports_locked(self):

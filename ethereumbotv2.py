@@ -1435,8 +1435,20 @@ DEXSCREENER_CACHE_TTL = 300  # 5 minutes
 DEXSCREENER_PAIR_TTL = 10  # short TTL for pair endpoint
 
 UNCX_API_BASE_URL = os.getenv("UNCX_API_BASE_URL", "https://api.uncx.network/api/v1")
+UNCX_FALLBACK_API_BASE_URLS = [
+    url.strip()
+    for url in os.getenv(
+        "UNCX_FALLBACK_API_BASE_URLS", "https://api.unicrypt.network/api/v1"
+    ).split(",")
+    if url.strip()
+]
+UNCX_LOCK_ENDPOINTS = [
+    f"{UNCX_API_BASE_URL.rstrip('/')}/locks/token",
+    *[f"{base.rstrip('/')}/locks/token" for base in UNCX_FALLBACK_API_BASE_URLS],
+]
+_CURRENT_UNCX_ENDPOINT_INDEX = 0
 UNCX_LOCKS_ENDPOINT = os.getenv(
-    "UNCX_LOCKS_ENDPOINT", f"{UNCX_API_BASE_URL.rstrip('/')}/locks/token"
+    "UNCX_LOCKS_ENDPOINT", UNCX_LOCK_ENDPOINTS[_CURRENT_UNCX_ENDPOINT_INDEX]
 )
 UNCX_GRAPH_API_KEY = os.getenv(
     "UNCX_GRAPH_API_KEY",
@@ -3101,6 +3113,24 @@ def disable_uncx_lookups(reason: str) -> None:
     schedule_uncx_recovery()
 
 
+def _rotate_uncx_endpoint(reason: str) -> bool:
+    """Switch to a fallback Uncx REST endpoint after connection failures."""
+
+    global UNCX_LOCKS_ENDPOINT, _CURRENT_UNCX_ENDPOINT_INDEX
+
+    if len(UNCX_LOCK_ENDPOINTS) <= 1:
+        return False
+
+    next_index = (_CURRENT_UNCX_ENDPOINT_INDEX + 1) % len(UNCX_LOCK_ENDPOINTS)
+    if next_index == _CURRENT_UNCX_ENDPOINT_INDEX:
+        return False
+
+    _CURRENT_UNCX_ENDPOINT_INDEX = next_index
+    UNCX_LOCKS_ENDPOINT = UNCX_LOCK_ENDPOINTS[_CURRENT_UNCX_ENDPOINT_INDEX]
+    logger.warning("Switching Uncx endpoint to %s (%s)", UNCX_LOCKS_ENDPOINT, reason)
+    return True
+
+
 def enable_uncx_lookups(reason: str = "") -> None:
     """Manually re-enable Uncx lookups."""
 
@@ -3301,7 +3331,7 @@ def _extract_uncx_locks(payload: Any) -> Optional[List[dict]]:
 
 
 async def _check_liquidity_locked_uncx_rest_async(
-    pair_addr: str,
+    pair_addr: str, attempt: int = 0
 ) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     """Query the legacy Uncx REST API for liquidity locks."""
 
@@ -3330,6 +3360,14 @@ async def _check_liquidity_locked_uncx_rest_async(
                 resp.raise_for_status()
                 data = await resp.json()
         metrics.record_api_call(error=False)
+    except aiohttp.ClientConnectionError as exc:
+        metrics.record_api_call(error=True)
+        logger.warning(
+            "Transient Uncx network error for %s: %s", pair_addr, exc
+        )
+        if attempt == 0 and _rotate_uncx_endpoint(str(exc)):
+            return await _check_liquidity_locked_uncx_rest_async(pair_addr, attempt=1)
+        return None, None
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         metrics.record_api_call(error=True)
         disable_uncx_lookups(f"Uncx lookup failed: {exc}")
