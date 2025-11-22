@@ -1571,9 +1571,27 @@ def _load_manual_followup_snapshot(pair_addr: str) -> Optional[ManualFollowupSna
     if not addr_no_prefix:
         return None
 
-    candidate_paths = glob.glob("run_reports/manual_pair_followup_*.md")
-    target_path: Optional[str] = None
+    base_dirs = [Path.cwd(), Path(__file__).resolve().parent]
+    # Also consider project root if running from a submodule path
+    base_dirs.append(base_dirs[-1].parent)
+
+    candidate_paths: List[str] = []
+    for base_dir in base_dirs:
+        candidate_paths.extend(
+            str(path)
+            for path in base_dir.glob("run_reports/manual_pair_followup_*.md")
+        )
+
+    seen = set()
+    filtered_paths = []
     for path in candidate_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        filtered_paths.append(path)
+
+    target_path: Optional[str] = None
+    for path in filtered_paths:
         base = os.path.basename(path).lower()
         match = re.search(r"manual_pair_followup_(0x[0-9a-f]{6,40})", base)
         if not match:
