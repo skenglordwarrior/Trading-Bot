@@ -154,26 +154,16 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(locked)
         uncx_mock.assert_awaited_once_with("0xpair")
 
-    async def test_uncx_rest_network_error_does_not_disable(self):
-        class FakeSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-            def get(self, *args, **kwargs):
-                raise aiohttp.ClientConnectionError("dns lookup failed")
-
-        ethereumbotv2.UNCX_LOOKUPS_ENABLED = True
+    async def test_uncx_graph_skipped_when_disabled(self):
+        ethereumbotv2.UNCX_LOOKUPS_ENABLED = False
 
         with patch.object(
-            ethereumbotv2, "create_aiohttp_session", return_value=FakeSession()
-        ), patch.object(ethereumbotv2, "disable_uncx_lookups") as disable_mock:
-            result = await ethereumbotv2._check_liquidity_locked_uncx_rest_async("0xpair")
+            ethereumbotv2, "_check_liquidity_locked_uncx_graph_async", AsyncMock()
+        ) as graph_mock:
+            result = await ethereumbotv2._check_liquidity_locked_uncx_async("0xpair")
 
         self.assertEqual((None, None), result)
-        disable_mock.assert_not_called()
+        graph_mock.assert_not_awaited()
 
 
     async def test_holder_snapshot_reports_locked(self):
