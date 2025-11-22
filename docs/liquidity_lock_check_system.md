@@ -1,13 +1,13 @@
 # Liquidity Lock Check System
 
 ## Overview
-Our liquidity safety net stacks independent data sources so the bot can declare a pool "locked" only after cross-verifying holder snapshots, Unicrypt (UNCX) disclosures, and on-chain transaction history. The pipeline first builds an LP-holder census from Ethplorer (with automatic Etherscan fallback), then grades each holder to see whether ≥95 % of the supply is provably locked. If that verdict is inconclusive, the bot pivots to the UNCX GraphQL subgraph before finally sweeping Etherscan transfers for burn events, locker calls, or trusted locker contract names.【F:ethereumbotv2.py†L2015-L2138】【F:ethereumbotv2.py†L3176-L3313】【F:ethereumbotv2.py†L2141-L2219】
+Our liquidity safety net stacks independent data sources so the bot can declare a pool "locked" only after cross-verifying holder snapshots, Unicrypt (UNCX) disclosures, and on-chain transaction history. The pipeline first builds an LP-holder census from Ethplorer, then grades each holder to see whether ≥95 % of the supply is provably locked. If that verdict is inconclusive, the bot pivots to the UNCX GraphQL subgraph before finally sweeping Etherscan transfers for burn events, locker calls, or trusted locker contract names.【F:ethereumbotv2.py†L2015-L2138】【F:ethereumbotv2.py†L3176-L3313】【F:ethereumbotv2.py†L2141-L2219】
 
 ## Layered Source Strategy
 
 ### 1. Holder Analytics First
-- **Ethplorer top holders.** `_fetch_ethplorer_top_holders` pages through the public Ethplorer endpoint with keyed retries, normalises each holder record, and logs structured telemetry for operators.【F:ethereumbotv2.py†L4247-L4288】
-- **Automatic fallback.** `_fetch_holder_distribution_async` reuses the Ethplorer snapshot when available, but transparently drops to the Etherscan `tokenholderlist` API whenever Ethplorer does not respond or the operator needs more depth.【F:ethereumbotv2.py†L4293-L4319】
+- **Ethplorer top holders.** `_fetch_ethplorer_top_holders` pages through the public Ethplorer endpoint with keyed retries, normalises each holder record, and logs structured telemetry for operators.【F:ethereumbotv2.py†L4248-L4289】
+- **Optional derived snapshot.** When enabled, `_derive_top_holders_from_transfers_async` reconstructs top holders from `Transfer` events (or a third-party tracker) for informational dashboards only—it never participates in the 95/5 lock gate.【F:ethereumbotv2.py†L4295-L4346】【F:ethereumbotv2.py†L4455-L4470】
 - **95/5 gating.** `_check_liquidity_locked_holder_analysis` tallies balances by status, credits unknown balances to the remainder, and only returns `True` when ≥95 % of the supply is categorised as locked (with the mirror condition for an unlocked verdict).【F:ethereumbotv2.py†L2015-L2138】
 
 This combination gives the bot a deterministic "lock" verdict whenever a reputable locker or burn sink dominates the LP supply, making holder analysis the fastest route for high-confidence confirmations.

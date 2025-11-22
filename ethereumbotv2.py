@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import glob
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 try:
     from solidity_parser import parser
@@ -1475,6 +1476,9 @@ LOCKER_KEYWORDS: Tuple[str, ...] = (
 )
 LP_HOLDER_SNAPSHOT_LIMIT = 20
 LOCKER_FRESHNESS_BUFFER_SECONDS = 60
+SELF_DERIVED_HOLDER_SCAN_LIMIT = int(
+    os.getenv("SELF_DERIVED_HOLDER_SCAN_LIMIT", "200") or "0"
+)
 
 
 @dataclass
@@ -2962,7 +2966,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
-USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", True)
+USE_SELF_DERIVED_TOKEN_HOLDERS = _env_flag("ENABLE_SELF_DERIVED_TOKEN_HOLDERS", False)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
 ETHERSCAN_RECOVERY_DELAY_SECONDS = int(
     os.getenv("ETHERSCAN_RECOVERY_DELAY_SECONDS", "300") or "0"
@@ -4292,45 +4296,88 @@ async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List
 
 async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
     holders = await _fetch_ethplorer_top_holders(token_addr, limit)
-    if holders:
-        return holders
-
-    if not ETHERSCAN_LOOKUPS_ENABLED or not USE_ETHERSCAN_TOKEN_HOLDERS:
-        return holders
-
-    api_key = get_next_etherscan_key()
-    if not api_key:
-        return holders
-    params = {
-        "module": "token",
-        "action": "tokenholderlist",
-        "contractaddress": token_addr,
-        "page": 1,
-        "offset": limit,
-        "apikey": api_key,
-    }
-    try:
-        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
-        if isinstance(data, dict):
-            result = data.get("result", [])
-            if isinstance(result, list):
-                holders = []
-                for entry in result:
-                    normalised = _normalise_holder_entry(entry)
-                    if normalised:
-                        holders.append(normalised)
-                return holders
-        return holders
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
-        return holders
-    except Exception as e:
-        logger.debug(f"holder distribution error: {e}")
-        return holders
+    return holders
 
 
 def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
     return asyncio.run(_fetch_holder_distribution_async(token_addr, limit))
+
+
+async def _derive_top_holders_from_transfers_async(
+    token_addr: str, limit: int = LP_HOLDER_SNAPSHOT_LIMIT
+) -> List[dict]:
+    if not USE_SELF_DERIVED_TOKEN_HOLDERS or not ETHERSCAN_LOOKUPS_ENABLED:
+        return []
+
+    api_key = get_next_etherscan_key()
+    if not api_key:
+        return []
+
+    params = {
+        "module": "account",
+        "action": "tokentx",
+        "contractaddress": token_addr,
+        "page": 1,
+        "offset": max(limit, SELF_DERIVED_HOLDER_SCAN_LIMIT),
+        "sort": "asc",
+        "apikey": api_key,
+    }
+
+    try:
+        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
+        if data.get("status") != "1":
+            return []
+
+        balances: Dict[str, int] = defaultdict(int)
+        for tx in data.get("result", []):
+            frm = tx.get("from")
+            to = tx.get("to")
+            value = tx.get("value")
+            if not frm or not to or value is None:
+                continue
+            try:
+                value_int = int(value)
+            except (TypeError, ValueError):
+                continue
+
+            balances[frm.lower()] -= value_int
+            balances[to.lower()] += value_int
+
+        holders: List[dict] = []
+        for addr, bal in balances.items():
+            if bal <= 0:
+                continue
+
+            try:
+                checksum = to_checksum_address(addr)
+            except ValueError:
+                checksum = addr
+
+            holders.append({"address": checksum, "balance": bal})
+
+        holders.sort(key=lambda h: h.get("balance", 0), reverse=True)
+        if limit > 0:
+            holders = holders[:limit]
+        if holders:
+            log_event(
+                logging.INFO,
+                "derived_holders",
+                "Derived holder balances from transfer history",
+                context={"token": token_addr, "count": len(holders)},
+            )
+        return holders
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"self-derived holder fetch failed: {e}")
+        return []
+    except Exception as e:
+        logger.debug(f"self-derived holder error: {e}")
+        return []
+
+
+def derive_top_holders_from_transfers(
+    token_addr: str, limit: int = LP_HOLDER_SNAPSHOT_LIMIT
+) -> List[dict]:
+    return asyncio.run(_derive_top_holders_from_transfers_async(token_addr, limit))
 
 
 async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> dict:
@@ -4439,6 +4486,11 @@ def has_private_sale(token_addr: str) -> bool:
 
 def fetch_onchain_metrics(token_addr: str) -> dict:
     holders = fetch_holder_distribution(token_addr)
+    derived_holders: List[dict] = []
+    if USE_SELF_DERIVED_TOKEN_HOLDERS:
+        derived_holders = derive_top_holders_from_transfers(
+            token_addr, LP_HOLDER_SNAPSHOT_LIMIT
+        )
     if not isinstance(holders, list):
         holders = []
     transfers = analyze_transfer_history(token_addr)
@@ -4486,6 +4538,8 @@ def fetch_onchain_metrics(token_addr: str) -> dict:
     ratio = None
     if transfers["uniqueSellers"] > 0:
         ratio = transfers["uniqueBuyers"] / transfers["uniqueSellers"]
+    if derived_holders:
+        transfers["derivedTopHolders"] = derived_holders
     return {
         "holderConcentration": holder_share,
         "uniqueBuyerSellerRatio": ratio,
