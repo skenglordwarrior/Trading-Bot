@@ -21,6 +21,7 @@ import time
 import json
 import logging
 import re
+import glob
 from datetime import datetime, timedelta, timezone
 try:
     from solidity_parser import parser
@@ -1492,6 +1493,7 @@ class LiquidityLockDetails:
     locked_amount: Optional[Decimal] = None
     locked_at: Optional[int] = None
     unlock_at: Optional[int] = None
+    tx_hash: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Optional[Union[str, float, int]]]:
         duration: Optional[int] = None
@@ -1510,6 +1512,7 @@ class LiquidityLockDetails:
             "lockedAt": self.locked_at,
             "unlockAt": self.unlock_at,
             "lockDurationSeconds": duration,
+            "txHash": self.tx_hash,
         }
 
 
@@ -2107,6 +2110,44 @@ def _format_decimal_amount(val: Optional[Decimal]) -> str:
         return str(val)
 
 
+def _fetch_token_creation_metadata_ethplorer(
+    pair_addr: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    base_url = ETHPLORER_BASE_URL.rstrip("/")
+    url = f"{base_url}/getTokenInfo/{pair_addr}"
+    api_key = get_next_ethplorer_key() or _DEFAULT_ETHPLORER_KEYS[0]
+    params = {"apiKey": api_key}
+
+    try:
+        resp = requests.get(url, params=params, timeout=FETCH_TIMEOUT + 5)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.debug("ethplorer creation fetch failed for %s: %s", pair_addr, exc)
+        return None, None
+
+    block_number = None
+    timestamp = None
+
+    try:
+        if payload.get("creationBlock") is not None:
+            block_number = int(payload.get("creationBlock"))
+    except (ValueError, TypeError):
+        block_number = None
+
+    for key in ("creationTimestamp", "timestamp", "firstTxTime", "lastUpdated"):
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        try:
+            timestamp = int(raw)
+            break
+        except (ValueError, TypeError):
+            continue
+
+    return block_number, timestamp
+
+
 def _fetch_pair_creation_timestamp(pair_addr: str) -> Tuple[Optional[int], Optional[int]]:
     if not ETHERSCAN_LOOKUPS_ENABLED or not ETHERSCAN_API_URL:
         return None, None
@@ -2168,13 +2209,166 @@ def _fetch_pair_creation_timestamp(pair_addr: str) -> Tuple[Optional[int], Optio
     return block_number, timestamp
 
 
-def _fetch_initial_lp_mint(pair_addr: str) -> Tuple[Optional[Decimal], Optional[int]]:
+def _resolve_pair_creation(pair_addr: str) -> Tuple[Optional[int], Optional[int]]:
+    ethplorer_block, ethplorer_ts = _fetch_token_creation_metadata_ethplorer(pair_addr)
+    etherscan_block, etherscan_ts = _fetch_pair_creation_timestamp(pair_addr)
+
+    block_number = ethplorer_block or etherscan_block
+    timestamp = ethplorer_ts or etherscan_ts
+
+    return block_number, timestamp
+
+
+def _fetch_lp_transfers(pair_addr: str, *, limit: int = 200) -> List[dict]:
     if not ETHERSCAN_LOOKUPS_ENABLED or not ETHERSCAN_API_URL:
-        return None, None
+        return []
 
     api_key = get_next_etherscan_key()
     if not api_key:
-        return None, None
+        return []
+
+    params = {
+        "module": "account",
+        "action": "tokentx",
+        "contractaddress": pair_addr,
+        "page": 1,
+        "offset": limit,
+        "sort": "asc",
+        "apikey": api_key,
+    }
+
+    try:
+        prepared = _prepare_etherscan_params(params)
+        resp = requests.get(ETHERSCAN_API_URL, params=prepared, timeout=FETCH_TIMEOUT + 5)
+        resp.raise_for_status()
+        payload = resp.json()
+    except requests.RequestException as exc:
+        logger.debug("lp transfer fetch failed for %s: %s", pair_addr, exc)
+        return []
+
+    if payload.get("status") != "1":
+        return []
+
+    return payload.get("result", []) if isinstance(payload.get("result"), list) else []
+
+
+def _parse_token_tx_amount(tx: dict) -> Optional[Decimal]:
+    value_raw = tx.get("value")
+    decimals_raw = tx.get("tokenDecimal")
+    if value_raw is None or decimals_raw is None:
+        return None
+    try:
+        decimals_int = int(decimals_raw)
+        return Decimal(str(value_raw)) / (Decimal(10) ** decimals_int)
+    except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+async def _find_lock_transfer_async(
+    txs: List[dict],
+    *,
+    target_amount: Optional[Decimal] = None,
+    target_timestamp: Optional[int] = None,
+    exclude_tx_hashes: Optional[Set[str]] = None,
+) -> Optional[dict]:
+    inspected_contracts: Dict[str, str] = {}
+    candidates: List[Tuple[Decimal, int, str, str]] = []
+
+    excluded = {h.lower() for h in exclude_tx_hashes} if exclude_tx_hashes else set()
+
+    for tx in txs:
+        tx_hash = (tx.get("hash") or "").lower()
+        if tx_hash and tx_hash in excluded:
+            continue
+
+        from_addr = (tx.get("from") or "").lower()
+        if from_addr in BURN_ADDRESSES:
+            # Mint events originate from the zero address; treat them as non-locks
+            continue
+
+        to_addr = (tx.get("to") or "").lower()
+        if not to_addr:
+            continue
+
+        amount = _parse_token_tx_amount(tx)
+        if amount is None or amount <= 0:
+            continue
+
+        ts = _normalize_timestamp_seconds(tx.get("timeStamp"))
+        tag = None
+
+        if to_addr in BURN_ADDRESSES:
+            tag = "burn"
+        else:
+            cached = inspected_contracts.get(to_addr)
+            if cached is None:
+                try:
+                    info = await _fetch_contract_source_etherscan_async(to_addr)
+                    cached = (info.get("contractName") or "").lower()
+                except Exception:
+                    cached = ""
+                inspected_contracts[to_addr] = cached
+
+            if any(keyword in cached for keyword in LOCKER_KEYWORDS):
+                tag = "locker"
+
+        if not tag:
+            continue
+
+        candidates.append((amount, ts or 0, tx_hash or "", tag))
+
+    if not candidates:
+        return None
+
+    def _score(entry: Tuple[Decimal, int, str, str]) -> Tuple:
+        amount, ts, _, tag = entry
+        locker_rank = 0 if tag == "locker" else 1
+        amount_delta = (abs(amount - target_amount)) if target_amount is not None else Decimal("0")
+        ts_delta = abs(ts - target_timestamp) if target_timestamp is not None else 0
+        return (
+            locker_rank,
+            amount_delta if target_amount is not None else Decimal(0),
+            ts_delta if target_timestamp is not None else 0,
+            -amount,
+        )
+
+    candidates.sort(key=_score)
+    best_amount, best_ts, best_hash, best_tag = candidates[0]
+    return {
+        "amount": best_amount,
+        "timestamp": best_ts or None,
+        "hash": best_hash or None,
+        "tag": best_tag,
+    }
+
+
+def _compute_coverage_pct(
+    locked_amount: Optional[Decimal], minted_amount: Optional[Decimal]
+) -> Optional[float]:
+    if locked_amount is None or minted_amount is None:
+        return None
+    try:
+        if minted_amount <= 0:
+            return None
+        ratio = locked_amount / minted_amount
+        if ratio < 0:
+            return None
+        if ratio > 1:
+            ratio = Decimal(1)
+        return float(ratio)
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return None
+
+
+def _fetch_initial_lp_mint(
+    pair_addr: str,
+) -> Tuple[Optional[Decimal], Optional[int], Optional[str], Optional[int]]:
+    if not ETHERSCAN_LOOKUPS_ENABLED or not ETHERSCAN_API_URL:
+        return None, None, None, None
+
+    api_key = get_next_etherscan_key()
+    if not api_key:
+        return None, None, None, None
 
     params = {
         "module": "account",
@@ -2193,15 +2387,20 @@ def _fetch_initial_lp_mint(pair_addr: str) -> Tuple[Optional[Decimal], Optional[
         payload = resp.json()
     except requests.RequestException as exc:
         logger.debug("initial mint fetch failed for %s: %s", pair_addr, exc)
-        return None, None
+        return None, None, None, None
 
     if payload.get("status") != "1":
-        return None, None
+        return None, None, None, None
 
     for tx in payload.get("result", []):
         value_raw = tx.get("value")
         decimals_raw = tx.get("tokenDecimal")
         minted_at = _normalize_timestamp_seconds(tx.get("timeStamp"))
+        minted_block = None
+        try:
+            minted_block = int(tx.get("blockNumber")) if tx.get("blockNumber") else None
+        except (TypeError, ValueError):
+            minted_block = None
         if value_raw is None or decimals_raw is None:
             continue
         try:
@@ -2209,9 +2408,47 @@ def _fetch_initial_lp_mint(pair_addr: str) -> Tuple[Optional[Decimal], Optional[
             amount = Decimal(str(value_raw)) / (Decimal(10) ** decimals_int)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
-        return amount, minted_at
+        return amount, minted_at, tx.get("hash"), minted_block
 
-    return None, None
+    return None, None, None, None
+
+
+async def _gather_lock_details_async(
+    pair_addr: str, minted_amount: Optional[Decimal], minted_tx_hash: Optional[str]
+) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
+    locked, details = await _check_liquidity_locked_uncx_async(pair_addr)
+    txs = _fetch_lp_transfers(pair_addr)
+
+    target_amount = details.locked_amount if details and details.locked_amount else minted_amount
+    target_timestamp = details.locked_at if details and details.locked_at else None
+    matched_tx = await _find_lock_transfer_async(
+        txs,
+        target_amount=target_amount,
+        target_timestamp=target_timestamp,
+        exclude_tx_hashes={minted_tx_hash} if minted_tx_hash else None,
+    )
+
+    if details is None and matched_tx:
+        details = LiquidityLockDetails(
+            source="etherscan_tokentx",
+            locked_amount=matched_tx.get("amount"),
+            locked_at=matched_tx.get("timestamp"),
+            tx_hash=matched_tx.get("hash"),
+        )
+        locked = True
+
+    if details:
+        if details.locked_amount is None and matched_tx:
+            details.locked_amount = matched_tx.get("amount")
+        if details.locked_at is None and matched_tx:
+            details.locked_at = matched_tx.get("timestamp")
+        if details.tx_hash is None and matched_tx:
+            details.tx_hash = matched_tx.get("hash")
+        if details.coverage_pct is None:
+            details.coverage_pct = _compute_coverage_pct(
+                details.locked_amount, minted_amount
+            )
+    return locked, details
 
 
 def build_liquidity_lock_snapshot(pair_addr: str) -> str:
@@ -2220,10 +2457,22 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
         return "Usage: /lock_check <pair-address>"
 
     header = f"🔒 LP lock snapshot for <code>{pair_arg}</code>"
-    creation_block, creation_ts = _fetch_pair_creation_timestamp(pair_arg)
-    initial_amount, initial_ts = _fetch_initial_lp_mint(pair_arg)
+    creation_block, creation_ts = _resolve_pair_creation(pair_arg)
+    initial_amount, initial_ts, initial_tx, initial_block = _fetch_initial_lp_mint(pair_arg)
+    if creation_block is None and initial_block is not None:
+        creation_block = initial_block
+    if creation_ts is None:
+        creation_ts = initial_ts
 
-    locked, lock_details = asyncio.run(_check_liquidity_locked_etherscan_async(pair_arg))
+    locked, lock_details = asyncio.run(
+        _gather_lock_details_async(pair_arg, initial_amount, initial_tx)
+    )
+    if lock_details and lock_details.coverage_pct is None:
+        lock_details.coverage_pct = _compute_coverage_pct(
+            lock_details.locked_amount, initial_amount
+        )
+    if locked is None:
+        locked = bool(lock_details)
 
     lines: List[str] = []
     if creation_block or creation_ts:
@@ -2236,20 +2485,27 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
     if initial_amount is not None or initial_ts:
         amount_display = _format_decimal_amount(initial_amount)
         ts_display = _format_timestamp_utc(initial_ts)
-        lines.append(f"• Initial LP mint: {amount_display} LP @ {ts_display}")
+        mint_tx_display = initial_tx or "unknown"
+        lines.append(
+            f"• Initial LP mint: {amount_display} LP @ {ts_display} (tx {mint_tx_display})"
+        )
     else:
         lines.append("• Initial LP mint: unavailable")
 
     if locked:
+        coverage_val = lock_details.coverage_pct if lock_details else None
         coverage = (
-            f"{lock_details.coverage_pct * 100:.2f}%" if lock_details and lock_details.coverage_pct is not None else "unknown"
+            f"{coverage_val * 100:.2f}%" if coverage_val is not None else "unknown"
         )
         locked_amount = _format_decimal_amount(lock_details.locked_amount) if lock_details else "unknown"
         locked_at = _format_timestamp_utc(lock_details.locked_at if lock_details else None)
         unlock_at = _format_timestamp_utc(lock_details.unlock_at if lock_details else None)
+        lock_tx = lock_details.tx_hash if lock_details else None
+        lock_tx_display = lock_tx or "unknown"
+        lines.append(f"• Lock tx: {lock_tx_display} @ {locked_at}")
         lines.append(
             f"• Liquidity lock: locked ({coverage} coverage; amount {locked_amount})"
-            f" — locked_at {locked_at}; unlock_at {unlock_at}"
+            f" — unlock_at {unlock_at}"
         )
     elif locked is False:
         lines.append("• Liquidity lock: no definitive lock detected")
