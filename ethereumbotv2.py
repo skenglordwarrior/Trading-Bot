@@ -2404,11 +2404,23 @@ async def _find_lock_transfer_async(
     *,
     target_amount: Optional[Decimal] = None,
     target_timestamp: Optional[int] = None,
+    exclude_tx_hashes: Optional[Set[str]] = None,
 ) -> Optional[dict]:
     inspected_contracts: Dict[str, str] = {}
     candidates: List[Tuple[Decimal, int, str, str]] = []
 
+    excluded = {h.lower() for h in exclude_tx_hashes} if exclude_tx_hashes else set()
+
     for tx in txs:
+        tx_hash = (tx.get("hash") or "").lower()
+        if tx_hash and tx_hash in excluded:
+            continue
+
+        from_addr = (tx.get("from") or "").lower()
+        if from_addr in BURN_ADDRESSES:
+            # Mint events originate from the zero address; treat them as non-locks
+            continue
+
         to_addr = (tx.get("to") or "").lower()
         if not to_addr:
             continue
@@ -2438,7 +2450,7 @@ async def _find_lock_transfer_async(
         if not tag:
             continue
 
-        candidates.append((amount, ts or 0, tx.get("hash") or "", tag))
+        candidates.append((amount, ts or 0, tx_hash or "", tag))
 
     if not candidates:
         return None
@@ -2537,7 +2549,7 @@ def _fetch_initial_lp_mint(
 
 
 async def _gather_lock_details_async(
-    pair_addr: str, minted_amount: Optional[Decimal]
+    pair_addr: str, minted_amount: Optional[Decimal], minted_tx_hash: Optional[str]
 ) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     locked, details = await _check_liquidity_locked_uncx_async(pair_addr)
     txs = _fetch_lp_transfers(pair_addr)
@@ -2545,7 +2557,10 @@ async def _gather_lock_details_async(
     target_amount = details.locked_amount if details and details.locked_amount else minted_amount
     target_timestamp = details.locked_at if details and details.locked_at else None
     matched_tx = await _find_lock_transfer_async(
-        txs, target_amount=target_amount, target_timestamp=target_timestamp
+        txs,
+        target_amount=target_amount,
+        target_timestamp=target_timestamp,
+        exclude_tx_hashes={minted_tx_hash} if minted_tx_hash else None,
     )
 
     if details is None and matched_tx:
@@ -2584,7 +2599,9 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
     if creation_ts is None:
         creation_ts = initial_ts
 
-    locked, lock_details = asyncio.run(_gather_lock_details_async(pair_arg, initial_amount))
+    locked, lock_details = asyncio.run(
+        _gather_lock_details_async(pair_arg, initial_amount, initial_tx)
+    )
     if lock_details and lock_details.coverage_pct is None:
         lock_details.coverage_pct = _compute_coverage_pct(
             lock_details.locked_amount, initial_amount
