@@ -2361,11 +2361,11 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
 
     manual_snapshot = _load_manual_followup_snapshot(pair_arg)
     if manual_snapshot:
-        if not creation_ts and manual_snapshot.creation_timestamp:
+        if manual_snapshot.creation_timestamp:
             creation_ts = manual_snapshot.creation_timestamp
-        if initial_amount is None and manual_snapshot.initial_lp_amount is not None:
+        if manual_snapshot.initial_lp_amount is not None:
             initial_amount = manual_snapshot.initial_lp_amount
-        if not initial_ts and manual_snapshot.initial_lp_timestamp:
+        if manual_snapshot.initial_lp_timestamp:
             initial_ts = manual_snapshot.initial_lp_timestamp
 
     locked, lock_details = asyncio.run(_check_liquidity_locked_etherscan_async(pair_arg))
@@ -2384,16 +2384,16 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
         lock_details = LiquidityLockDetails(source="manual_followup")
 
     if lock_details and manual_snapshot:
-        if lock_details.locked_amount is None and manual_snapshot.locked_amount is not None:
+        if manual_snapshot.locked_amount is not None:
             lock_details.locked_amount = manual_snapshot.locked_amount
             lock_details.source = lock_details.source or "manual_followup"
-        if lock_details.coverage_pct is None and manual_snapshot.coverage_pct is not None:
+        if manual_snapshot.coverage_pct is not None:
             lock_details.coverage_pct = manual_snapshot.coverage_pct
             lock_details.source = lock_details.source or "manual_followup"
-        if lock_details.locked_at is None and manual_snapshot.locked_at is not None:
+        if manual_snapshot.locked_at is not None:
             lock_details.locked_at = manual_snapshot.locked_at
             lock_details.source = lock_details.source or "manual_followup"
-        if lock_details.unlock_at is None and manual_snapshot.unlock_at is not None:
+        if manual_snapshot.unlock_at is not None:
             lock_details.unlock_at = manual_snapshot.unlock_at
             lock_details.source = lock_details.source or "manual_followup"
 
