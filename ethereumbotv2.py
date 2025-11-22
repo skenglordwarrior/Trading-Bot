@@ -1563,14 +1563,24 @@ def _parse_timestamp_from_text(text: str) -> Optional[int]:
 
 
 def _load_manual_followup_snapshot(pair_addr: str) -> Optional[ManualFollowupSnapshot]:
-    prefix = (pair_addr or "").lower().strip()[:10]
-    if not prefix:
+    addr_normalized = (pair_addr or "").lower().strip()
+    if not addr_normalized:
+        return None
+
+    addr_no_prefix = addr_normalized[2:] if addr_normalized.startswith("0x") else addr_normalized
+    if not addr_no_prefix:
         return None
 
     candidate_paths = glob.glob("run_reports/manual_pair_followup_*.md")
     target_path: Optional[str] = None
     for path in candidate_paths:
-        if prefix in os.path.basename(path).lower():
+        base = os.path.basename(path).lower()
+        match = re.search(r"manual_pair_followup_(0x[0-9a-f]{6,40})", base)
+        if not match:
+            continue
+        fragment = match.group(1)
+        fragment_no_prefix = fragment[2:]
+        if addr_no_prefix.startswith(fragment_no_prefix):
             target_path = path
             break
 
