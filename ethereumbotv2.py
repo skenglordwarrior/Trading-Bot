@@ -21,6 +21,7 @@ import time
 import json
 import logging
 import re
+import glob
 from datetime import datetime, timedelta, timezone
 try:
     from solidity_parser import parser
@@ -1513,6 +1514,141 @@ class LiquidityLockDetails:
         }
 
 
+@dataclass
+class ManualFollowupSnapshot:
+    creation_timestamp: Optional[int] = None
+    initial_lp_amount: Optional[Decimal] = None
+    initial_lp_timestamp: Optional[int] = None
+    locked_amount: Optional[Decimal] = None
+    coverage_pct: Optional[float] = None
+    locked_at: Optional[int] = None
+    unlock_at: Optional[int] = None
+
+
+def _parse_decimal_from_text(text: str) -> Optional[Decimal]:
+    cleaned = text.replace(",", "").replace("≈", "").replace("~", "")
+    match = re.search(r"(-?\d+(?:\.\d+)?)", cleaned)
+    if not match:
+        return None
+    try:
+        return Decimal(match.group(1))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_percent_from_text(text: str) -> Optional[float]:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    if not match:
+        return None
+    try:
+        pct = float(match.group(1)) / 100.0
+    except ValueError:
+        return None
+    if pct < 0 or pct > 1:
+        return None
+    return pct
+
+
+def _parse_timestamp_from_text(text: str) -> Optional[int]:
+    normalized = text.replace("\u202f", " ").replace("\u00a0", " ")
+    match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", normalized)
+    if not match:
+        return None
+    try:
+        dt = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, OSError):
+        return None
+
+
+def _load_manual_followup_snapshot(pair_addr: str) -> Optional[ManualFollowupSnapshot]:
+    addr_normalized = (pair_addr or "").lower().strip()
+    if not addr_normalized:
+        return None
+
+    addr_no_prefix = addr_normalized[2:] if addr_normalized.startswith("0x") else addr_normalized
+    if not addr_no_prefix:
+        return None
+
+    base_dirs = [Path.cwd(), Path(__file__).resolve().parent]
+    # Also consider project root if running from a submodule path
+    base_dirs.append(base_dirs[-1].parent)
+
+    candidate_paths: List[str] = []
+    for base_dir in base_dirs:
+        candidate_paths.extend(
+            str(path)
+            for path in base_dir.glob("run_reports/manual_pair_followup_*.md")
+        )
+
+    seen = set()
+    filtered_paths = []
+    for path in candidate_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        filtered_paths.append(path)
+
+    target_path: Optional[str] = None
+    for path in filtered_paths:
+        base = os.path.basename(path).lower()
+        match = re.search(r"manual_pair_followup_(0x[0-9a-f]{6,40})", base)
+        if not match:
+            continue
+        fragment = match.group(1)
+        fragment_no_prefix = fragment[2:]
+        if addr_no_prefix.startswith(fragment_no_prefix):
+            target_path = path
+            break
+
+    if not target_path:
+        return None
+
+    try:
+        with open(target_path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    snapshot = ManualFollowupSnapshot()
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            continue
+        parts = [p.strip() for p in line.strip("| ").split("|")]
+        if len(parts) < 2:
+            continue
+        label = parts[0].lower()
+        value_field = parts[1]
+
+        if label == "pair creation" and snapshot.creation_timestamp is None:
+            snapshot.creation_timestamp = _parse_timestamp_from_text(value_field)
+        elif label == "initial lp mint":
+            if snapshot.initial_lp_timestamp is None:
+                snapshot.initial_lp_timestamp = _parse_timestamp_from_text(value_field)
+            if snapshot.initial_lp_amount is None:
+                snapshot.initial_lp_amount = _parse_decimal_from_text(value_field)
+        elif label.startswith("liquidity lock execution"):
+            if snapshot.locked_at is None:
+                snapshot.locked_at = _parse_timestamp_from_text(value_field)
+        elif label.startswith("locked amount"):
+            if snapshot.locked_amount is None:
+                snapshot.locked_amount = _parse_decimal_from_text(value_field)
+            if snapshot.coverage_pct is None:
+                snapshot.coverage_pct = _parse_percent_from_text(value_field)
+            if snapshot.coverage_pct is None:
+                coverage_match = _parse_percent_from_text(raw_line)
+                if coverage_match is not None:
+                    snapshot.coverage_pct = coverage_match
+        elif label.startswith("unlock schedule"):
+            if snapshot.unlock_at is None:
+                snapshot.unlock_at = _parse_timestamp_from_text(value_field)
+
+    return snapshot
+
+
 def _normalize_timestamp_seconds(value: Any) -> Optional[int]:
     if value in (None, ""):
         return None
@@ -2223,7 +2359,43 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
     creation_block, creation_ts = _fetch_pair_creation_timestamp(pair_arg)
     initial_amount, initial_ts = _fetch_initial_lp_mint(pair_arg)
 
+    manual_snapshot = _load_manual_followup_snapshot(pair_arg)
+    if manual_snapshot:
+        if manual_snapshot.creation_timestamp:
+            creation_ts = manual_snapshot.creation_timestamp
+        if manual_snapshot.initial_lp_amount is not None:
+            initial_amount = manual_snapshot.initial_lp_amount
+        if manual_snapshot.initial_lp_timestamp:
+            initial_ts = manual_snapshot.initial_lp_timestamp
+
     locked, lock_details = asyncio.run(_check_liquidity_locked_etherscan_async(pair_arg))
+
+    manual_lock_present = manual_snapshot and manual_snapshot.locked_amount is not None
+    manual_unlock_present = manual_snapshot and manual_snapshot.unlock_at is not None
+    manual_coverage_present = manual_snapshot and manual_snapshot.coverage_pct is not None
+
+    if locked is None and manual_snapshot and (
+        manual_lock_present or manual_unlock_present or manual_coverage_present
+    ):
+        locked = True
+        lock_details = LiquidityLockDetails(source="manual_followup")
+
+    if locked and lock_details is None and manual_snapshot:
+        lock_details = LiquidityLockDetails(source="manual_followup")
+
+    if lock_details and manual_snapshot:
+        if manual_snapshot.locked_amount is not None:
+            lock_details.locked_amount = manual_snapshot.locked_amount
+            lock_details.source = lock_details.source or "manual_followup"
+        if manual_snapshot.coverage_pct is not None:
+            lock_details.coverage_pct = manual_snapshot.coverage_pct
+            lock_details.source = lock_details.source or "manual_followup"
+        if manual_snapshot.locked_at is not None:
+            lock_details.locked_at = manual_snapshot.locked_at
+            lock_details.source = lock_details.source or "manual_followup"
+        if manual_snapshot.unlock_at is not None:
+            lock_details.unlock_at = manual_snapshot.unlock_at
+            lock_details.source = lock_details.source or "manual_followup"
 
     lines: List[str] = []
     if creation_block or creation_ts:
