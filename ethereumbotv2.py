@@ -3330,6 +3330,12 @@ async def _check_liquidity_locked_uncx_rest_async(
                 resp.raise_for_status()
                 data = await resp.json()
         metrics.record_api_call(error=False)
+    except aiohttp.ClientConnectionError as exc:
+        metrics.record_api_call(error=True)
+        logger.warning(
+            "Transient Uncx network error for %s: %s", pair_addr, exc
+        )
+        return None, None
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         metrics.record_api_call(error=True)
         disable_uncx_lookups(f"Uncx lookup failed: {exc}")
