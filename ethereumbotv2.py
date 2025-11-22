@@ -2399,7 +2399,7 @@ def _parse_token_tx_amount(tx: dict) -> Optional[Decimal]:
         return None
 
 
-def _find_lock_transfer(
+async def _find_lock_transfer_async(
     txs: List[dict],
     *,
     target_amount: Optional[Decimal] = None,
@@ -2426,7 +2426,7 @@ def _find_lock_transfer(
             cached = inspected_contracts.get(to_addr)
             if cached is None:
                 try:
-                    info = fetch_contract_source_etherscan(to_addr)
+                    info = await _fetch_contract_source_etherscan_async(to_addr)
                     cached = (info.get("contractName") or "").lower()
                 except Exception:
                     cached = ""
@@ -2544,7 +2544,7 @@ async def _gather_lock_details_async(
 
     target_amount = details.locked_amount if details and details.locked_amount else minted_amount
     target_timestamp = details.locked_at if details and details.locked_at else None
-    matched_tx = _find_lock_transfer(
+    matched_tx = await _find_lock_transfer_async(
         txs, target_amount=target_amount, target_timestamp=target_timestamp
     )
 
@@ -2591,33 +2591,6 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
         )
     if locked is None:
         locked = bool(lock_details)
-
-    manual_lock_present = manual_snapshot and manual_snapshot.locked_amount is not None
-    manual_unlock_present = manual_snapshot and manual_snapshot.unlock_at is not None
-    manual_coverage_present = manual_snapshot and manual_snapshot.coverage_pct is not None
-
-    if locked is None and manual_snapshot and (
-        manual_lock_present or manual_unlock_present or manual_coverage_present
-    ):
-        locked = True
-        lock_details = LiquidityLockDetails(source="manual_followup")
-
-    if locked and lock_details is None and manual_snapshot:
-        lock_details = LiquidityLockDetails(source="manual_followup")
-
-    if lock_details and manual_snapshot:
-        if manual_snapshot.locked_amount is not None:
-            lock_details.locked_amount = manual_snapshot.locked_amount
-            lock_details.source = lock_details.source or "manual_followup"
-        if manual_snapshot.coverage_pct is not None:
-            lock_details.coverage_pct = manual_snapshot.coverage_pct
-            lock_details.source = lock_details.source or "manual_followup"
-        if manual_snapshot.locked_at is not None:
-            lock_details.locked_at = manual_snapshot.locked_at
-            lock_details.source = lock_details.source or "manual_followup"
-        if manual_snapshot.unlock_at is not None:
-            lock_details.unlock_at = manual_snapshot.unlock_at
-            lock_details.source = lock_details.source or "manual_followup"
 
     lines: List[str] = []
     if creation_block or creation_ts:
