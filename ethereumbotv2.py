@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import glob
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 try:
     from solidity_parser import parser
@@ -1475,6 +1476,9 @@ LOCKER_KEYWORDS: Tuple[str, ...] = (
 )
 LP_HOLDER_SNAPSHOT_LIMIT = 20
 LOCKER_FRESHNESS_BUFFER_SECONDS = 60
+SELF_DERIVED_HOLDER_SCAN_LIMIT = int(
+    os.getenv("SELF_DERIVED_HOLDER_SCAN_LIMIT", "200") or "0"
+)
 
 
 @dataclass
@@ -2962,7 +2966,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 
 ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
-USE_ETHERSCAN_TOKEN_HOLDERS = _env_flag("ENABLE_ETHERSCAN_TOKEN_HOLDERS", True)
+USE_SELF_DERIVED_TOKEN_HOLDERS = _env_flag("ENABLE_SELF_DERIVED_TOKEN_HOLDERS", False)
 ETHERSCAN_DISABLED_REASON: Optional[str] = None
 ETHERSCAN_RECOVERY_DELAY_SECONDS = int(
     os.getenv("ETHERSCAN_RECOVERY_DELAY_SECONDS", "300") or "0"
@@ -3139,299 +3143,6 @@ def _coerce_uncx_timestamp(value: Any) -> Optional[float]:
         return None
 
 
-def _extract_uncx_unlock_timestamp(lock: dict) -> Optional[float]:
-    """Return the unlock timestamp (in seconds) for an Uncx lock entry."""
-
-    timestamp_keys = (
-        "unlockDate",
-        "unlock_date",
-        "unlockTimestamp",
-        "unlockTs",
-        "unlock_time",
-        "unlockTime",
-        "unlockAt",
-        "unlock_at",
-        "unlockTimeStamp",
-        "unlock",  # sometimes used as shorthand
-    )
-
-    for key in timestamp_keys:
-        if key in lock:
-            ts = _coerce_uncx_timestamp(lock.get(key))
-            if ts is not None:
-                return ts
-
-    # Some responses may include ISO8601 strings under alternative keys
-    for key in ("unlockDateISO", "unlock_date_iso", "unlockTimeISO"):
-        if key in lock:
-            ts = _coerce_uncx_timestamp(lock.get(key))
-            if ts is not None:
-                return ts
-
-    return None
-
-
-def _extract_uncx_lock_timestamp(lock: dict) -> Optional[float]:
-    timestamp_keys = (
-        "lockDate",
-        "lock_date",
-        "lockTimestamp",
-        "lockTs",
-        "lock_time",
-        "lockTime",
-        "lockAt",
-        "lock_at",
-        "lockTimeStamp",
-    )
-
-    for key in timestamp_keys:
-        if key in lock:
-            ts = _coerce_uncx_timestamp(lock.get(key))
-            if ts is not None:
-                return ts
-
-    return None
-
-
-def _extract_uncx_percent(lock: dict) -> Optional[float]:
-    percent_keys = (
-        "lockedPercent",
-        "percent",
-        "percentLocked",
-        "lockPercent",
-        "lpPercent",
-        "share",
-    )
-
-    for key in percent_keys:
-        if key not in lock:
-            continue
-        pct = _normalize_percent_ratio(lock.get(key))
-        if pct is not None:
-            return pct
-
-    return None
-
-
-def _extract_uncx_amount(lock: dict) -> Optional[Decimal]:
-    """Return the locked token amount from an Uncx lock entry."""
-
-    amount_keys = (
-        "amount",
-        "amountLocked",
-        "locked_amount",
-        "tokensLocked",
-        "tokenAmount",
-        "lockAmount",
-        "amount_total",
-        "amount_locked",
-        "amountToken",
-        "lpTokensLocked",
-    )
-
-    for key in amount_keys:
-        if key not in lock:
-            continue
-        raw_value = lock.get(key)
-        if raw_value in (None, ""):
-            continue
-        try:
-            amount = Decimal(str(raw_value))
-        except (InvalidOperation, ValueError, TypeError):
-            continue
-        if amount <= 0:
-            continue
-
-        # Normalize values that include a decimals hint when supplied as integers
-        decimals_hint = lock.get("decimals") or lock.get("tokenDecimals")
-        if (
-            isinstance(decimals_hint, (int, float))
-            or (isinstance(decimals_hint, str) and decimals_hint.isdigit())
-        ):
-            try:
-                decimals_int = int(decimals_hint)
-            except (TypeError, ValueError):
-                decimals_int = None
-            else:
-                if decimals_int and amount == amount.to_integral_value():
-                    try:
-                        scaled = amount / (Decimal(10) ** decimals_int)
-                    except (InvalidOperation, OverflowError):
-                        scaled = None
-                    else:
-                        if scaled is not None and scaled > 0:
-                            amount = scaled
-
-        return amount
-
-    formatted = lock.get("amountFormatted") or lock.get("amount_formatted")
-    if formatted:
-        try:
-            amount = Decimal(str(formatted))
-        except (InvalidOperation, ValueError, TypeError):
-            return None
-        return amount if amount > 0 else None
-
-    return None
-
-
-def _extract_uncx_locks(payload: Any) -> Optional[List[dict]]:
-    """Extract the list of lock entries from a Uncx API response."""
-
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        for key in ("locks", "result", "data", "items", "rows"):
-            if key not in payload:
-                continue
-            nested = payload.get(key)
-            if isinstance(nested, list):
-                return nested
-            if isinstance(nested, dict):
-                extracted = _extract_uncx_locks(nested)
-                if extracted is not None:
-                    return extracted
-        return []
-
-    return None
-
-
-async def _check_liquidity_locked_uncx_rest_async(
-    pair_addr: str,
-) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
-    """Query the legacy Uncx REST API for liquidity locks."""
-
-    if not UNCX_LOOKUPS_ENABLED:
-        return None, None
-
-    endpoint = UNCX_LOCKS_ENDPOINT.rstrip("/")
-    url = f"{endpoint}/{pair_addr}"
-
-    try:
-        async with create_aiohttp_session() as session:
-            async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
-                if resp.status == 404:
-                    metrics.record_api_call(error=False)
-                    logger.debug("Uncx reports no locks for %s", pair_addr)
-                    return False, None
-                if resp.status == 429:
-                    metrics.record_api_call(error=True)
-                    disable_uncx_lookups("Uncx rate limited")
-                    return None, None
-                if resp.status >= 500:
-                    metrics.record_api_call(error=True)
-                    disable_uncx_lookups(f"Uncx service error: {resp.status}")
-                    return None, None
-
-                resp.raise_for_status()
-                data = await resp.json()
-        metrics.record_api_call(error=False)
-    except aiohttp.ClientConnectionError as exc:
-        metrics.record_api_call(error=True)
-        logger.warning(
-            "Transient Uncx network error for %s: %s", pair_addr, exc
-        )
-        return None, None
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-        metrics.record_api_call(error=True)
-        disable_uncx_lookups(f"Uncx lookup failed: {exc}")
-        return None, None
-    except Exception as exc:  # pragma: no cover - unexpected parser issues
-        metrics.record_api_call(error=True)
-        logger.debug("Uncx lock check error: %s", exc, exc_info=True)
-        return None, None
-
-    locks = _extract_uncx_locks(data)
-    if locks is None:
-        return None, None
-
-    if not locks:
-        return False, None
-
-    now_ts = time.time()
-    active_amount = Decimal(0)
-    total_amount = Decimal(0)
-    inconclusive = False
-    entries = 0
-    lock_times: List[int] = []
-    unlock_times: List[int] = []
-    coverage_values: List[float] = []
-
-    for lock in locks:
-        if not isinstance(lock, dict):
-            inconclusive = True
-            continue
-
-        entries += 1
-
-        amount = _extract_uncx_amount(lock)
-        if amount is None:
-            inconclusive = True
-            continue
-
-        status_text = str(lock.get("status") or "").lower()
-        unlocked_flag = lock.get("isUnlocked")
-        is_locked_flag = lock.get("isLocked")
-
-        if unlocked_flag is True or "withdrawn" in status_text:
-            continue
-
-        total_amount += amount
-
-        if is_locked_flag is True or ("lock" in status_text and "unlock" not in status_text):
-            active_amount += amount
-            continue
-
-        unlock_ts = _extract_uncx_unlock_timestamp(lock)
-        if unlock_ts is None:
-            inconclusive = True
-            continue
-
-        normalized_unlock = _normalize_timestamp_seconds(unlock_ts)
-        if normalized_unlock:
-            unlock_times.append(normalized_unlock)
-
-        if normalized_unlock is None:
-            active_amount += amount
-            continue
-
-        if normalized_unlock > now_ts:
-            active_amount += amount
-
-        lock_ts = _extract_uncx_lock_timestamp(lock)
-        normalized_lock = _normalize_timestamp_seconds(lock_ts)
-        if normalized_lock:
-            lock_times.append(normalized_lock)
-
-        pct = _extract_uncx_percent(lock)
-        if pct is not None:
-            coverage_values.append(pct)
-
-    if active_amount > 0:
-        logger.debug(
-            "Uncx lock snapshot for %s => active_amount=%s total=%s entries=%s",
-            pair_addr,
-            str(active_amount),
-            str(total_amount) if total_amount else "0",
-            entries,
-        )
-        details = LiquidityLockDetails(
-            source="uncx_rest",
-            coverage_pct=max(coverage_values) if coverage_values else None,
-            locked_amount=active_amount,
-            locked_at=min(lock_times) if lock_times else None,
-            unlock_at=max(unlock_times) if unlock_times else None,
-        )
-        return True, details
-
-    if inconclusive:
-        return None, None
-
-    return False, None
 
 
 def _format_uncx_graph_endpoint() -> Optional[str]:
@@ -3611,18 +3322,10 @@ async def _check_liquidity_locked_uncx_async(
 ) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
     """Return True/False when Uncx provides a definitive liquidity status."""
 
-    rest_result: Optional[bool] = None
-    rest_details: Optional[LiquidityLockDetails] = None
-    if UNCX_LOOKUPS_ENABLED:
-        rest_result, rest_details = await _check_liquidity_locked_uncx_rest_async(pair_addr)
-        if rest_result is True:
-            return True, rest_details
+    if not UNCX_LOOKUPS_ENABLED:
+        return None, None
 
-    graph_result, graph_details = await _check_liquidity_locked_uncx_graph_async(pair_addr)
-    if graph_result is not None:
-        return graph_result, graph_details
-
-    return rest_result, rest_details
+    return await _check_liquidity_locked_uncx_graph_async(pair_addr)
 
 
 def ensure_etherscan_connectivity() -> None:
@@ -4593,45 +4296,88 @@ async def _fetch_ethplorer_top_holders(token_addr: str, limit: int = 10) -> List
 
 async def _fetch_holder_distribution_async(token_addr: str, limit: int = 10) -> List[dict]:
     holders = await _fetch_ethplorer_top_holders(token_addr, limit)
-    if holders:
-        return holders
-
-    if not ETHERSCAN_LOOKUPS_ENABLED or not USE_ETHERSCAN_TOKEN_HOLDERS:
-        return holders
-
-    api_key = get_next_etherscan_key()
-    if not api_key:
-        return holders
-    params = {
-        "module": "token",
-        "action": "tokenholderlist",
-        "contractaddress": token_addr,
-        "page": 1,
-        "offset": limit,
-        "apikey": api_key,
-    }
-    try:
-        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
-        if isinstance(data, dict):
-            result = data.get("result", [])
-            if isinstance(result, list):
-                holders = []
-                for entry in result:
-                    normalised = _normalise_holder_entry(entry)
-                    if normalised:
-                        holders.append(normalised)
-                return holders
-        return holders
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-        disable_etherscan_lookups(f"holder distribution lookup failed: {e}")
-        return holders
-    except Exception as e:
-        logger.debug(f"holder distribution error: {e}")
-        return holders
+    return holders
 
 
 def fetch_holder_distribution(token_addr: str, limit: int = 10) -> List[dict]:
     return asyncio.run(_fetch_holder_distribution_async(token_addr, limit))
+
+
+async def _derive_top_holders_from_transfers_async(
+    token_addr: str, limit: int = LP_HOLDER_SNAPSHOT_LIMIT
+) -> List[dict]:
+    if not USE_SELF_DERIVED_TOKEN_HOLDERS or not ETHERSCAN_LOOKUPS_ENABLED:
+        return []
+
+    api_key = get_next_etherscan_key()
+    if not api_key:
+        return []
+
+    params = {
+        "module": "account",
+        "action": "tokentx",
+        "contractaddress": token_addr,
+        "page": 1,
+        "offset": max(limit, SELF_DERIVED_HOLDER_SCAN_LIMIT),
+        "sort": "asc",
+        "apikey": api_key,
+    }
+
+    try:
+        data = await _etherscan_get_async(params, FETCH_TIMEOUT)
+        if data.get("status") != "1":
+            return []
+
+        balances: Dict[str, int] = defaultdict(int)
+        for tx in data.get("result", []):
+            frm = tx.get("from")
+            to = tx.get("to")
+            value = tx.get("value")
+            if not frm or not to or value is None:
+                continue
+            try:
+                value_int = int(value)
+            except (TypeError, ValueError):
+                continue
+
+            balances[frm.lower()] -= value_int
+            balances[to.lower()] += value_int
+
+        holders: List[dict] = []
+        for addr, bal in balances.items():
+            if bal <= 0:
+                continue
+
+            try:
+                checksum = to_checksum_address(addr)
+            except ValueError:
+                checksum = addr
+
+            holders.append({"address": checksum, "balance": bal})
+
+        holders.sort(key=lambda h: h.get("balance", 0), reverse=True)
+        if limit > 0:
+            holders = holders[:limit]
+        if holders:
+            log_event(
+                logging.INFO,
+                "derived_holders",
+                "Derived holder balances from transfer history",
+                context={"token": token_addr, "count": len(holders)},
+            )
+        return holders
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        disable_etherscan_lookups(f"self-derived holder fetch failed: {e}")
+        return []
+    except Exception as e:
+        logger.debug(f"self-derived holder error: {e}")
+        return []
+
+
+def derive_top_holders_from_transfers(
+    token_addr: str, limit: int = LP_HOLDER_SNAPSHOT_LIMIT
+) -> List[dict]:
+    return asyncio.run(_derive_top_holders_from_transfers_async(token_addr, limit))
 
 
 async def _analyze_transfer_history_async(token_addr: str, limit: int = 100) -> dict:
@@ -4740,6 +4486,11 @@ def has_private_sale(token_addr: str) -> bool:
 
 def fetch_onchain_metrics(token_addr: str) -> dict:
     holders = fetch_holder_distribution(token_addr)
+    derived_holders: List[dict] = []
+    if USE_SELF_DERIVED_TOKEN_HOLDERS:
+        derived_holders = derive_top_holders_from_transfers(
+            token_addr, LP_HOLDER_SNAPSHOT_LIMIT
+        )
     if not isinstance(holders, list):
         holders = []
     transfers = analyze_transfer_history(token_addr)
@@ -4787,6 +4538,8 @@ def fetch_onchain_metrics(token_addr: str) -> dict:
     ratio = None
     if transfers["uniqueSellers"] > 0:
         ratio = transfers["uniqueBuyers"] / transfers["uniqueSellers"]
+    if derived_holders:
+        transfers["derivedTopHolders"] = derived_holders
     return {
         "holderConcentration": holder_share,
         "uniqueBuyerSellerRatio": ratio,
@@ -6004,7 +5757,6 @@ def _format_lock_source_name(source: Optional[str]) -> Optional[str]:
     normalized = source.strip().lower()
     mapping = {
         "holder_analysis": "Holder snapshot",
-        "uncx_rest": "UNCX REST",
         "uncx_graph": "UNCX Graph",
         "etherscan_tokentx": "Etherscan token tx",
         "dexscreener_label": "DexScreener label",
