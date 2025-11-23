@@ -1,23 +1,35 @@
 # Maestro integration guide
 
-This repository's Ethereum bot is currently a research and monitoring tool. It scores new liquidity pools with `check_pair_criteria` and then schedules volume checks or refreshes, but it does not dispatch any swap/buy transactions.
+# Live Maestro execution path
+
+The bot now includes a live Maestro execution hook. When a pair clears the production thresholds (`passes >= MIN_PASS_THRESHOLD`, volume, and trade count) **and** the pool is a WETH-paired token, the bot can dispatch a Maestro buy request without blocking the scanning loop.
+
+**Configuration (env vars):**
+
+- `MAESTRO_ENABLED=true` — master toggle.
+- `MAESTRO_API_BASE_URL` — e.g., `https://api.maestro.xyz` (no trailing slash).
+- `MAESTRO_API_KEY` — Maestro bearer token.
+- `MAESTRO_ACCOUNT` — Maestro-managed account/wallet identifier.
+- `MAESTRO_BUY_AMOUNT_ETH` — amount of WETH to spend per trigger (Decimal). If `0` or unset, orders are skipped.
+- `MAESTRO_SLIPPAGE_BPS` — slippage in basis points (default `75`).
+- `MAESTRO_PRIORITY_FEE_GWEI` — optional priority tip.
+- `MAESTRO_DRY_RUN` — keep `true` to shadow-test orders; set `false` to go live.
+- Optional: `MAESTRO_MAX_RETRIES`, `MAESTRO_RETRY_BACKOFF`, `MAESTRO_REQUEST_TIMEOUT`, `MAESTRO_TRADE_PATH`, `MAESTRO_BUY_REASON`.
 
 ## Where to hook a buy trigger
 - **Pair evaluation:** `check_pair_criteria` returns `passes`, `total`, and a rich `extra` payload with DexScreener stats, contract risk, and verification status. It is already used as the single gate before any follow-up work.
 - **Lifecycle pivot:** `handle_new_pair` handles the initial pass/fail outcome. Once `passes >= MIN_PASS_THRESHOLD`, it starts wallet monitoring and queues volume checks or passing refresh timers. This is the earliest point where a trade trigger would be safe to add without duplicating work or missing requeues.
 
-Recommended insertion point:
-1. Inside `handle_new_pair`, immediately after the `passes >= MIN_PASS_THRESHOLD` block that already increments metrics and calls `start_wallet_monitor(main_token)`.
-2. Gate the call on both the pass threshold and the volume/trade guard (`vol_now >= MIN_VOLUME_USD` and `trades_now >= MIN_TRADES_REQUIRED`) to avoid frontrunning illiquid pools.
+The hook now lives inside `handle_new_pair` after the volume/trade gate. When the pair passes and meets activity requirements, `maybe_execute_maestro_buy` prepares a payload and ships it to Maestro in a background thread. It only triggers when one leg is WETH to guarantee swap routing.
 
 ## Sketch of an execution hook
-1. **Config:** Add Maestro API URL, API key/token, and a default size/slippage to the existing environment-driven config (align with `INFURA_URL` and similar settings).
-2. **Client:** Create a small `maestro_client.py` module that exposes `submit_buy(pair_address, base_token, quote_token, amount)` and handles retries + 429 back-off.
-3. **Trigger:** Call `submit_buy` from the recommended insertion point with the pair address, token addresses, and desired size. Make the call async-safe (use `asyncio.run` or `loop.create_task` if a long request) so it does not block the main scanning loop.
-4. **Result handling:** Log Maestro responses alongside the existing `log_event` metadata, and push success/failure to Telegram so operators can reconcile fills.
+1. **Config:** Provide Maestro URL, key, account, per-trade amount, and slippage via env vars.
+2. **Client:** `maestro_client.MaestroClient` wraps the HTTP API with retry/back-off and rate-limit handling.
+3. **Trigger:** `maybe_execute_maestro_buy` calls `MaestroClient.submit_buy_background(...)`, handing pair/token metadata and respecting dry-run mode.
+4. **Result handling:** `log_event` emits structured success/failure entries and pushes Telegram failures for visibility.
 
 ## Safety considerations
 - Keep the existing pass threshold, volume/trade minimums, and verification error handling intact so risky pools are not traded.
 - Fail closed: if the Maestro call errors, log and continue monitoring rather than retrying infinitely in the hot path.
 - Store secrets in env vars or a separate, git-ignored file; do not hardcode API tokens.
-- Add a dry-run flag so you can shadow-test the hook before enabling live orders.
+- Use `MAESTRO_DRY_RUN=true` while shadow-testing the hook before enabling live orders.
