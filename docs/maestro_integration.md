@@ -33,3 +33,4 @@ The hook now lives inside `handle_new_pair` after the volume/trade gate. When th
 - Fail closed: if the Maestro call errors, log and continue monitoring rather than retrying infinitely in the hot path.
 - Store secrets in env vars or a separate, git-ignored file; do not hardcode API tokens.
 - Use `MAESTRO_DRY_RUN=true` while shadow-testing the hook before enabling live orders.
+- Obtain your Maestro API key and account/wallet identifier from the Maestro dashboard or API portal. This project does **not** generate those credentials; availability and pricing are determined by Maestro (a funded Maestro account is typically required to place buys).
