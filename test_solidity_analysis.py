@@ -3,6 +3,8 @@ import asyncio
 from collections import deque
 from unittest.mock import patch, AsyncMock
 
+from eth_utils import to_checksum_address
+
 import aiohttp
 
 from ethereumbotv2 import (
@@ -111,7 +113,7 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         ), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}), patch.object(
             ethereumbotv2,
             "_check_liquidity_locked_holder_analysis",
-            AsyncMock(return_value=None),
+            AsyncMock(return_value=(None, None)),
         ):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
@@ -134,7 +136,7 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         ), patch.dict("os.environ", {"ETHERSCAN_API_KEY": "X"}), patch.object(
             ethereumbotv2,
             "_check_liquidity_locked_holder_analysis",
-            AsyncMock(return_value=None),
+            AsyncMock(return_value=(None, None)),
         ):
             locked = await ethereumbotv2._check_liquidity_locked_etherscan_async("0xpair")
         self.assertTrue(locked)
@@ -143,7 +145,7 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             ethereumbotv2,
             "_check_liquidity_locked_holder_analysis",
-            AsyncMock(return_value=None),
+            AsyncMock(return_value=(None, None)),
         ), patch.object(
             ethereumbotv2,
             "_check_liquidity_locked_uncx_async",
@@ -154,26 +156,16 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(locked)
         uncx_mock.assert_awaited_once_with("0xpair")
 
-    async def test_uncx_rest_network_error_does_not_disable(self):
-        class FakeSession:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-            def get(self, *args, **kwargs):
-                raise aiohttp.ClientConnectionError("dns lookup failed")
-
-        ethereumbotv2.UNCX_LOOKUPS_ENABLED = True
+    async def test_uncx_graph_skipped_when_disabled(self):
+        ethereumbotv2.UNCX_LOOKUPS_ENABLED = False
 
         with patch.object(
-            ethereumbotv2, "create_aiohttp_session", return_value=FakeSession()
-        ), patch.object(ethereumbotv2, "disable_uncx_lookups") as disable_mock:
-            result = await ethereumbotv2._check_liquidity_locked_uncx_rest_async("0xpair")
+            ethereumbotv2, "_check_liquidity_locked_uncx_graph_async", AsyncMock()
+        ) as graph_mock:
+            result = await ethereumbotv2._check_liquidity_locked_uncx_async("0xpair")
 
         self.assertEqual((None, None), result)
-        disable_mock.assert_not_called()
+        graph_mock.assert_not_awaited()
 
 
     async def test_holder_snapshot_reports_locked(self):
@@ -210,9 +202,11 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
             "_analyze_lp_holder_async",
             AsyncMock(side_effect=analyses),
         ):
-            result = await ethereumbotv2._check_liquidity_locked_holder_analysis("0xPAIR")
+            locked, _ = await ethereumbotv2._check_liquidity_locked_holder_analysis(
+                "0xPAIR"
+            )
 
-        self.assertTrue(result)
+        self.assertTrue(locked)
 
     async def test_holder_snapshot_reports_unlocked(self):
         locker_addr = "0x2222222222222222222222222222222222222222"
@@ -248,9 +242,63 @@ class LiquidityLockDetectionTest(unittest.IsolatedAsyncioTestCase):
             "_analyze_lp_holder_async",
             AsyncMock(side_effect=analyses),
         ):
-            result = await ethereumbotv2._check_liquidity_locked_holder_analysis("0xPAIR")
+            locked, _ = await ethereumbotv2._check_liquidity_locked_holder_analysis(
+                "0xPAIR"
+            )
 
-        self.assertFalse(result)
+        self.assertFalse(locked)
+
+
+class HolderDistributionSourceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_holder_distribution_skips_etherscan(self):
+        with patch.object(
+            ethereumbotv2,
+            "_fetch_ethplorer_top_holders",
+            AsyncMock(return_value=[]),
+        ), patch.object(
+            ethereumbotv2, "_etherscan_get_async", AsyncMock(side_effect=AssertionError)
+        ):
+            holders = await ethereumbotv2._fetch_holder_distribution_async(
+                "0xTOKEN", limit=5
+            )
+
+        self.assertEqual([], holders)
+
+    async def test_self_derived_holders_available_when_enabled(self):
+        ethereumbotv2.USE_SELF_DERIVED_TOKEN_HOLDERS = True
+        self.addCleanup(setattr, ethereumbotv2, "USE_SELF_DERIVED_TOKEN_HOLDERS", False)
+
+        fake_result = {
+            "status": "1",
+            "result": [
+                {
+                    "from": "0x0000000000000000000000000000000000000aaa",
+                    "to": "0x0000000000000000000000000000000000000bbb",
+                    "value": "100",
+                },
+                {
+                    "from": "0x0000000000000000000000000000000000000bbb",
+                    "to": "0x0000000000000000000000000000000000000ccc",
+                    "value": "40",
+                },
+            ],
+        }
+
+        with patch.object(
+            ethereumbotv2, "_etherscan_get_async", AsyncMock(return_value=fake_result)
+        ), patch.object(
+            ethereumbotv2, "get_next_etherscan_key", return_value="key"
+        ), patch.object(ethereumbotv2, "log_event") as log_mock:
+            holders = await ethereumbotv2._derive_top_holders_from_transfers_async(
+                "0xToken", limit=5
+            )
+
+        self.assertEqual(2, len(holders))
+        self.assertEqual(
+            to_checksum_address("0x0000000000000000000000000000000000000bbb"),
+            holders[0]["address"],
+        )
+        log_mock.assert_called()
 
 
 class EtherscanFetchFallbackTest(unittest.IsolatedAsyncioTestCase):
