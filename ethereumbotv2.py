@@ -236,6 +236,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4895948667")
 TELEGRAM_BASE_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 )
+TELEGRAM_REFRESH_DEFAULT_INTERVAL = int(
+    os.getenv("TELEGRAM_REFRESH_DEFAULT_INTERVAL", "45")
+)
+TELEGRAM_REFRESH_MIN_INTERVAL = int(os.getenv("TELEGRAM_REFRESH_MIN_INTERVAL", "20"))
+TELEGRAM_REFRESH_MAX = int(os.getenv("TELEGRAM_REFRESH_MAX", "6"))
+TELEGRAM_REFRESH_CHANGE_THRESHOLD = float(
+    os.getenv("TELEGRAM_REFRESH_CHANGE_THRESHOLD", "0.5")
+)
+TELEGRAM_REFRESH_LOOP_SLEEP = float(os.getenv("TELEGRAM_REFRESH_LOOP_SLEEP", "2.0"))
 
 # The Graph configuration
 GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzfCBmGwYNdVkduYXVivCsLR"
@@ -554,6 +563,9 @@ state_lock = threading.RLock()
 discovered_pairs_queue: "Queue[tuple[str, str, str]]" = Queue(maxsize=PAIR_QUEUE_MAXSIZE)
 pair_workers_stop = threading.Event()
 maintenance_stop = threading.Event()
+telegram_refresh_stop = threading.Event()
+telegram_refresh_lock = threading.RLock()
+telegram_refresh_subscriptions: Dict[str, dict] = {}
 
 
 def log_event(
@@ -1296,6 +1308,269 @@ except Exception:
 
 
 # ---------------------------------------------------------
+# Telegram auto-refresh helpers
+# ---------------------------------------------------------
+
+
+def _normalize_refresh_interval_seconds(interval: Optional[str]) -> int:
+    try:
+        seconds = int(interval) if interval else TELEGRAM_REFRESH_DEFAULT_INTERVAL
+    except (TypeError, ValueError):
+        seconds = TELEGRAM_REFRESH_DEFAULT_INTERVAL
+    return max(TELEGRAM_REFRESH_MIN_INTERVAL, seconds)
+
+
+def _resolve_refresh_addresses(arg: str) -> Tuple[Optional[str], Optional[str]]:
+    """Attempt to derive a pair+token tuple from user input."""
+
+    if not arg:
+        return None, None
+    cleaned = arg.strip()
+    cleaned_low = cleaned.lower()
+    pair_addr = None
+    token_addr = None
+
+    if cleaned_low.startswith("0x") and len(cleaned_low) == 42:
+        if cleaned_low in known_pairs:
+            token0, token1 = known_pairs[cleaned_low]
+            pair_addr = cleaned
+            try:
+                token_addr = get_non_weth_token(token0, token1)
+            except Exception:
+                token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+        else:
+            token_addr = cleaned
+            for paddr, (token0, token1) in list(known_pairs.items()):
+                if cleaned_low in {token0.lower(), token1.lower()}:
+                    pair_addr = paddr
+                    break
+
+    if pair_addr is None:
+        for paddr, (token0, token1) in list(known_pairs.items()):
+            if paddr.lower().startswith(cleaned_low) or paddr.lower().endswith(cleaned_low):
+                pair_addr = paddr
+                try:
+                    token_addr = get_non_weth_token(token0, token1)
+                except Exception:
+                    token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+                break
+
+    return pair_addr, token_addr
+
+
+def _build_refresh_snapshot(data: Optional[dict], reason: Optional[str]) -> dict:
+    snapshot = {
+        "price": None,
+        "liq": None,
+        "mc": None,
+        "vol": None,
+        "buys": None,
+        "sells": None,
+        "locked": None,
+        "lock_details": None,
+        "dex_paid": False,
+        "reason": reason or "ok",
+    }
+
+    if data:
+        snapshot.update(
+            {
+                "price": float(data.get("priceUsd", 0) or 0),
+                "liq": float(data.get("liquidityUsd", 0) or 0),
+                "mc": float(data.get("marketCap") or data.get("fdv") or 0),
+                "vol": float(data.get("volume24h", 0) or 0),
+                "buys": int(data.get("buys", 0) or 0),
+                "sells": int(data.get("sells", 0) or 0),
+                "locked": data.get("lockedLiquidity"),
+                "lock_details": data.get("lockedLiquidityDetails"),
+                "dex_paid": bool(data.get("dexPaid", False)),
+                "reason": "ok" if not reason else reason,
+            }
+        )
+
+    return snapshot
+
+
+def _refresh_delta_exceeds(prev: Optional[float], curr: Optional[float], threshold: float) -> bool:
+    if prev is None or curr is None:
+        return True
+    if prev == 0:
+        return curr != 0
+    return abs((curr - prev) / prev) * 100 >= threshold
+
+
+def _should_emit_refresh(
+    prev_snapshot: Optional[dict],
+    snapshot: dict,
+    last_sent: float,
+    interval: int,
+) -> bool:
+    if prev_snapshot is None:
+        return True
+
+    heartbeat_after = max(interval * 3, 180)
+    if last_sent and time.time() - last_sent >= heartbeat_after:
+        return True
+
+    if prev_snapshot.get("reason") != snapshot.get("reason"):
+        return True
+
+    for key in ("price", "mc", "liq", "vol"):
+        if _refresh_delta_exceeds(prev_snapshot.get(key), snapshot.get(key), TELEGRAM_REFRESH_CHANGE_THRESHOLD):
+            return True
+
+    if prev_snapshot.get("buys") != snapshot.get("buys"):
+        return True
+    if prev_snapshot.get("sells") != snapshot.get("sells"):
+        return True
+    if prev_snapshot.get("locked") != snapshot.get("locked"):
+        return True
+
+    return False
+
+
+def _format_refresh_message(
+    pair_addr: str, token_addr: str, snapshot: dict, interval: int
+) -> str:
+    def _fmt_money(val: Optional[float]) -> str:
+        if val is None:
+            return "?"
+        if val >= 1:
+            return f"${val:,.0f}"
+        return f"${val:.6f}"
+
+    header = f"📡 Auto-refresh <code>{pair_addr}</code>"
+    token_line = f"Token: <code>{token_addr}</code> • every {interval}s"
+
+    if snapshot.get("reason") != "ok" and snapshot.get("price") in (None, 0):
+        body_lines = [f"DexScreener: {snapshot.get('reason') or 'unavailable'}"]
+    else:
+        price = snapshot.get("price") or 0
+        liq = snapshot.get("liq")
+        mc = snapshot.get("mc")
+        vol = snapshot.get("vol")
+        buys = snapshot.get("buys")
+        sells = snapshot.get("sells")
+        lock_flag = snapshot.get("locked")
+        lock_tag = "🔒 Locked" if lock_flag else "🔓 Unlockable"
+        lock_detail = snapshot.get("lock_details") or {}
+        if lock_detail:
+            pct = lock_detail.get("coverage_pct")
+            if pct:
+                lock_tag = f"{lock_tag} ({pct*100:.1f}% locked)"
+        paid_tag = " • 🔥 Paid/Trending" if snapshot.get("dex_paid") else ""
+
+        body_lines = [
+            f"Price: ${price:.8f}",
+            f"Liq: {_fmt_money(liq)} | MC: {_fmt_money(mc)}{paid_tag}",
+            f"Vol24h: {_fmt_money(vol)} | Tx24h: {buys}/{sells}",
+            lock_tag,
+        ]
+
+    return "\n".join([header, token_line, *body_lines])
+
+
+def start_telegram_auto_refresh(arg: str, interval: Optional[str] = None) -> str:
+    pair_addr, token_addr = _resolve_refresh_addresses(arg)
+    if not pair_addr:
+        return "Usage: /refresh_on <pair-address> [seconds]"
+
+    interval_seconds = _normalize_refresh_interval_seconds(interval)
+    key = pair_addr.lower()
+    token_addr = token_addr or pair_addr
+
+    with telegram_refresh_lock:
+        if key not in telegram_refresh_subscriptions and len(telegram_refresh_subscriptions) >= TELEGRAM_REFRESH_MAX:
+            return f"⚠️ Maximum of {TELEGRAM_REFRESH_MAX} auto-refresh slots in use."
+
+        telegram_refresh_subscriptions[key] = {
+            "pair": pair_addr,
+            "token": token_addr,
+            "interval": interval_seconds,
+            "next_due": time.time(),
+            "last_snapshot": telegram_refresh_subscriptions.get(key, {}).get("last_snapshot"),
+            "last_sent": telegram_refresh_subscriptions.get(key, {}).get("last_sent", 0.0),
+        }
+
+    return (
+        f"📡 Auto-refresh enabled for <code>{pair_addr}</code> "
+        f"every {interval_seconds}s"
+    )
+
+
+def stop_telegram_auto_refresh(arg: str) -> str:
+    pair_addr, _ = _resolve_refresh_addresses(arg)
+    if not pair_addr:
+        return "Usage: /refresh_off <pair-address>"
+
+    removed = False
+    with telegram_refresh_lock:
+        removed = telegram_refresh_subscriptions.pop(pair_addr.lower(), None) is not None
+    if removed:
+        return f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>"
+    return f"ℹ️ No auto-refresh found for <code>{pair_addr}</code>"
+
+
+def list_telegram_auto_refresh() -> str:
+    with telegram_refresh_lock:
+        if not telegram_refresh_subscriptions:
+            return "No active auto-refresh watches."
+        lines = []
+        for entry in telegram_refresh_subscriptions.values():
+            wait = max(0, int(entry.get("next_due", 0) - time.time()))
+            lines.append(
+                f"- <code>{entry['pair']}</code> every {entry['interval']}s (next in {wait}s)"
+            )
+    return "Active auto-refresh watches:\n" + "\n".join(lines)
+
+
+def _telegram_refresh_loop():
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram auto-refresh disabled (no credentials)")
+        return
+
+    while not telegram_refresh_stop.wait(TELEGRAM_REFRESH_LOOP_SLEEP):
+        now = time.time()
+        due: List[Tuple[str, dict]] = []
+
+        with telegram_refresh_lock:
+            for key, entry in list(telegram_refresh_subscriptions.items()):
+                next_due = entry.get("next_due", 0)
+                if now >= next_due:
+                    due.append((key, entry.copy()))
+                    entry["next_due"] = now + entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL)
+
+        for key, entry in due:
+            try:
+                data, reason = fetch_dexscreener_data(
+                    entry.get("token", ""), entry.get("pair", ""), with_reason=True
+                )
+                snapshot = _build_refresh_snapshot(data, reason)
+                if _should_emit_refresh(
+                    entry.get("last_snapshot"),
+                    snapshot,
+                    entry.get("last_sent", 0.0),
+                    entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+                ):
+                    send_telegram_message(
+                        _format_refresh_message(
+                            entry.get("pair", ""),
+                            entry.get("token", ""),
+                            snapshot,
+                            entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+                        )
+                    )
+                    with telegram_refresh_lock:
+                        if key in telegram_refresh_subscriptions:
+                            telegram_refresh_subscriptions[key]["last_snapshot"] = snapshot
+                            telegram_refresh_subscriptions[key]["last_sent"] = time.time()
+            except Exception as exc:
+                logger.debug(f"telegram refresh loop error: {exc}")
+
+
+
+
+# ---------------------------------------------------------
 # Telegram command listener (polling): /monitor_on, /monitor_off, /monitor_off_all, /monitor_list
 # ---------------------------------------------------------
 def _telegram_command_listener():
@@ -1326,6 +1601,7 @@ def _telegram_command_listener():
                 parts = text.split()
                 cmd = parts[0].lower()
                 arg = parts[1] if len(parts) > 1 else ""
+                extra = parts[2] if len(parts) > 2 else None
                 if cmd in ("/monitor_on", "/monitoron"):
                     token = _resolve_main_token_from_arg(arg)
                     if not token:
@@ -1352,6 +1628,18 @@ def _telegram_command_listener():
                     else:
                         body = "\n".join(f"- <code>{x}</code>" for x in lst)
                         send_telegram_message(f"Active monitors ({len(lst)}):\n{body}")
+                elif cmd in ("/refresh_on", "/refreshon", "/autorefresh"):
+                    if not arg:
+                        send_telegram_message("Usage: /refresh_on <pair-address> [seconds]")
+                        continue
+                    send_telegram_message(start_telegram_auto_refresh(arg, extra))
+                elif cmd in ("/refresh_off", "/refreshoff"):
+                    if not arg:
+                        send_telegram_message("Usage: /refresh_off <pair-address>")
+                        continue
+                    send_telegram_message(stop_telegram_auto_refresh(arg))
+                elif cmd in ("/refresh_list", "/refreshlist"):
+                    send_telegram_message(list_telegram_auto_refresh())
                 elif cmd in ("/lock_check", "/lockcheck", "/lock_status"):
                     if not arg:
                         send_telegram_message("Usage: /lock_check <pair-address>")
@@ -1366,6 +1654,9 @@ def _telegram_command_listener():
 
 # Start the Telegram command listener in a background thread
 _threading.Thread(target=_telegram_command_listener, daemon=True).start()
+
+# Start the Telegram auto-refresh loop in a background thread
+_threading.Thread(target=_telegram_refresh_loop, daemon=True).start()
 
 ###########################################################
 # 4. FAIL BUFFER
@@ -7132,6 +7423,7 @@ def main():
             log_event(logging.INFO, "shutdown", "KeyboardInterrupt => stopping")
             pair_workers_stop.set()
             maintenance_stop.set()
+            telegram_refresh_stop.set()
             break
         except Exception as e:
             metrics.record_exception()
