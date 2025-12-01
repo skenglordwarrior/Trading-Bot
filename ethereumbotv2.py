@@ -55,6 +55,7 @@ import threading
 from collections import Counter, deque
 from concurrent.futures import Future
 from itertools import cycle, product
+from queue import Queue, Empty, Full
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
@@ -535,6 +536,9 @@ LAST_BLOCK_FILE_V2 = os.path.join(SCRIPT_DIR, "last_block_v2.json")
 LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
 MAIN_LOOP_SLEEP = 2
+PAIR_QUEUE_MAXSIZE = int(os.getenv("PAIR_QUEUE_MAXSIZE", "500"))
+PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
+MAINTENANCE_LOOP_SLEEP = int(os.getenv("MAINTENANCE_LOOP_SLEEP", "2"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -544,6 +548,12 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("trading_bot")
+
+# Shared state coordination
+state_lock = threading.RLock()
+discovered_pairs_queue: "Queue[tuple[str, str, str]]" = Queue(maxsize=PAIR_QUEUE_MAXSIZE)
+pair_workers_stop = threading.Event()
+maintenance_stop = threading.Event()
 
 
 def log_event(
@@ -5685,32 +5695,33 @@ volume_checks: Dict[str, dict] = {}
 def queue_passing_refresh(
     pair_addr: str, token0: str, token1: str, init_mc: float, init_liq: float
 ):
-    if pair_addr not in passing_pairs:
-        passing_pairs[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "attempt_index": 0,
-            "last_attempt": time.time(),
-            "initial_mc": init_mc,
-            "mc_milestones_hit": set(),
-            "silent_active": True,
-            "last_silent_check": time.time(),
-            "last_silent_mc": init_mc,
-            "last_liq_check": time.time(),
-            "last_liquidity": init_liq,
-            "no_new_high_count": 0,
-            # For quick 1-min honeypot check
-            "last_hp_check": 0,
-            # To avoid repeated spam logs
-            "no_more_attempts_logged": False,
-            "lp_supply": get_lp_total_supply(pair_addr),
-            "last_lp_check": time.time(),
-            "last_lp_block": w3_read.eth.block_number,
-            "first_sell_block": w3_read.eth.block_number,
-            "first_sell_detected": False,
-            "verification_retry_at": 0,
-            "verification_warning": False,
-        }
+    with state_lock:
+        if pair_addr not in passing_pairs:
+            passing_pairs[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "attempt_index": 0,
+                "last_attempt": time.time(),
+                "initial_mc": init_mc,
+                "mc_milestones_hit": set(),
+                "silent_active": True,
+                "last_silent_check": time.time(),
+                "last_silent_mc": init_mc,
+                "last_liq_check": time.time(),
+                "last_liquidity": init_liq,
+                "no_new_high_count": 0,
+                # For quick 1-min honeypot check
+                "last_hp_check": 0,
+                # To avoid repeated spam logs
+                "no_more_attempts_logged": False,
+                "lp_supply": get_lp_total_supply(pair_addr),
+                "last_lp_check": time.time(),
+                "last_lp_block": w3_read.eth.block_number,
+                "first_sell_block": w3_read.eth.block_number,
+                "first_sell_detected": False,
+                "verification_retry_at": 0,
+                "verification_warning": False,
+            }
 
 
 def queue_volume_check(
@@ -5723,18 +5734,19 @@ def queue_volume_check(
     is_recheck: bool = False,
     attempt_num: int = None,
 ):
-    if pair_addr not in volume_checks:
-        volume_checks[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "start": time.time(),
-            "last_check": 0,
-            "passes": passes,
-            "total": total,
-            "extra": extra,
-            "is_recheck": is_recheck,
-            "attempt": attempt_num,
-        }
+    with state_lock:
+        if pair_addr not in volume_checks:
+            volume_checks[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "start": time.time(),
+                "last_check": 0,
+                "passes": passes,
+                "total": total,
+                "extra": extra,
+                "is_recheck": is_recheck,
+                "attempt": attempt_num,
+            }
 
 
 def _format_utc_timestamp(ts: int) -> str:
@@ -6027,9 +6039,10 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
 
 
 def check_marketcap_milestones(pair_addr: str, current_mc: float):
-    if pair_addr not in passing_pairs:
-        return
-    info = passing_pairs[pair_addr]
+    with state_lock:
+        if pair_addr not in passing_pairs:
+            return
+        info = passing_pairs[pair_addr]
     init_mc = info["initial_mc"]
     if init_mc <= 0:
         return
@@ -6048,7 +6061,9 @@ def check_marketcap_milestones(pair_addr: str, current_mc: float):
 def handle_passing_refreshes():
     now_ts = time.time()
     remove_list = []
-    for pair, data in list(passing_pairs.items()):
+    with state_lock:
+        items = list(passing_pairs.items())
+    for pair, data in items:
         if not data.get("first_sell_detected"):
             seller = detect_first_sell(
                 pair,
@@ -6267,15 +6282,18 @@ def handle_passing_refreshes():
             ):
                 remove_list.append(pair)
 
-    for rm in remove_list:
-        passing_pairs.pop(rm, None)
-        logger.info(f"[PassingPairs] => removed {rm}")
+    with state_lock:
+        for rm in remove_list:
+            passing_pairs.pop(rm, None)
+            logger.info(f"[PassingPairs] => removed {rm}")
 
 
 def handle_volume_checks():
     now = time.time()
     remove = []
-    for pair, data in list(volume_checks.items()):
+    with state_lock:
+        items = list(volume_checks.items())
+    for pair, data in items:
         if (now - data["last_check"]) >= 5 or (now - data["start"]) >= 300:
             data["last_check"] = now
             ds = fetch_dexscreener_data(data["token0"], pair)
@@ -6311,8 +6329,9 @@ def handle_volume_checks():
                 logger.info(f"[VolumeCheck] {pair} failed to reach targets")
                 remove.append(pair)
 
-    for rm in remove:
-        volume_checks.pop(rm, None)
+    with state_lock:
+        for rm in remove:
+            volume_checks.pop(rm, None)
 
 
 def handle_wallet_updates():
@@ -6388,52 +6407,61 @@ pending_rechecks: Dict[str, dict] = {}
 
 
 def _collect_queue_depth() -> dict:
-    return {
-        "passing_pairs": len(passing_pairs),
-        "volume_checks": len(volume_checks),
-        "pending_rechecks": len(pending_rechecks),
-    }
+    with state_lock:
+        return {
+            "passing_pairs": len(passing_pairs),
+            "volume_checks": len(volume_checks),
+            "pending_rechecks": len(pending_rechecks),
+            "new_pairs": discovered_pairs_queue.qsize(),
+        }
 
 
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
 def queue_recheck(pair_addr: str, token0: str, token1: str):
-    if pair_addr not in pending_rechecks:
-        pending_rechecks[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "attempt_index": 0,
-            "last_attempt": time.time(),
-            "created": time.time(),
-            "fail_count": 0,
-            "verification_retry_at": 0,
-            "verification_warning": False,
-        }
+    with state_lock:
+        if pair_addr not in pending_rechecks:
+            pending_rechecks[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "attempt_index": 0,
+                "last_attempt": time.time(),
+                "created": time.time(),
+                "fail_count": 0,
+                "verification_retry_at": 0,
+                "verification_warning": False,
+            }
 
 
 def handle_rechecks():
     now_ts = time.time()
     rm_list = []
     for pair, data in list(pending_rechecks.items()):
-        idx = data["attempt_index"]
+        with state_lock:
+            idx = data["attempt_index"]
         if idx >= len(RECHECK_DELAYS):
             logger.info(f"[Recheck] => removing {pair}, no more attempts.")
             rm_list.append(pair)
             continue
 
         delay = RECHECK_DELAYS[idx]
-        if (now_ts - data["last_attempt"]) >= delay:
+        with state_lock:
+            last_attempt = data["last_attempt"]
             retry_at = data.get("verification_retry_at", 0)
+        if (now_ts - last_attempt) >= delay:
             if retry_at and now_ts < retry_at:
                 continue
-            data["attempt_index"] += 1
-            data["last_attempt"] = now_ts
-            attempt_num = data["attempt_index"]
+            with state_lock:
+                data["attempt_index"] += 1
+                data["last_attempt"] = now_ts
+                attempt_num = data["attempt_index"]
+                token0 = data["token0"]
+                token1 = data["token1"]
             logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
 
             passes, total, extra = recheck_logic_detail(
-                pair, data["token0"], data["token1"], attempt_num, False
+                pair, token0, token1, attempt_num, False
             )
             if isinstance(extra, dict) and extra.get("dexscreener_missing"):
                 dex_reason = extra.get("dexscreener_reason", "unknown")
@@ -6474,9 +6502,10 @@ def handle_rechecks():
                 rm_list.append(pair)
                 continue
             else:
-                if data.get("verification_warning"):
-                    data["verification_warning"] = False
-                    data["verification_retry_at"] = 0
+                with state_lock:
+                    if data.get("verification_warning"):
+                        data["verification_warning"] = False
+                        data["verification_retry_at"] = 0
             if passes >= MIN_PASS_THRESHOLD:
                 vol_now = extra.get("volume24h", 0)
                 trades_now = extra.get("buys", 0) + extra.get("sells", 0)
@@ -6496,18 +6525,22 @@ def handle_rechecks():
                         recheck_attempt=attempt_num,
                         is_passing_refresh=False,
                     )
-                    queue_passing_refresh(
-                        pair, data["token0"], data["token1"], mc_now, liq_now
-                    )
-                    main_token = get_non_weth_token(data["token0"], data["token1"])
+                    with state_lock:
+                        token0 = data.get("token0")
+                        token1 = data.get("token1")
+                    queue_passing_refresh(pair, token0, token1, mc_now, liq_now)
+                    main_token = get_non_weth_token(token0, token1)
                     start_wallet_monitor(main_token)
                     continue
                 else:
                     logger.info(f"[VolumeCheck] waiting on {pair}")
+                    with state_lock:
+                        token0 = data.get("token0")
+                        token1 = data.get("token1")
                     queue_volume_check(
                         pair,
-                        data["token0"],
-                        data["token1"],
+                        token0,
+                        token1,
                         passes,
                         total,
                         extra,
@@ -6523,8 +6556,10 @@ def handle_rechecks():
                 )
                 if not extra.get("transient_failure"):
                     add_failed_recheck_message(line)
-                    data["fail_count"] = data.get("fail_count", 0) + 1
-                    if data["fail_count"] >= 3:
+                    with state_lock:
+                        data["fail_count"] = data.get("fail_count", 0) + 1
+                        fail_count = data["fail_count"]
+                    if fail_count >= 3:
                         logger.info(f"[Recheck] => removing {pair}, failed 3 times")
                         rm_list.append(pair)
                         continue
@@ -6534,13 +6569,15 @@ def handle_rechecks():
                     )
 
         # stop after 10 minutes of failures
-        elapsed = now_ts - data.get("created", data["last_attempt"])
+        with state_lock:
+            elapsed = now_ts - data.get("created", data["last_attempt"])
         if elapsed >= 600:
             logger.info(f"[Recheck] => removing {pair}, failed after 10m")
             rm_list.append(pair)
 
     for r in rm_list:
-        pending_rechecks.pop(r, None)
+        with state_lock:
+            pending_rechecks.pop(r, None)
         logger.info(f"[Recheck] => removed {r}")
 
 
@@ -6628,18 +6665,19 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
         token1 = to_checksum_address(token1)
         paddr_display = paddr
         lower_addr = paddr.lower()
-        if lower_addr in SEEN_PAIRS:
-            log_event(
-                logging.INFO,
-                "skip_pair",
-                f"{paddr} already processed, skipping",
-                pair=paddr,
-                context={"reason": "already_processed"},
-            )
-            return
-        SEEN_PAIRS.add(lower_addr)
-        detected_at[paddr.lower()] = time.time()
-        known_pairs[paddr.lower()] = (token0, token1)
+        with state_lock:
+            if lower_addr in SEEN_PAIRS:
+                log_event(
+                    logging.INFO,
+                    "skip_pair",
+                    f"{paddr} already processed, skipping",
+                    pair=paddr,
+                    context={"reason": "already_processed"},
+                )
+                return
+            SEEN_PAIRS.add(lower_addr)
+            detected_at[paddr.lower()] = time.time()
+            known_pairs[paddr.lower()] = (token0, token1)
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
         outcome_context.update({"passes": passes, "total": total})
@@ -6836,8 +6874,84 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
 
 ###########################################################
-# 13. OPTIONAL REPORTS
+# 13. PIPELINES & OPTIONAL REPORTS
 ###########################################################
+
+
+def enqueue_discovered_pair(pair_addr: str, token0: str, token1: str) -> None:
+    """Push a discovered pair into the processing queue without blocking ingestion."""
+
+    try:
+        discovered_pairs_queue.put_nowait((pair_addr, token0, token1))
+    except Full:
+        log_event(
+            logging.WARNING,
+            "ingestion_backpressure",
+            "Discovered pair queue full; dropping pair",
+            pair=pair_addr,
+            context={"queue_depth": discovered_pairs_queue.qsize()},
+        )
+
+
+def _pair_worker_loop(worker_id: int) -> None:
+    """Background worker that drains the discovered pair queue."""
+
+    while not pair_workers_stop.is_set():
+        try:
+            pair_addr, token0, token1 = discovered_pairs_queue.get(timeout=1)
+        except Empty:
+            continue
+        start = time.perf_counter()
+        try:
+            handle_new_pair(pair_addr, token0, token1)
+        finally:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            log_event(
+                logging.DEBUG,
+                "pair_worker",
+                "Processed discovered pair",
+                pair=pair_addr,
+                latency_ms=duration_ms,
+                context={
+                    "worker_id": worker_id,
+                    "queue_depth": discovered_pairs_queue.qsize(),
+                },
+            )
+            discovered_pairs_queue.task_done()
+
+
+def start_pair_workers() -> None:
+    for idx in range(PAIR_WORKER_COUNT):
+        t = threading.Thread(target=_pair_worker_loop, args=(idx,), daemon=True)
+        t.start()
+
+
+def maintenance_loop() -> None:
+    while not maintenance_stop.wait(MAINTENANCE_LOOP_SLEEP):
+        loop_start = time.perf_counter()
+        try:
+            handle_rechecks()
+            handle_volume_checks()
+            handle_passing_refreshes()
+            handle_wallet_updates()
+            maybe_flush_failed_rechecks()
+        except Exception as exc:
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "maintenance_loop_error",
+                "Maintenance loop error",
+                error=str(exc),
+            )
+        else:
+            duration_ms = round((time.perf_counter() - loop_start) * 1000, 2)
+            log_event(
+                logging.DEBUG,
+                "maintenance_loop",
+                "Completed maintenance sweep",
+                latency_ms=duration_ms,
+                context={"queue_depth": _collect_queue_depth()},
+            )
 
 _last_daily_date = None
 _last_weekly_date = None
@@ -6874,6 +6988,8 @@ def main():
     ensure_etherscan_connectivity()
     if runtime_reporter is None:
         runtime_reporter = RuntimeReporter(metrics)
+    start_pair_workers()
+    threading.Thread(target=maintenance_loop, daemon=True).start()
     send_telegram_message(
         "🤖 Ethereum bot v2 online and scanning for fresh Ethereum pairs."
     )
@@ -6906,6 +7022,8 @@ def main():
             if curr_block_v2 > last_block_v2:
                 from_blk = last_block_v2 + 1
                 to_blk = curr_block_v2
+                ingest_start = time.perf_counter()
+                enqueued = 0
 
                 filter_params = {
                     "fromBlock": from_blk,
@@ -6928,7 +7046,8 @@ def main():
                     raw_bytes = bytes.fromhex(data_field)
                     try:
                         pair_addr, _ = decode(["address", "uint256"], raw_bytes)
-                        handle_new_pair(pair_addr, token0_hex, token1_hex)
+                        enqueue_discovered_pair(pair_addr, token0_hex, token1_hex)
+                        enqueued += 1
                     except Exception as e:
                         tb = traceback.extract_tb(e.__traceback__)
                         line = tb[-1].lineno if tb else 'unknown'
@@ -6938,6 +7057,7 @@ def main():
 
                 last_block_v2 = to_blk
                 save_last_block(last_block_v2, LAST_BLOCK_FILE_V2)
+                duration_ms = round((time.perf_counter() - ingest_start) * 1000, 2)
                 log_event(
                     logging.INFO,
                     "blocks_processed",
@@ -6947,6 +7067,9 @@ def main():
                         "from_block": from_blk,
                         "to_block": to_blk,
                         "pairs_found": len(logs),
+                        "enqueued": enqueued,
+                        "duration_ms": duration_ms,
+                        "queue_depth": discovered_pairs_queue.qsize(),
                     },
                 )
 
@@ -6954,6 +7077,8 @@ def main():
             if curr_block_v3 > last_block_v3:
                 from_blk = last_block_v3 + 1
                 to_blk = curr_block_v3
+                ingest_start = time.perf_counter()
+                enqueued = 0
 
                 filter_params = {
                     "fromBlock": from_blk,
@@ -6976,7 +7101,8 @@ def main():
                     raw_bytes = bytes.fromhex(data_field)
                     try:
                         _, pool_addr = decode(["int24", "address"], raw_bytes)
-                        handle_new_pair(pool_addr, token0_hex, token1_hex)
+                        enqueue_discovered_pair(pool_addr, token0_hex, token1_hex)
+                        enqueued += 1
                     except Exception as e:
                         tb = traceback.extract_tb(e.__traceback__)
                         line = tb[-1].lineno if tb else 'unknown'
@@ -6986,6 +7112,7 @@ def main():
 
                 last_block_v3 = to_blk
                 save_last_block(last_block_v3, LAST_BLOCK_FILE_V3)
+                duration_ms = round((time.perf_counter() - ingest_start) * 1000, 2)
                 log_event(
                     logging.INFO,
                     "blocks_processed",
@@ -6995,26 +7122,16 @@ def main():
                         "from_block": from_blk,
                         "to_block": to_blk,
                         "pairs_found": len(logs),
+                        "enqueued": enqueued,
+                        "duration_ms": duration_ms,
+                        "queue_depth": discovered_pairs_queue.qsize(),
                     },
                 )
 
-            # handle failing rechecks
-            handle_rechecks()
-
-            # check volume milestones for pending pairs
-            handle_volume_checks()
-
-            # handle passing refresh
-            handle_passing_refreshes()
-
-            # update wallet reports
-            handle_wallet_updates()
-
-            # flush fail buffer
-            maybe_flush_failed_rechecks()
-
         except KeyboardInterrupt:
             log_event(logging.INFO, "shutdown", "KeyboardInterrupt => stopping")
+            pair_workers_stop.set()
+            maintenance_stop.set()
             break
         except Exception as e:
             metrics.record_exception()
