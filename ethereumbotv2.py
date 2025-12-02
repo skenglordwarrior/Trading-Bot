@@ -55,6 +55,7 @@ import threading
 from collections import Counter, deque
 from concurrent.futures import Future
 from itertools import cycle, product
+from queue import Queue, Empty, Full
 # Ensure local imports work even when script executed from a different directory
 import sys
 from pathlib import Path
@@ -235,6 +236,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-4895948667")
 TELEGRAM_BASE_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 )
+TELEGRAM_REFRESH_DEFAULT_INTERVAL = int(
+    os.getenv("TELEGRAM_REFRESH_DEFAULT_INTERVAL", "45")
+)
+TELEGRAM_REFRESH_MIN_INTERVAL = int(os.getenv("TELEGRAM_REFRESH_MIN_INTERVAL", "20"))
+TELEGRAM_REFRESH_MAX = int(os.getenv("TELEGRAM_REFRESH_MAX", "6"))
+TELEGRAM_REFRESH_CHANGE_THRESHOLD = float(
+    os.getenv("TELEGRAM_REFRESH_CHANGE_THRESHOLD", "0.5")
+)
+TELEGRAM_REFRESH_LOOP_SLEEP = float(os.getenv("TELEGRAM_REFRESH_LOOP_SLEEP", "2.0"))
 
 # The Graph configuration
 GRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/EYCKATKGBKLWvSfwvBjzfCBmGwYNdVkduYXVivCsLR"
@@ -535,6 +545,9 @@ LAST_BLOCK_FILE_V2 = os.path.join(SCRIPT_DIR, "last_block_v2.json")
 LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
 MAIN_LOOP_SLEEP = 2
+PAIR_QUEUE_MAXSIZE = int(os.getenv("PAIR_QUEUE_MAXSIZE", "500"))
+PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
+MAINTENANCE_LOOP_SLEEP = int(os.getenv("MAINTENANCE_LOOP_SLEEP", "2"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -544,6 +557,15 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("trading_bot")
+
+# Shared state coordination
+state_lock = threading.RLock()
+discovered_pairs_queue: "Queue[tuple[str, str, str]]" = Queue(maxsize=PAIR_QUEUE_MAXSIZE)
+pair_workers_stop = threading.Event()
+maintenance_stop = threading.Event()
+telegram_refresh_stop = threading.Event()
+telegram_refresh_lock = threading.RLock()
+telegram_refresh_subscriptions: Dict[str, dict] = {}
 
 
 def log_event(
@@ -605,7 +627,7 @@ class MetricsCollector:
         self.stop_event = threading.Event()
         self.event_history = {name: deque() for name in ("pairs_scanned", "passes")}
         self.daily_totals: Counter = Counter()
-        self.daily_period_start = datetime.utcnow().replace(
+        self.daily_period_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         threading.Thread(target=self._emit_loop, daemon=True).start()
@@ -738,12 +760,18 @@ class MetricsCollector:
             return {}
         return dict(data)
 
-    def snapshot_daily_totals(self) -> Tuple[datetime, Dict[str, int]]:
+    def snapshot_daily_totals(
+        self, reference: Optional[datetime] = None
+    ) -> Tuple[datetime, Dict[str, int]]:
+        ref = reference or datetime.now(timezone.utc)
+        next_period_start = datetime.combine(
+            ref.date(), datetime.min.time(), tzinfo=timezone.utc
+        )
         with self.lock:
             period_start = self.daily_period_start
             totals = dict(self.daily_totals)
             self.daily_totals = Counter()
-            self.daily_period_start = datetime.utcnow()
+            self.daily_period_start = next_period_start
             return period_start, totals
 
 
@@ -759,19 +787,19 @@ class RuntimeReporter:
 
     @staticmethod
     def _next_hour_boundary(reference: Optional[datetime] = None) -> datetime:
-        ref = reference or datetime.utcnow()
+        ref = reference or datetime.now(timezone.utc)
         truncated = ref.replace(minute=0, second=0, microsecond=0)
         return truncated + timedelta(hours=1)
 
     @staticmethod
     def _next_midnight_boundary(reference: Optional[datetime] = None) -> datetime:
-        ref = reference or datetime.utcnow()
+        ref = reference or datetime.now(timezone.utc)
         tomorrow = (ref + timedelta(days=1)).date()
-        return datetime.combine(tomorrow, datetime.min.time())
+        return datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc)
 
     def _run(self) -> None:
         while not self.stop_event.wait(30):
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if now >= self.next_hour:
                 try:
                     self.send_hourly_update(now)
@@ -800,7 +828,7 @@ class RuntimeReporter:
         send_telegram_message(msg)
 
     def send_daily_summary(self, now: datetime) -> None:
-        period_start, totals = self.metrics.snapshot_daily_totals()
+        period_start, totals = self.metrics.snapshot_daily_totals(now)
         period_label = period_start.date().isoformat()
         msg = (
             "🗓️ Daily summary\n"
@@ -855,7 +883,7 @@ def store_pair_record(
     """Persist a snapshot of pair evaluation results to the Excel history file."""
 
     extra = extra or {}
-    detected_at = datetime.utcnow().replace(microsecond=0).isoformat()
+    detected_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     liquidity = extra.get("liquidityUsd") or extra.get("liquidity")
     volume = extra.get("volume24h") or extra.get("volume")
     marketcap = extra.get("marketCap") or extra.get("marketcap")
@@ -1246,34 +1274,118 @@ def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
 # 3. TELEGRAM
 ###########################################################
 
-async def async_send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+async def async_send_telegram_message(
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+    return_payload: bool = False,
+) -> Union[bool, dict]:
     """Send a message to Telegram asynchronously."""
     if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
         return False
     url = f"{TELEGRAM_BASE_URL}/sendMessage"
-    data = {
+    data: Dict[str, Union[str, int]] = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        async with create_aiohttp_session() as session:
+            async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
+                payload = await resp.json()
+                if return_payload:
+                    return payload
+                return bool(payload.get("ok"))
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+        return False
+
+
+async def async_edit_telegram_message(
+    message_id: int,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Edit a Telegram message asynchronously."""
+
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        return False
+
+    url = f"{TELEGRAM_BASE_URL}/editMessageText"
+    data: Dict[str, Union[str, int]] = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+
     try:
         async with create_aiohttp_session() as session:
             async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
                 payload = await resp.json()
                 return bool(payload.get("ok"))
     except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
+        logger.error(f"Telegram edit failed: {e}")
         return False
 
-def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+
+def send_telegram_message(
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+    return_payload: bool = False,
+) -> Union[bool, dict]:
     """Safe to call from inside or outside an event loop."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(async_send_telegram_message(text, parse_mode))
+        return asyncio.run(
+            async_send_telegram_message(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                return_payload=return_payload,
+            )
+        )
     else:
-        loop.create_task(async_send_telegram_message(text, parse_mode))
+        coro = async_send_telegram_message(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            return_payload=return_payload,
+        )
+        loop.create_task(coro)
+        return True
+
+
+def edit_telegram_message(
+    message_id: int,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Safe wrapper around Telegram editMessageText."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            async_edit_telegram_message(
+                message_id, text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+        )
+    else:
+        loop.create_task(
+            async_edit_telegram_message(
+                message_id, text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+        )
         return True
 
 # Wire wallet tracker notifications to Telegram (Patch A)
@@ -1281,6 +1393,471 @@ try:
     set_notifier(send_telegram_message, async_send_telegram_message)
 except Exception:
     pass
+
+
+
+
+# ---------------------------------------------------------
+# Telegram auto-refresh helpers
+# ---------------------------------------------------------
+
+
+def _normalize_refresh_interval_seconds(interval: Optional[str]) -> int:
+    try:
+        seconds = int(interval) if interval else TELEGRAM_REFRESH_DEFAULT_INTERVAL
+    except (TypeError, ValueError):
+        seconds = TELEGRAM_REFRESH_DEFAULT_INTERVAL
+    return max(TELEGRAM_REFRESH_MIN_INTERVAL, seconds)
+
+
+def _resolve_refresh_addresses(arg: str) -> Tuple[Optional[str], Optional[str]]:
+    """Attempt to derive a pair+token tuple from user input."""
+
+    if not arg:
+        return None, None
+    cleaned = arg.strip()
+    cleaned_low = cleaned.lower()
+    pair_addr = None
+    token_addr = None
+
+    if cleaned_low.startswith("0x") and len(cleaned_low) == 42:
+        if cleaned_low in known_pairs:
+            token0, token1 = known_pairs[cleaned_low]
+            pair_addr = cleaned
+            try:
+                token_addr = get_non_weth_token(token0, token1)
+            except Exception:
+                token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+        else:
+            pair_addr = cleaned
+            token_addr = cleaned
+            for paddr, (token0, token1) in list(known_pairs.items()):
+                if cleaned_low in {token0.lower(), token1.lower()}:
+                    pair_addr = paddr
+                    try:
+                        token_addr = get_non_weth_token(token0, token1)
+                    except Exception:
+                        token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+                    break
+
+    if pair_addr is None:
+        for paddr, (token0, token1) in list(known_pairs.items()):
+            if paddr.lower().startswith(cleaned_low) or paddr.lower().endswith(cleaned_low):
+                pair_addr = paddr
+                try:
+                    token_addr = get_non_weth_token(token0, token1)
+                except Exception:
+                    token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
+                break
+
+    return pair_addr, token_addr
+
+
+def _build_refresh_snapshot(data: Optional[dict], reason: Optional[str]) -> dict:
+    snapshot = {
+        "price": None,
+        "liq": None,
+        "mc": None,
+        "vol": None,
+        "buys": None,
+        "sells": None,
+        "locked": None,
+        "lock_details": None,
+        "dex_paid": False,
+        "reason": reason or "ok",
+    }
+
+    if data:
+        snapshot.update(
+            {
+                "price": float(data.get("priceUsd", 0) or 0),
+                "liq": float(data.get("liquidityUsd", 0) or 0),
+                "mc": float(data.get("marketCap") or data.get("fdv") or 0),
+                "vol": float(data.get("volume24h", 0) or 0),
+                "buys": int(data.get("buys", 0) or 0),
+                "sells": int(data.get("sells", 0) or 0),
+                "locked": data.get("lockedLiquidity"),
+                "lock_details": data.get("lockedLiquidityDetails"),
+                "dex_paid": bool(data.get("dexPaid", False)),
+                "reason": "ok" if not reason else reason,
+            }
+        )
+
+    return snapshot
+
+
+def _refresh_delta_exceeds(prev: Optional[float], curr: Optional[float], threshold: float) -> bool:
+    if prev is None or curr is None:
+        return True
+    if prev == 0:
+        return curr != 0
+    return abs((curr - prev) / prev) * 100 >= threshold
+
+
+def _should_emit_refresh(
+    prev_snapshot: Optional[dict],
+    snapshot: dict,
+    last_sent: float,
+    interval: int,
+) -> bool:
+    if prev_snapshot is None:
+        return True
+
+    heartbeat_after = max(interval * 3, 180)
+    if last_sent and time.time() - last_sent >= heartbeat_after:
+        return True
+
+    if prev_snapshot.get("reason") != snapshot.get("reason"):
+        return True
+
+    for key in ("price", "mc", "liq", "vol"):
+        if _refresh_delta_exceeds(prev_snapshot.get(key), snapshot.get(key), TELEGRAM_REFRESH_CHANGE_THRESHOLD):
+            return True
+
+    if prev_snapshot.get("buys") != snapshot.get("buys"):
+        return True
+    if prev_snapshot.get("sells") != snapshot.get("sells"):
+        return True
+    if prev_snapshot.get("locked") != snapshot.get("locked"):
+        return True
+
+    return False
+
+
+def _format_refresh_message(
+    pair_addr: str,
+    token_addr: str,
+    snapshot: dict,
+    interval: int,
+    paused: bool = False,
+) -> str:
+    def _fmt_money(val: Optional[float]) -> str:
+        if val is None:
+            return "?"
+        if val >= 1:
+            return f"${val:,.0f}"
+        return f"${val:.6f}"
+
+    status = "⏸ Auto-refresh paused" if paused else f"📡 Auto-refresh every {interval}s"
+    header = f"<b>{status}</b> — <code>{pair_addr}</code>"
+    token_line = f"Token: <code>{token_addr}</code> • interval {interval}s"
+
+    if snapshot.get("reason") != "ok" and snapshot.get("price") in (None, 0):
+        body_lines = [f"DexScreener: {snapshot.get('reason') or 'unavailable'}"]
+    else:
+        price = snapshot.get("price") or 0
+        liq = snapshot.get("liq")
+        mc = snapshot.get("mc")
+        vol = snapshot.get("vol")
+        buys = snapshot.get("buys")
+        sells = snapshot.get("sells")
+        lock_flag = snapshot.get("locked")
+        lock_tag = "🔒 Locked" if lock_flag else "🔓 Unlockable"
+        lock_detail = snapshot.get("lock_details") or {}
+        if lock_detail:
+            pct = lock_detail.get("coverage_pct")
+            if pct:
+                lock_tag = f"{lock_tag} ({pct*100:.1f}% locked)"
+        paid_tag = " • 🔥 Paid/Trending" if snapshot.get("dex_paid") else ""
+
+        body_lines = [
+            f"Price: ${price:.8f}",
+            f"Liq: {_fmt_money(liq)} | MC: {_fmt_money(mc)}{paid_tag}",
+            f"Vol24h: {_fmt_money(vol)} | Tx24h: {buys}/{sells}",
+            lock_tag,
+        ]
+
+    return "\n".join([header, token_line, *body_lines])
+
+
+def _build_refresh_keyboard(entry: dict) -> dict:
+    pair_addr = entry.get("pair", "")
+    paused = entry.get("paused", False)
+    toggle_label = "▶️ Start auto" if paused else "⏸ Pause auto"
+    return {
+        "inline_keyboard": [
+            [{"text": "🔄 Refresh now", "callback_data": f"refresh:{pair_addr}"}],
+            [{"text": toggle_label, "callback_data": f"toggle:{pair_addr}"}],
+            [{"text": "🛑 Stop", "callback_data": f"stop:{pair_addr}"}],
+        ]
+    }
+
+
+def _upsert_refresh_message(key: str, entry: dict, snapshot: dict) -> bool:
+    reply_markup = _build_refresh_keyboard(entry)
+    text = _format_refresh_message(
+        entry.get("pair", ""),
+        entry.get("token", ""),
+        snapshot,
+        entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+        paused=entry.get("paused", False),
+    )
+
+    msg_id = entry.get("message_id")
+    if msg_id:
+        return bool(
+            edit_telegram_message(
+                msg_id, text, reply_markup=reply_markup, parse_mode="HTML"
+            )
+        )
+
+    payload = send_telegram_message(
+        text, reply_markup=reply_markup, return_payload=True, parse_mode="HTML"
+    )
+    if isinstance(payload, dict) and payload.get("ok"):
+        result = payload.get("result") or {}
+        new_id = result.get("message_id")
+        if new_id:
+            entry["message_id"] = new_id
+        return True
+    return False
+
+
+def _run_refresh_cycle(key: str, entry: dict, force_emit: bool = False) -> None:
+    if entry.get("paused") and not force_emit:
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["next_due"] = time.time() + entry.get(
+                    "interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL
+                )
+        return
+
+    try:
+        data, reason = fetch_dexscreener_data(
+            entry.get("token", ""), entry.get("pair", ""), with_reason=True
+        )
+        snapshot = _build_refresh_snapshot(data, reason)
+        should_emit = force_emit or _should_emit_refresh(
+            entry.get("last_snapshot"),
+            snapshot,
+            entry.get("last_sent", 0.0),
+            entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+        )
+
+        if should_emit and _upsert_refresh_message(key, entry, snapshot):
+            with telegram_refresh_lock:
+                if key in telegram_refresh_subscriptions:
+                    telegram_refresh_subscriptions[key].update(
+                        {
+                            "last_snapshot": snapshot,
+                            "last_sent": time.time(),
+                            "message_id": entry.get("message_id") or telegram_refresh_subscriptions[
+                                key
+                            ].get("message_id"),
+                        }
+                    )
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["next_due"] = time.time() + entry.get(
+                    "interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL
+                )
+    except Exception as exc:
+        logger.debug(f"telegram refresh loop error: {exc}")
+
+
+def _answer_callback_query(callback_id: str, text: Optional[str] = None) -> None:
+    if not TELEGRAM_BASE_URL:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_BASE_URL}/answerCallbackQuery",
+            data={"callback_query_id": callback_id, "text": text or ""},
+            timeout=FETCH_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.debug(f"telegram callback ack error: {exc}")
+
+
+def _handle_refresh_callback(cb: dict) -> None:
+    data = cb.get("data") or ""
+    callback_id = cb.get("id")
+
+    if not data or ":" not in data:
+        if callback_id:
+            _answer_callback_query(callback_id)
+        return
+
+    action, pair_addr = data.split(":", 1)
+    key = pair_addr.lower()
+
+    if action not in {"refresh", "toggle", "stop"}:
+        if callback_id:
+            _answer_callback_query(callback_id)
+        return
+
+    with telegram_refresh_lock:
+        entry = telegram_refresh_subscriptions.get(key)
+        entry_copy = entry.copy() if entry else None
+
+    if not entry_copy:
+        if callback_id:
+            _answer_callback_query(callback_id, "Not tracked")
+        return
+
+    if action == "refresh":
+        if callback_id:
+            _answer_callback_query(callback_id, "Refreshing…")
+        _run_refresh_cycle(key, entry_copy, force_emit=True)
+        return
+
+    if action == "toggle":
+        new_paused = not entry_copy.get("paused")
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["paused"] = new_paused
+                telegram_refresh_subscriptions[key]["next_due"] = time.time()
+                entry_copy = telegram_refresh_subscriptions[key].copy()
+        if callback_id:
+            _answer_callback_query(callback_id, "Paused" if new_paused else "Resumed")
+        if new_paused:
+            snapshot = entry_copy.get("last_snapshot") or _build_refresh_snapshot(
+                None, "Auto-refresh paused"
+            )
+            _upsert_refresh_message(key, entry_copy, snapshot)
+        else:
+            _run_refresh_cycle(key, entry_copy, force_emit=True)
+        return
+
+    if action == "stop":
+        with telegram_refresh_lock:
+            msg_id = entry_copy.get("message_id")
+        if callback_id:
+            _answer_callback_query(callback_id, "Stopped")
+        stop_telegram_auto_refresh(pair_addr)
+        if msg_id:
+            edit_telegram_message(
+                msg_id,
+                f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>",
+                reply_markup={"inline_keyboard": []},
+            )
+
+
+def start_telegram_auto_refresh(arg: str, interval: Optional[str] = None) -> str:
+    pair_addr, token_addr = _resolve_refresh_addresses(arg)
+    if not pair_addr:
+        return "Usage: /refresh_on <pair-address> [seconds]"
+
+    interval_seconds = _normalize_refresh_interval_seconds(interval)
+    key = pair_addr.lower()
+    token_addr = token_addr or pair_addr
+
+    with telegram_refresh_lock:
+        if key not in telegram_refresh_subscriptions and len(telegram_refresh_subscriptions) >= TELEGRAM_REFRESH_MAX:
+            return f"⚠️ Maximum of {TELEGRAM_REFRESH_MAX} auto-refresh slots in use."
+
+        telegram_refresh_subscriptions[key] = {
+            "pair": pair_addr,
+            "token": token_addr,
+            "interval": interval_seconds,
+            "next_due": time.time(),
+            "last_snapshot": telegram_refresh_subscriptions.get(key, {}).get("last_snapshot"),
+            "last_sent": telegram_refresh_subscriptions.get(key, {}).get("last_sent", 0.0),
+            "message_id": telegram_refresh_subscriptions.get(key, {}).get("message_id"),
+            "paused": False,
+        }
+
+    return (
+        f"📡 Auto-refresh enabled for <code>{pair_addr}</code> "
+        f"every {interval_seconds}s"
+    )
+
+
+def stop_telegram_auto_refresh(arg: str) -> str:
+    pair_addr, _ = _resolve_refresh_addresses(arg)
+    if not pair_addr:
+        return "Usage: /refresh_off <pair-address>"
+
+    removed = False
+    msg_id = None
+    with telegram_refresh_lock:
+        existing = telegram_refresh_subscriptions.pop(pair_addr.lower(), None)
+        if existing:
+            removed = True
+            msg_id = existing.get("message_id")
+    if removed:
+        if msg_id:
+            edit_telegram_message(
+                msg_id,
+                f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>",
+                reply_markup={"inline_keyboard": []},
+            )
+        return f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>"
+    return f"ℹ️ No auto-refresh found for <code>{pair_addr}</code>"
+
+
+def list_telegram_auto_refresh() -> str:
+    with telegram_refresh_lock:
+        if not telegram_refresh_subscriptions:
+            return "No active auto-refresh watches."
+        lines = []
+        for entry in telegram_refresh_subscriptions.values():
+            wait = max(0, int(entry.get("next_due", 0) - time.time()))
+            state = "paused" if entry.get("paused") else "running"
+            lines.append(
+                f"- <code>{entry['pair']}</code> every {entry['interval']}s "
+                f"({state}, next in {wait}s)"
+            )
+    return "Active auto-refresh watches:\n" + "\n".join(lines)
+
+
+def _auto_subscribe_passing_pair(pair_addr: str, token0: str, token1: str) -> None:
+    """Ensure a passing pair has a Telegram auto-refresh slot if capacity allows."""
+
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        token_addr = get_non_weth_token(token0, token1)
+    except Exception:
+        token_addr = token0
+
+    key = pair_addr.lower()
+    added = False
+    with telegram_refresh_lock:
+        if key in telegram_refresh_subscriptions:
+            return
+        if len(telegram_refresh_subscriptions) >= TELEGRAM_REFRESH_MAX:
+            logger.debug(
+                f"auto-refresh skipped for {pair_addr}: subscription limit reached"
+            )
+            return
+        telegram_refresh_subscriptions[key] = {
+            "pair": pair_addr,
+            "token": token_addr or pair_addr,
+            "interval": TELEGRAM_REFRESH_DEFAULT_INTERVAL,
+            "next_due": time.time(),
+            "last_snapshot": None,
+            "last_sent": 0.0,
+            "message_id": None,
+            "paused": False,
+        }
+        added = True
+
+    if added:
+        send_telegram_message(
+            f"📡 Auto-refresh enabled for passing pair <code>{pair_addr}</code>"
+        )
+        logger.info(f"[AutoRefresh] Enabled for passing pair {pair_addr}")
+
+
+def _telegram_refresh_loop():
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram auto-refresh disabled (no credentials)")
+        return
+
+    while not telegram_refresh_stop.wait(TELEGRAM_REFRESH_LOOP_SLEEP):
+        now = time.time()
+        due: List[Tuple[str, dict]] = []
+
+        with telegram_refresh_lock:
+            for key, entry in list(telegram_refresh_subscriptions.items()):
+                next_due = entry.get("next_due", 0)
+                if now >= next_due:
+                    due.append((key, entry.copy()))
+                    entry["next_due"] = now + entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL)
+
+        for key, entry in due:
+            _run_refresh_cycle(key, entry)
 
 
 
@@ -1305,6 +1882,9 @@ def _telegram_command_listener():
             data = resp.json() if resp.ok else {}
             for upd in data.get("result", []):
                 offset = upd.get("update_id", 0) + 1
+                if upd.get("callback_query"):
+                    _handle_refresh_callback(upd.get("callback_query") or {})
+                    continue
                 msg = upd.get("message") or upd.get("edited_message") or {}
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 # Restrict to configured chat unless left blank
@@ -1316,6 +1896,7 @@ def _telegram_command_listener():
                 parts = text.split()
                 cmd = parts[0].lower()
                 arg = parts[1] if len(parts) > 1 else ""
+                extra = parts[2] if len(parts) > 2 else None
                 if cmd in ("/monitor_on", "/monitoron"):
                     token = _resolve_main_token_from_arg(arg)
                     if not token:
@@ -1342,6 +1923,18 @@ def _telegram_command_listener():
                     else:
                         body = "\n".join(f"- <code>{x}</code>" for x in lst)
                         send_telegram_message(f"Active monitors ({len(lst)}):\n{body}")
+                elif cmd in ("/refresh_on", "/refreshon", "/autorefresh"):
+                    if not arg:
+                        send_telegram_message("Usage: /refresh_on <pair-address> [seconds]")
+                        continue
+                    send_telegram_message(start_telegram_auto_refresh(arg, extra))
+                elif cmd in ("/refresh_off", "/refreshoff"):
+                    if not arg:
+                        send_telegram_message("Usage: /refresh_off <pair-address>")
+                        continue
+                    send_telegram_message(stop_telegram_auto_refresh(arg))
+                elif cmd in ("/refresh_list", "/refreshlist"):
+                    send_telegram_message(list_telegram_auto_refresh())
                 elif cmd in ("/lock_check", "/lockcheck", "/lock_status"):
                     if not arg:
                         send_telegram_message("Usage: /lock_check <pair-address>")
@@ -1356,6 +1949,9 @@ def _telegram_command_listener():
 
 # Start the Telegram command listener in a background thread
 _threading.Thread(target=_telegram_command_listener, daemon=True).start()
+
+# Start the Telegram auto-refresh loop in a background thread
+_threading.Thread(target=_telegram_refresh_loop, daemon=True).start()
 
 ###########################################################
 # 4. FAIL BUFFER
@@ -5685,32 +6281,38 @@ volume_checks: Dict[str, dict] = {}
 def queue_passing_refresh(
     pair_addr: str, token0: str, token1: str, init_mc: float, init_liq: float
 ):
-    if pair_addr not in passing_pairs:
-        passing_pairs[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "attempt_index": 0,
-            "last_attempt": time.time(),
-            "initial_mc": init_mc,
-            "mc_milestones_hit": set(),
-            "silent_active": True,
-            "last_silent_check": time.time(),
-            "last_silent_mc": init_mc,
-            "last_liq_check": time.time(),
-            "last_liquidity": init_liq,
-            "no_new_high_count": 0,
-            # For quick 1-min honeypot check
-            "last_hp_check": 0,
-            # To avoid repeated spam logs
-            "no_more_attempts_logged": False,
-            "lp_supply": get_lp_total_supply(pair_addr),
-            "last_lp_check": time.time(),
-            "last_lp_block": w3_read.eth.block_number,
-            "first_sell_block": w3_read.eth.block_number,
-            "first_sell_detected": False,
-            "verification_retry_at": 0,
-            "verification_warning": False,
-        }
+    auto_refresh_added = False
+    with state_lock:
+        if pair_addr not in passing_pairs:
+            passing_pairs[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "attempt_index": 0,
+                "last_attempt": time.time(),
+                "initial_mc": init_mc,
+                "mc_milestones_hit": set(),
+                "silent_active": True,
+                "last_silent_check": time.time(),
+                "last_silent_mc": init_mc,
+                "last_liq_check": time.time(),
+                "last_liquidity": init_liq,
+                "no_new_high_count": 0,
+                # For quick 1-min honeypot check
+                "last_hp_check": 0,
+                # To avoid repeated spam logs
+                "no_more_attempts_logged": False,
+                "lp_supply": get_lp_total_supply(pair_addr),
+                "last_lp_check": time.time(),
+                "last_lp_block": w3_read.eth.block_number,
+                "first_sell_block": w3_read.eth.block_number,
+                "first_sell_detected": False,
+                "verification_retry_at": 0,
+                "verification_warning": False,
+            }
+            auto_refresh_added = True
+
+    if auto_refresh_added:
+        _auto_subscribe_passing_pair(pair_addr, token0, token1)
 
 
 def queue_volume_check(
@@ -5723,18 +6325,19 @@ def queue_volume_check(
     is_recheck: bool = False,
     attempt_num: int = None,
 ):
-    if pair_addr not in volume_checks:
-        volume_checks[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "start": time.time(),
-            "last_check": 0,
-            "passes": passes,
-            "total": total,
-            "extra": extra,
-            "is_recheck": is_recheck,
-            "attempt": attempt_num,
-        }
+    with state_lock:
+        if pair_addr not in volume_checks:
+            volume_checks[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "start": time.time(),
+                "last_check": 0,
+                "passes": passes,
+                "total": total,
+                "extra": extra,
+                "is_recheck": is_recheck,
+                "attempt": attempt_num,
+            }
 
 
 def _format_utc_timestamp(ts: int) -> str:
@@ -6027,9 +6630,10 @@ def evaluate_fail_reasons(extra: Dict) -> List[str]:
 
 
 def check_marketcap_milestones(pair_addr: str, current_mc: float):
-    if pair_addr not in passing_pairs:
-        return
-    info = passing_pairs[pair_addr]
+    with state_lock:
+        if pair_addr not in passing_pairs:
+            return
+        info = passing_pairs[pair_addr]
     init_mc = info["initial_mc"]
     if init_mc <= 0:
         return
@@ -6048,7 +6652,9 @@ def check_marketcap_milestones(pair_addr: str, current_mc: float):
 def handle_passing_refreshes():
     now_ts = time.time()
     remove_list = []
-    for pair, data in list(passing_pairs.items()):
+    with state_lock:
+        items = list(passing_pairs.items())
+    for pair, data in items:
         if not data.get("first_sell_detected"):
             seller = detect_first_sell(
                 pair,
@@ -6267,15 +6873,18 @@ def handle_passing_refreshes():
             ):
                 remove_list.append(pair)
 
-    for rm in remove_list:
-        passing_pairs.pop(rm, None)
-        logger.info(f"[PassingPairs] => removed {rm}")
+    with state_lock:
+        for rm in remove_list:
+            passing_pairs.pop(rm, None)
+            logger.info(f"[PassingPairs] => removed {rm}")
 
 
 def handle_volume_checks():
     now = time.time()
     remove = []
-    for pair, data in list(volume_checks.items()):
+    with state_lock:
+        items = list(volume_checks.items())
+    for pair, data in items:
         if (now - data["last_check"]) >= 5 or (now - data["start"]) >= 300:
             data["last_check"] = now
             ds = fetch_dexscreener_data(data["token0"], pair)
@@ -6311,8 +6920,9 @@ def handle_volume_checks():
                 logger.info(f"[VolumeCheck] {pair} failed to reach targets")
                 remove.append(pair)
 
-    for rm in remove:
-        volume_checks.pop(rm, None)
+    with state_lock:
+        for rm in remove:
+            volume_checks.pop(rm, None)
 
 
 def handle_wallet_updates():
@@ -6388,52 +6998,61 @@ pending_rechecks: Dict[str, dict] = {}
 
 
 def _collect_queue_depth() -> dict:
-    return {
-        "passing_pairs": len(passing_pairs),
-        "volume_checks": len(volume_checks),
-        "pending_rechecks": len(pending_rechecks),
-    }
+    with state_lock:
+        return {
+            "passing_pairs": len(passing_pairs),
+            "volume_checks": len(volume_checks),
+            "pending_rechecks": len(pending_rechecks),
+            "new_pairs": discovered_pairs_queue.qsize(),
+        }
 
 
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
 def queue_recheck(pair_addr: str, token0: str, token1: str):
-    if pair_addr not in pending_rechecks:
-        pending_rechecks[pair_addr] = {
-            "token0": token0,
-            "token1": token1,
-            "attempt_index": 0,
-            "last_attempt": time.time(),
-            "created": time.time(),
-            "fail_count": 0,
-            "verification_retry_at": 0,
-            "verification_warning": False,
-        }
+    with state_lock:
+        if pair_addr not in pending_rechecks:
+            pending_rechecks[pair_addr] = {
+                "token0": token0,
+                "token1": token1,
+                "attempt_index": 0,
+                "last_attempt": time.time(),
+                "created": time.time(),
+                "fail_count": 0,
+                "verification_retry_at": 0,
+                "verification_warning": False,
+            }
 
 
 def handle_rechecks():
     now_ts = time.time()
     rm_list = []
     for pair, data in list(pending_rechecks.items()):
-        idx = data["attempt_index"]
+        with state_lock:
+            idx = data["attempt_index"]
         if idx >= len(RECHECK_DELAYS):
             logger.info(f"[Recheck] => removing {pair}, no more attempts.")
             rm_list.append(pair)
             continue
 
         delay = RECHECK_DELAYS[idx]
-        if (now_ts - data["last_attempt"]) >= delay:
+        with state_lock:
+            last_attempt = data["last_attempt"]
             retry_at = data.get("verification_retry_at", 0)
+        if (now_ts - last_attempt) >= delay:
             if retry_at and now_ts < retry_at:
                 continue
-            data["attempt_index"] += 1
-            data["last_attempt"] = now_ts
-            attempt_num = data["attempt_index"]
+            with state_lock:
+                data["attempt_index"] += 1
+                data["last_attempt"] = now_ts
+                attempt_num = data["attempt_index"]
+                token0 = data["token0"]
+                token1 = data["token1"]
             logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
 
             passes, total, extra = recheck_logic_detail(
-                pair, data["token0"], data["token1"], attempt_num, False
+                pair, token0, token1, attempt_num, False
             )
             if isinstance(extra, dict) and extra.get("dexscreener_missing"):
                 dex_reason = extra.get("dexscreener_reason", "unknown")
@@ -6474,9 +7093,10 @@ def handle_rechecks():
                 rm_list.append(pair)
                 continue
             else:
-                if data.get("verification_warning"):
-                    data["verification_warning"] = False
-                    data["verification_retry_at"] = 0
+                with state_lock:
+                    if data.get("verification_warning"):
+                        data["verification_warning"] = False
+                        data["verification_retry_at"] = 0
             if passes >= MIN_PASS_THRESHOLD:
                 vol_now = extra.get("volume24h", 0)
                 trades_now = extra.get("buys", 0) + extra.get("sells", 0)
@@ -6496,18 +7116,22 @@ def handle_rechecks():
                         recheck_attempt=attempt_num,
                         is_passing_refresh=False,
                     )
-                    queue_passing_refresh(
-                        pair, data["token0"], data["token1"], mc_now, liq_now
-                    )
-                    main_token = get_non_weth_token(data["token0"], data["token1"])
+                    with state_lock:
+                        token0 = data.get("token0")
+                        token1 = data.get("token1")
+                    queue_passing_refresh(pair, token0, token1, mc_now, liq_now)
+                    main_token = get_non_weth_token(token0, token1)
                     start_wallet_monitor(main_token)
                     continue
                 else:
                     logger.info(f"[VolumeCheck] waiting on {pair}")
+                    with state_lock:
+                        token0 = data.get("token0")
+                        token1 = data.get("token1")
                     queue_volume_check(
                         pair,
-                        data["token0"],
-                        data["token1"],
+                        token0,
+                        token1,
                         passes,
                         total,
                         extra,
@@ -6523,8 +7147,10 @@ def handle_rechecks():
                 )
                 if not extra.get("transient_failure"):
                     add_failed_recheck_message(line)
-                    data["fail_count"] = data.get("fail_count", 0) + 1
-                    if data["fail_count"] >= 3:
+                    with state_lock:
+                        data["fail_count"] = data.get("fail_count", 0) + 1
+                        fail_count = data["fail_count"]
+                    if fail_count >= 3:
                         logger.info(f"[Recheck] => removing {pair}, failed 3 times")
                         rm_list.append(pair)
                         continue
@@ -6534,13 +7160,15 @@ def handle_rechecks():
                     )
 
         # stop after 10 minutes of failures
-        elapsed = now_ts - data.get("created", data["last_attempt"])
+        with state_lock:
+            elapsed = now_ts - data.get("created", data["last_attempt"])
         if elapsed >= 600:
             logger.info(f"[Recheck] => removing {pair}, failed after 10m")
             rm_list.append(pair)
 
     for r in rm_list:
-        pending_rechecks.pop(r, None)
+        with state_lock:
+            pending_rechecks.pop(r, None)
         logger.info(f"[Recheck] => removed {r}")
 
 
@@ -6628,18 +7256,19 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
         token1 = to_checksum_address(token1)
         paddr_display = paddr
         lower_addr = paddr.lower()
-        if lower_addr in SEEN_PAIRS:
-            log_event(
-                logging.INFO,
-                "skip_pair",
-                f"{paddr} already processed, skipping",
-                pair=paddr,
-                context={"reason": "already_processed"},
-            )
-            return
-        SEEN_PAIRS.add(lower_addr)
-        detected_at[paddr.lower()] = time.time()
-        known_pairs[paddr.lower()] = (token0, token1)
+        with state_lock:
+            if lower_addr in SEEN_PAIRS:
+                log_event(
+                    logging.INFO,
+                    "skip_pair",
+                    f"{paddr} already processed, skipping",
+                    pair=paddr,
+                    context={"reason": "already_processed"},
+                )
+                return
+            SEEN_PAIRS.add(lower_addr)
+            detected_at[paddr.lower()] = time.time()
+            known_pairs[paddr.lower()] = (token0, token1)
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
         outcome_context.update({"passes": passes, "total": total})
@@ -6836,8 +7465,97 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
 
 ###########################################################
-# 13. OPTIONAL REPORTS
+# 13. PIPELINES & OPTIONAL REPORTS
 ###########################################################
+
+
+def enqueue_discovered_pair(pair_addr: str, token0: str, token1: str) -> None:
+    """Push a discovered pair into the processing queue without blocking ingestion."""
+
+    try:
+        discovered_pairs_queue.put_nowait((pair_addr, token0, token1))
+    except Full:
+        log_event(
+            logging.WARNING,
+            "ingestion_backpressure",
+            "Discovered pair queue full; dropping pair",
+            pair=pair_addr,
+            context={"queue_depth": discovered_pairs_queue.qsize()},
+        )
+
+
+def _pair_worker_loop(worker_id: int) -> None:
+    """Background worker that drains the discovered pair queue."""
+
+    while not pair_workers_stop.is_set():
+        try:
+            pair_addr, token0, token1 = discovered_pairs_queue.get(timeout=1)
+        except Empty:
+            continue
+        start = time.perf_counter()
+        try:
+            handle_new_pair(pair_addr, token0, token1)
+        except Exception as exc:  # noqa: BLE001
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "pair_worker_error",
+                "Error processing discovered pair",
+                pair=pair_addr,
+                context={
+                    "worker_id": worker_id,
+                    "queue_depth": discovered_pairs_queue.qsize(),
+                    "error": repr(exc),
+                },
+            )
+        finally:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            log_event(
+                logging.DEBUG,
+                "pair_worker",
+                "Processed discovered pair",
+                pair=pair_addr,
+                latency_ms=duration_ms,
+                context={
+                    "worker_id": worker_id,
+                    "queue_depth": discovered_pairs_queue.qsize(),
+                },
+            )
+            discovered_pairs_queue.task_done()
+        
+
+def start_pair_workers() -> None:
+    for idx in range(PAIR_WORKER_COUNT):
+        t = threading.Thread(target=_pair_worker_loop, args=(idx,), daemon=True)
+        t.start()
+
+
+def maintenance_loop() -> None:
+    while not maintenance_stop.wait(MAINTENANCE_LOOP_SLEEP):
+        loop_start = time.perf_counter()
+        try:
+            handle_rechecks()
+            handle_volume_checks()
+            handle_passing_refreshes()
+            handle_wallet_updates()
+            maybe_flush_failed_rechecks()
+        except Exception as exc:
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "maintenance_loop_error",
+                "Maintenance loop error",
+                error=str(exc),
+            )
+        else:
+            duration_ms = round((time.perf_counter() - loop_start) * 1000, 2)
+            log_event(
+                logging.DEBUG,
+                "maintenance_loop",
+                "Completed maintenance sweep",
+                latency_ms=duration_ms,
+                context={"queue_depth": _collect_queue_depth()},
+            )
 
 _last_daily_date = None
 _last_weekly_date = None
@@ -6874,6 +7592,8 @@ def main():
     ensure_etherscan_connectivity()
     if runtime_reporter is None:
         runtime_reporter = RuntimeReporter(metrics)
+    start_pair_workers()
+    threading.Thread(target=maintenance_loop, daemon=True).start()
     send_telegram_message(
         "🤖 Ethereum bot v2 online and scanning for fresh Ethereum pairs."
     )
@@ -6906,6 +7626,8 @@ def main():
             if curr_block_v2 > last_block_v2:
                 from_blk = last_block_v2 + 1
                 to_blk = curr_block_v2
+                ingest_start = time.perf_counter()
+                enqueued = 0
 
                 filter_params = {
                     "fromBlock": from_blk,
@@ -6928,7 +7650,8 @@ def main():
                     raw_bytes = bytes.fromhex(data_field)
                     try:
                         pair_addr, _ = decode(["address", "uint256"], raw_bytes)
-                        handle_new_pair(pair_addr, token0_hex, token1_hex)
+                        enqueue_discovered_pair(pair_addr, token0_hex, token1_hex)
+                        enqueued += 1
                     except Exception as e:
                         tb = traceback.extract_tb(e.__traceback__)
                         line = tb[-1].lineno if tb else 'unknown'
@@ -6938,6 +7661,7 @@ def main():
 
                 last_block_v2 = to_blk
                 save_last_block(last_block_v2, LAST_BLOCK_FILE_V2)
+                duration_ms = round((time.perf_counter() - ingest_start) * 1000, 2)
                 log_event(
                     logging.INFO,
                     "blocks_processed",
@@ -6947,6 +7671,9 @@ def main():
                         "from_block": from_blk,
                         "to_block": to_blk,
                         "pairs_found": len(logs),
+                        "enqueued": enqueued,
+                        "duration_ms": duration_ms,
+                        "queue_depth": discovered_pairs_queue.qsize(),
                     },
                 )
 
@@ -6954,6 +7681,8 @@ def main():
             if curr_block_v3 > last_block_v3:
                 from_blk = last_block_v3 + 1
                 to_blk = curr_block_v3
+                ingest_start = time.perf_counter()
+                enqueued = 0
 
                 filter_params = {
                     "fromBlock": from_blk,
@@ -6976,7 +7705,8 @@ def main():
                     raw_bytes = bytes.fromhex(data_field)
                     try:
                         _, pool_addr = decode(["int24", "address"], raw_bytes)
-                        handle_new_pair(pool_addr, token0_hex, token1_hex)
+                        enqueue_discovered_pair(pool_addr, token0_hex, token1_hex)
+                        enqueued += 1
                     except Exception as e:
                         tb = traceback.extract_tb(e.__traceback__)
                         line = tb[-1].lineno if tb else 'unknown'
@@ -6986,6 +7716,7 @@ def main():
 
                 last_block_v3 = to_blk
                 save_last_block(last_block_v3, LAST_BLOCK_FILE_V3)
+                duration_ms = round((time.perf_counter() - ingest_start) * 1000, 2)
                 log_event(
                     logging.INFO,
                     "blocks_processed",
@@ -6995,26 +7726,17 @@ def main():
                         "from_block": from_blk,
                         "to_block": to_blk,
                         "pairs_found": len(logs),
+                        "enqueued": enqueued,
+                        "duration_ms": duration_ms,
+                        "queue_depth": discovered_pairs_queue.qsize(),
                     },
                 )
 
-            # handle failing rechecks
-            handle_rechecks()
-
-            # check volume milestones for pending pairs
-            handle_volume_checks()
-
-            # handle passing refresh
-            handle_passing_refreshes()
-
-            # update wallet reports
-            handle_wallet_updates()
-
-            # flush fail buffer
-            maybe_flush_failed_rechecks()
-
         except KeyboardInterrupt:
             log_event(logging.INFO, "shutdown", "KeyboardInterrupt => stopping")
+            pair_workers_stop.set()
+            maintenance_stop.set()
+            telegram_refresh_stop.set()
             break
         except Exception as e:
             metrics.record_exception()
