@@ -1268,34 +1268,118 @@ def safe_get_logs(filter_params: dict, is_v3: bool = False) -> List[dict]:
 # 3. TELEGRAM
 ###########################################################
 
-async def async_send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+async def async_send_telegram_message(
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+    return_payload: bool = False,
+) -> Union[bool, dict]:
     """Send a message to Telegram asynchronously."""
     if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
         return False
     url = f"{TELEGRAM_BASE_URL}/sendMessage"
-    data = {
+    data: Dict[str, Union[str, int]] = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    try:
+        async with create_aiohttp_session() as session:
+            async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
+                payload = await resp.json()
+                if return_payload:
+                    return payload
+                return bool(payload.get("ok"))
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+        return False
+
+
+async def async_edit_telegram_message(
+    message_id: int,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Edit a Telegram message asynchronously."""
+
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        return False
+
+    url = f"{TELEGRAM_BASE_URL}/editMessageText"
+    data: Dict[str, Union[str, int]] = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+
     try:
         async with create_aiohttp_session() as session:
             async with session.post(url, data=data, timeout=FETCH_TIMEOUT) as resp:
                 payload = await resp.json()
                 return bool(payload.get("ok"))
     except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
+        logger.error(f"Telegram edit failed: {e}")
         return False
 
-def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+
+def send_telegram_message(
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+    return_payload: bool = False,
+) -> Union[bool, dict]:
     """Safe to call from inside or outside an event loop."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(async_send_telegram_message(text, parse_mode))
+        return asyncio.run(
+            async_send_telegram_message(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                return_payload=return_payload,
+            )
+        )
     else:
-        loop.create_task(async_send_telegram_message(text, parse_mode))
+        coro = async_send_telegram_message(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            return_payload=return_payload,
+        )
+        loop.create_task(coro)
+        return True
+
+
+def edit_telegram_message(
+    message_id: int,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> bool:
+    """Safe wrapper around Telegram editMessageText."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            async_edit_telegram_message(
+                message_id, text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+        )
+    else:
+        loop.create_task(
+            async_edit_telegram_message(
+                message_id, text, parse_mode=parse_mode, reply_markup=reply_markup
+            )
+        )
         return True
 
 # Wire wallet tracker notifications to Telegram (Patch A)
@@ -1430,7 +1514,11 @@ def _should_emit_refresh(
 
 
 def _format_refresh_message(
-    pair_addr: str, token_addr: str, snapshot: dict, interval: int
+    pair_addr: str,
+    token_addr: str,
+    snapshot: dict,
+    interval: int,
+    paused: bool = False,
 ) -> str:
     def _fmt_money(val: Optional[float]) -> str:
         if val is None:
@@ -1439,8 +1527,9 @@ def _format_refresh_message(
             return f"${val:,.0f}"
         return f"${val:.6f}"
 
-    header = f"📡 Auto-refresh <code>{pair_addr}</code>"
-    token_line = f"Token: <code>{token_addr}</code> • every {interval}s"
+    status = "⏸ Auto-refresh paused" if paused else f"📡 Auto-refresh every {interval}s"
+    header = f"<b>{status}</b> — <code>{pair_addr}</code>"
+    token_line = f"Token: <code>{token_addr}</code> • interval {interval}s"
 
     if snapshot.get("reason") != "ok" and snapshot.get("price") in (None, 0):
         body_lines = [f"DexScreener: {snapshot.get('reason') or 'unavailable'}"]
@@ -1470,6 +1559,168 @@ def _format_refresh_message(
     return "\n".join([header, token_line, *body_lines])
 
 
+def _build_refresh_keyboard(entry: dict) -> dict:
+    pair_addr = entry.get("pair", "")
+    paused = entry.get("paused", False)
+    toggle_label = "▶️ Start auto" if paused else "⏸ Pause auto"
+    return {
+        "inline_keyboard": [
+            [{"text": "🔄 Refresh now", "callback_data": f"refresh:{pair_addr}"}],
+            [{"text": toggle_label, "callback_data": f"toggle:{pair_addr}"}],
+            [{"text": "🛑 Stop", "callback_data": f"stop:{pair_addr}"}],
+        ]
+    }
+
+
+def _upsert_refresh_message(key: str, entry: dict, snapshot: dict) -> bool:
+    reply_markup = _build_refresh_keyboard(entry)
+    text = _format_refresh_message(
+        entry.get("pair", ""),
+        entry.get("token", ""),
+        snapshot,
+        entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+        paused=entry.get("paused", False),
+    )
+
+    msg_id = entry.get("message_id")
+    if msg_id:
+        return bool(
+            edit_telegram_message(
+                msg_id, text, reply_markup=reply_markup, parse_mode="HTML"
+            )
+        )
+
+    payload = send_telegram_message(
+        text, reply_markup=reply_markup, return_payload=True, parse_mode="HTML"
+    )
+    if isinstance(payload, dict) and payload.get("ok"):
+        result = payload.get("result") or {}
+        new_id = result.get("message_id")
+        if new_id:
+            entry["message_id"] = new_id
+        return True
+    return False
+
+
+def _run_refresh_cycle(key: str, entry: dict, force_emit: bool = False) -> None:
+    if entry.get("paused") and not force_emit:
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["next_due"] = time.time() + entry.get(
+                    "interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL
+                )
+        return
+
+    try:
+        data, reason = fetch_dexscreener_data(
+            entry.get("token", ""), entry.get("pair", ""), with_reason=True
+        )
+        snapshot = _build_refresh_snapshot(data, reason)
+        should_emit = force_emit or _should_emit_refresh(
+            entry.get("last_snapshot"),
+            snapshot,
+            entry.get("last_sent", 0.0),
+            entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
+        )
+
+        if should_emit and _upsert_refresh_message(key, entry, snapshot):
+            with telegram_refresh_lock:
+                if key in telegram_refresh_subscriptions:
+                    telegram_refresh_subscriptions[key].update(
+                        {
+                            "last_snapshot": snapshot,
+                            "last_sent": time.time(),
+                            "message_id": entry.get("message_id") or telegram_refresh_subscriptions[
+                                key
+                            ].get("message_id"),
+                        }
+                    )
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["next_due"] = time.time() + entry.get(
+                    "interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL
+                )
+    except Exception as exc:
+        logger.debug(f"telegram refresh loop error: {exc}")
+
+
+def _answer_callback_query(callback_id: str, text: Optional[str] = None) -> None:
+    if not TELEGRAM_BASE_URL:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_BASE_URL}/answerCallbackQuery",
+            data={"callback_query_id": callback_id, "text": text or ""},
+            timeout=FETCH_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.debug(f"telegram callback ack error: {exc}")
+
+
+def _handle_refresh_callback(cb: dict) -> None:
+    data = cb.get("data") or ""
+    callback_id = cb.get("id")
+
+    if not data or ":" not in data:
+        if callback_id:
+            _answer_callback_query(callback_id)
+        return
+
+    action, pair_addr = data.split(":", 1)
+    key = pair_addr.lower()
+
+    if action not in {"refresh", "toggle", "stop"}:
+        if callback_id:
+            _answer_callback_query(callback_id)
+        return
+
+    with telegram_refresh_lock:
+        entry = telegram_refresh_subscriptions.get(key)
+        entry_copy = entry.copy() if entry else None
+
+    if not entry_copy:
+        if callback_id:
+            _answer_callback_query(callback_id, "Not tracked")
+        return
+
+    if action == "refresh":
+        if callback_id:
+            _answer_callback_query(callback_id, "Refreshing…")
+        _run_refresh_cycle(key, entry_copy, force_emit=True)
+        return
+
+    if action == "toggle":
+        new_paused = not entry_copy.get("paused")
+        with telegram_refresh_lock:
+            if key in telegram_refresh_subscriptions:
+                telegram_refresh_subscriptions[key]["paused"] = new_paused
+                telegram_refresh_subscriptions[key]["next_due"] = time.time()
+                entry_copy = telegram_refresh_subscriptions[key].copy()
+        if callback_id:
+            _answer_callback_query(callback_id, "Paused" if new_paused else "Resumed")
+        if new_paused:
+            snapshot = entry_copy.get("last_snapshot") or _build_refresh_snapshot(
+                None, "Auto-refresh paused"
+            )
+            _upsert_refresh_message(key, entry_copy, snapshot)
+        else:
+            _run_refresh_cycle(key, entry_copy, force_emit=True)
+        return
+
+    if action == "stop":
+        with telegram_refresh_lock:
+            msg_id = entry_copy.get("message_id")
+        if callback_id:
+            _answer_callback_query(callback_id, "Stopped")
+        stop_telegram_auto_refresh(pair_addr)
+        if msg_id:
+            edit_telegram_message(
+                msg_id,
+                f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>",
+                reply_markup={"inline_keyboard": []},
+            )
+
+
 def start_telegram_auto_refresh(arg: str, interval: Optional[str] = None) -> str:
     pair_addr, token_addr = _resolve_refresh_addresses(arg)
     if not pair_addr:
@@ -1490,6 +1741,8 @@ def start_telegram_auto_refresh(arg: str, interval: Optional[str] = None) -> str
             "next_due": time.time(),
             "last_snapshot": telegram_refresh_subscriptions.get(key, {}).get("last_snapshot"),
             "last_sent": telegram_refresh_subscriptions.get(key, {}).get("last_sent", 0.0),
+            "message_id": telegram_refresh_subscriptions.get(key, {}).get("message_id"),
+            "paused": False,
         }
 
     return (
@@ -1504,9 +1757,19 @@ def stop_telegram_auto_refresh(arg: str) -> str:
         return "Usage: /refresh_off <pair-address>"
 
     removed = False
+    msg_id = None
     with telegram_refresh_lock:
-        removed = telegram_refresh_subscriptions.pop(pair_addr.lower(), None) is not None
+        existing = telegram_refresh_subscriptions.pop(pair_addr.lower(), None)
+        if existing:
+            removed = True
+            msg_id = existing.get("message_id")
     if removed:
+        if msg_id:
+            edit_telegram_message(
+                msg_id,
+                f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>",
+                reply_markup={"inline_keyboard": []},
+            )
         return f"🛑 Auto-refresh stopped for <code>{pair_addr}</code>"
     return f"ℹ️ No auto-refresh found for <code>{pair_addr}</code>"
 
@@ -1518,8 +1781,10 @@ def list_telegram_auto_refresh() -> str:
         lines = []
         for entry in telegram_refresh_subscriptions.values():
             wait = max(0, int(entry.get("next_due", 0) - time.time()))
+            state = "paused" if entry.get("paused") else "running"
             lines.append(
-                f"- <code>{entry['pair']}</code> every {entry['interval']}s (next in {wait}s)"
+                f"- <code>{entry['pair']}</code> every {entry['interval']}s "
+                f"({state}, next in {wait}s)"
             )
     return "Active auto-refresh watches:\n" + "\n".join(lines)
 
@@ -1552,6 +1817,8 @@ def _auto_subscribe_passing_pair(pair_addr: str, token0: str, token1: str) -> No
             "next_due": time.time(),
             "last_snapshot": None,
             "last_sent": 0.0,
+            "message_id": None,
+            "paused": False,
         }
         added = True
 
@@ -1579,31 +1846,7 @@ def _telegram_refresh_loop():
                     entry["next_due"] = now + entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL)
 
         for key, entry in due:
-            try:
-                data, reason = fetch_dexscreener_data(
-                    entry.get("token", ""), entry.get("pair", ""), with_reason=True
-                )
-                snapshot = _build_refresh_snapshot(data, reason)
-                if _should_emit_refresh(
-                    entry.get("last_snapshot"),
-                    snapshot,
-                    entry.get("last_sent", 0.0),
-                    entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
-                ):
-                    send_telegram_message(
-                        _format_refresh_message(
-                            entry.get("pair", ""),
-                            entry.get("token", ""),
-                            snapshot,
-                            entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL),
-                        )
-                    )
-                    with telegram_refresh_lock:
-                        if key in telegram_refresh_subscriptions:
-                            telegram_refresh_subscriptions[key]["last_snapshot"] = snapshot
-                            telegram_refresh_subscriptions[key]["last_sent"] = time.time()
-            except Exception as exc:
-                logger.debug(f"telegram refresh loop error: {exc}")
+            _run_refresh_cycle(key, entry)
 
 
 
@@ -1628,6 +1871,9 @@ def _telegram_command_listener():
             data = resp.json() if resp.ok else {}
             for upd in data.get("result", []):
                 offset = upd.get("update_id", 0) + 1
+                if upd.get("callback_query"):
+                    _handle_refresh_callback(upd.get("callback_query") or {})
+                    continue
                 msg = upd.get("message") or upd.get("edited_message") or {}
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 # Restrict to configured chat unless left blank
