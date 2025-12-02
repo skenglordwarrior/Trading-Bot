@@ -1429,10 +1429,15 @@ def _resolve_refresh_addresses(arg: str) -> Tuple[Optional[str], Optional[str]]:
             except Exception:
                 token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
         else:
+            pair_addr = cleaned
             token_addr = cleaned
             for paddr, (token0, token1) in list(known_pairs.items()):
                 if cleaned_low in {token0.lower(), token1.lower()}:
                     pair_addr = paddr
+                    try:
+                        token_addr = get_non_weth_token(token0, token1)
+                    except Exception:
+                        token_addr = token1 if token0.lower() == WETH_ADDRESS.lower() else token0
                     break
 
     if pair_addr is None:
