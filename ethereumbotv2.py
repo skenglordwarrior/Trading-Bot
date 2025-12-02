@@ -760,12 +760,18 @@ class MetricsCollector:
             return {}
         return dict(data)
 
-    def snapshot_daily_totals(self) -> Tuple[datetime, Dict[str, int]]:
+    def snapshot_daily_totals(
+        self, reference: Optional[datetime] = None
+    ) -> Tuple[datetime, Dict[str, int]]:
+        ref = reference or datetime.now(timezone.utc)
+        next_period_start = datetime.combine(
+            ref.date(), datetime.min.time(), tzinfo=timezone.utc
+        )
         with self.lock:
             period_start = self.daily_period_start
             totals = dict(self.daily_totals)
             self.daily_totals = Counter()
-            self.daily_period_start = datetime.now(timezone.utc)
+            self.daily_period_start = next_period_start
             return period_start, totals
 
 
@@ -822,7 +828,7 @@ class RuntimeReporter:
         send_telegram_message(msg)
 
     def send_daily_summary(self, now: datetime) -> None:
-        period_start, totals = self.metrics.snapshot_daily_totals()
+        period_start, totals = self.metrics.snapshot_daily_totals(now)
         period_label = period_start.date().isoformat()
         msg = (
             "🗓️ Daily summary\n"
