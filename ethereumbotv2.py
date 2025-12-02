@@ -1524,6 +1524,44 @@ def list_telegram_auto_refresh() -> str:
     return "Active auto-refresh watches:\n" + "\n".join(lines)
 
 
+def _auto_subscribe_passing_pair(pair_addr: str, token0: str, token1: str) -> None:
+    """Ensure a passing pair has a Telegram auto-refresh slot if capacity allows."""
+
+    if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        token_addr = get_non_weth_token(token0, token1)
+    except Exception:
+        token_addr = token0
+
+    key = pair_addr.lower()
+    added = False
+    with telegram_refresh_lock:
+        if key in telegram_refresh_subscriptions:
+            return
+        if len(telegram_refresh_subscriptions) >= TELEGRAM_REFRESH_MAX:
+            logger.debug(
+                f"auto-refresh skipped for {pair_addr}: subscription limit reached"
+            )
+            return
+        telegram_refresh_subscriptions[key] = {
+            "pair": pair_addr,
+            "token": token_addr or pair_addr,
+            "interval": TELEGRAM_REFRESH_DEFAULT_INTERVAL,
+            "next_due": time.time(),
+            "last_snapshot": None,
+            "last_sent": 0.0,
+        }
+        added = True
+
+    if added:
+        send_telegram_message(
+            f"📡 Auto-refresh enabled for passing pair <code>{pair_addr}</code>"
+        )
+        logger.info(f"[AutoRefresh] Enabled for passing pair {pair_addr}")
+
+
 def _telegram_refresh_loop():
     if not TELEGRAM_BASE_URL or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram auto-refresh disabled (no credentials)")
@@ -5986,6 +6024,7 @@ volume_checks: Dict[str, dict] = {}
 def queue_passing_refresh(
     pair_addr: str, token0: str, token1: str, init_mc: float, init_liq: float
 ):
+    auto_refresh_added = False
     with state_lock:
         if pair_addr not in passing_pairs:
             passing_pairs[pair_addr] = {
@@ -6013,6 +6052,10 @@ def queue_passing_refresh(
                 "verification_retry_at": 0,
                 "verification_warning": False,
             }
+            auto_refresh_added = True
+
+    if auto_refresh_added:
+        _auto_subscribe_passing_pair(pair_addr, token0, token1)
 
 
 def queue_volume_check(
