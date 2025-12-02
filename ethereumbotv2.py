@@ -7490,6 +7490,19 @@ def _pair_worker_loop(worker_id: int) -> None:
         start = time.perf_counter()
         try:
             handle_new_pair(pair_addr, token0, token1)
+        except Exception as exc:  # noqa: BLE001
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "pair_worker_error",
+                "Error processing discovered pair",
+                pair=pair_addr,
+                context={
+                    "worker_id": worker_id,
+                    "queue_depth": discovered_pairs_queue.qsize(),
+                    "error": repr(exc),
+                },
+            )
         finally:
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
             log_event(
@@ -7504,7 +7517,7 @@ def _pair_worker_loop(worker_id: int) -> None:
                 },
             )
             discovered_pairs_queue.task_done()
-
+        
 
 def start_pair_workers() -> None:
     for idx in range(PAIR_WORKER_COUNT):
