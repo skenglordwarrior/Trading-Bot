@@ -627,7 +627,7 @@ class MetricsCollector:
         self.stop_event = threading.Event()
         self.event_history = {name: deque() for name in ("pairs_scanned", "passes")}
         self.daily_totals: Counter = Counter()
-        self.daily_period_start = datetime.utcnow().replace(
+        self.daily_period_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         threading.Thread(target=self._emit_loop, daemon=True).start()
@@ -760,12 +760,18 @@ class MetricsCollector:
             return {}
         return dict(data)
 
-    def snapshot_daily_totals(self) -> Tuple[datetime, Dict[str, int]]:
+    def snapshot_daily_totals(
+        self, reference: Optional[datetime] = None
+    ) -> Tuple[datetime, Dict[str, int]]:
+        ref = reference or datetime.now(timezone.utc)
+        next_period_start = datetime.combine(
+            ref.date(), datetime.min.time(), tzinfo=timezone.utc
+        )
         with self.lock:
             period_start = self.daily_period_start
             totals = dict(self.daily_totals)
             self.daily_totals = Counter()
-            self.daily_period_start = datetime.utcnow()
+            self.daily_period_start = next_period_start
             return period_start, totals
 
 
@@ -781,19 +787,19 @@ class RuntimeReporter:
 
     @staticmethod
     def _next_hour_boundary(reference: Optional[datetime] = None) -> datetime:
-        ref = reference or datetime.utcnow()
+        ref = reference or datetime.now(timezone.utc)
         truncated = ref.replace(minute=0, second=0, microsecond=0)
         return truncated + timedelta(hours=1)
 
     @staticmethod
     def _next_midnight_boundary(reference: Optional[datetime] = None) -> datetime:
-        ref = reference or datetime.utcnow()
+        ref = reference or datetime.now(timezone.utc)
         tomorrow = (ref + timedelta(days=1)).date()
-        return datetime.combine(tomorrow, datetime.min.time())
+        return datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc)
 
     def _run(self) -> None:
         while not self.stop_event.wait(30):
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if now >= self.next_hour:
                 try:
                     self.send_hourly_update(now)
@@ -822,7 +828,7 @@ class RuntimeReporter:
         send_telegram_message(msg)
 
     def send_daily_summary(self, now: datetime) -> None:
-        period_start, totals = self.metrics.snapshot_daily_totals()
+        period_start, totals = self.metrics.snapshot_daily_totals(now)
         period_label = period_start.date().isoformat()
         msg = (
             "🗓️ Daily summary\n"
@@ -877,7 +883,7 @@ def store_pair_record(
     """Persist a snapshot of pair evaluation results to the Excel history file."""
 
     extra = extra or {}
-    detected_at = datetime.utcnow().replace(microsecond=0).isoformat()
+    detected_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     liquidity = extra.get("liquidityUsd") or extra.get("liquidity")
     volume = extra.get("volume24h") or extra.get("volume")
     marketcap = extra.get("marketCap") or extra.get("marketcap")
@@ -7484,6 +7490,19 @@ def _pair_worker_loop(worker_id: int) -> None:
         start = time.perf_counter()
         try:
             handle_new_pair(pair_addr, token0, token1)
+        except Exception as exc:  # noqa: BLE001
+            metrics.record_exception()
+            log_event(
+                logging.ERROR,
+                "pair_worker_error",
+                "Error processing discovered pair",
+                pair=pair_addr,
+                context={
+                    "worker_id": worker_id,
+                    "queue_depth": discovered_pairs_queue.qsize(),
+                    "error": repr(exc),
+                },
+            )
         finally:
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
             log_event(
@@ -7498,7 +7517,7 @@ def _pair_worker_loop(worker_id: int) -> None:
                 },
             )
             discovered_pairs_queue.task_done()
-
+        
 
 def start_pair_workers() -> None:
     for idx in range(PAIR_WORKER_COUNT):
