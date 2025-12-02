@@ -1623,8 +1623,13 @@ def _run_refresh_cycle(key: str, entry: dict, force_emit: bool = False) -> None:
         return
 
     try:
+        interval = entry.get("interval", TELEGRAM_REFRESH_DEFAULT_INTERVAL)
         data, reason = fetch_dexscreener_data(
-            entry.get("token", ""), entry.get("pair", ""), with_reason=True
+            entry.get("token", ""),
+            entry.get("pair", ""),
+            with_reason=True,
+            max_cache_age=interval,
+            pair_cache_age=min(interval, DEXSCREENER_PAIR_TTL),
         )
         snapshot = _build_refresh_snapshot(data, reason)
         should_emit = force_emit or _should_emit_refresh(
@@ -3257,9 +3262,15 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
 
 
 async def _fetch_dexscreener_data_async(
-    token_addr: str, pair_addr: str
+    token_addr: str,
+    pair_addr: str,
+    *,
+    max_cache_age: Optional[int] = None,
+    pair_cache_age: Optional[int] = None,
 ) -> Tuple[Optional[dict], Optional[str]]:
     now = time.time()
+    cache_ttl = max_cache_age if max_cache_age is not None else DEXSCREENER_CACHE_TTL
+    pair_ttl = pair_cache_age if pair_cache_age is not None else DEXSCREENER_PAIR_TTL
     pair_info = None
     pdata: Optional[dict] = None
     reason: Optional[str] = None
@@ -3304,7 +3315,7 @@ async def _fetch_dexscreener_data_async(
     # --- token-based lookup (preferred) ---
     key = token_addr.lower()
     cached = DEXSCREENER_CACHE.get(key)
-    if cached and now - cached[0] < DEXSCREENER_CACHE_TTL:
+    if cached and now - cached[0] < cache_ttl:
         jdata = cached[1]
         reason = None
     else:
@@ -3323,7 +3334,7 @@ async def _fetch_dexscreener_data_async(
     if not pair_info and reason != "rate_limited":
         pkey = f"pair:{pair_addr.lower()}"
         cached_pair = DEXSCREENER_CACHE.get(pkey)
-        if cached_pair and now - cached_pair[0] < DEXSCREENER_PAIR_TTL:
+        if cached_pair and now - cached_pair[0] < pair_ttl:
             pdata = cached_pair[1]
             pair_reason = None
         else:
@@ -3421,9 +3432,21 @@ async def _fetch_dexscreener_data_async(
 
 
 def fetch_dexscreener_data(
-    token_addr: str, pair_addr: str, *, with_reason: bool = False
+    token_addr: str,
+    pair_addr: str,
+    *,
+    with_reason: bool = False,
+    max_cache_age: Optional[int] = None,
+    pair_cache_age: Optional[int] = None,
 ) -> Union[Optional[dict], Tuple[Optional[dict], Optional[str]]]:
-    data, reason = asyncio.run(_fetch_dexscreener_data_async(token_addr, pair_addr))
+    data, reason = asyncio.run(
+        _fetch_dexscreener_data_async(
+            token_addr,
+            pair_addr,
+            max_cache_age=max_cache_age,
+            pair_cache_age=pair_cache_age,
+        )
+    )
     if with_reason:
         return data, reason
     return data
