@@ -7051,7 +7051,10 @@ def queue_recheck(pair_addr: str, token0: str, token1: str):
 def handle_rechecks():
     now_ts = time.time()
     rm_list = []
-    for pair, data in list(pending_rechecks.items()):
+    with state_lock:
+        pending_items = list(pending_rechecks.items())
+
+    for pair, data in pending_items:
         with state_lock:
             idx = data["attempt_index"]
         if idx >= len(RECHECK_DELAYS):
