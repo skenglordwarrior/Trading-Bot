@@ -5431,7 +5431,12 @@ SEEN_PAIRS: Set[str] = set()
 def should_retry_dexscreener(pair_addr: str, reason: str) -> Tuple[bool, Optional[float]]:
     """Decide whether to keep retrying DexScreener for the given failure reason."""
 
-    if reason != "not_listed":
+    # Some DexScreener responses (e.g. HTTP 400) effectively mean "not listed" even
+    # though they are surfaced as ``http_400``.  Treat these as not-listed so we stop
+    # retrying once the retry window elapses instead of re-queuing forever.
+    not_listed_reasons = {"not_listed", "http_400"}
+
+    if reason not in not_listed_reasons:
         return True, None
 
     first_seen = detected_at.get(pair_addr.lower())
