@@ -42,7 +42,8 @@ python slither_smoke_test.py
 ```
 
 The script exits non-zero if Slither is not on `PATH` or fails to produce a numeric issue
-count for the sample contract.
+count for the sample contract. If you see a message that Slither is missing, install it
+with `python -m pip install --upgrade slither-analyzer` and rerun the smoke test.
 
 ## Recent 20-Minute Smoke Test (Workspace)
 On 2025-10-12 we executed:

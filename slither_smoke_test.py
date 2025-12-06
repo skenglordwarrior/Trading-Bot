@@ -39,7 +39,13 @@ def main() -> int:
         print(f"Slither ran successfully; detected {issues} issues in the sample contract.")
         return 0
 
-    print(f"Slither did not complete successfully (slitherIssues={issues}).")
+    if issues == "not_installed":
+        print(
+            "Slither is not available on PATH. Install it with "
+            "`python -m pip install --upgrade slither-analyzer` and retry."
+        )
+    else:
+        print(f"Slither did not complete successfully (slitherIssues={issues}).")
     return 1
 
 
