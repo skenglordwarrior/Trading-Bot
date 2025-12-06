@@ -6,3 +6,4 @@ web3
 eth-abi
 eth-utils
 solidity_parser
+slither-analyzer==0.11.3
