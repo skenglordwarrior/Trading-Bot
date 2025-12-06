@@ -33,6 +33,19 @@ troubleshoot issues while it is running:
 With this setup, you can leave the bot running unattended yet still observe its behavior,
 collect evidence for tuning strategies, and intervene quickly if something goes wrong.
 
+## Slither smoke test
+Run the bundled `slither_smoke_test.py` helper to verify Slither is installed and able to
+analyze a trivial Solidity contract locally (it also prints the detected Slither version
+when available):
+
+```bash
+python slither_smoke_test.py
+```
+
+The script exits non-zero if Slither is not on `PATH` or fails to produce a numeric issue
+count for the sample contract. If you see a message that Slither is missing, install it
+with `python -m pip install --upgrade slither-analyzer` and rerun the smoke test.
+
 ## Recent 20-Minute Smoke Test (Workspace)
 On 2025-10-12 we executed:
 
