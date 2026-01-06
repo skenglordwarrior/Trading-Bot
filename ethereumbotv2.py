@@ -40,8 +40,6 @@ import numpy as np
 
 import social_discovery
 
-from maestro_client import MaestroClient, MaestroConfig
-
 # Web3 & dependencies
 from web3 import Web3, HTTPProvider
 from web3.types import HexBytes
@@ -304,10 +302,6 @@ MIN_FDV_USD = 40_000
 MIN_MARKETCAP_USD = 40_000
 MIN_BUYS_FIRST_HOUR = 20
 MIN_TRADES_REQUIRED = 20
-
-MAESTRO_CONFIG = MaestroConfig()
-MAESTRO_CLIENT = MaestroClient(MAESTRO_CONFIG)
-MAESTRO_BUY_REASON = os.getenv("MAESTRO_BUY_REASON", "auto_pass")
 
 VERIFICATION_RETRY_DELAY = int(os.getenv("VERIFICATION_RETRY_DELAY", "300"))
 
@@ -7212,65 +7206,6 @@ known_pairs: Dict[str, Tuple[str, str]] = {}
 ###########################################################
 
 
-def maestro_enabled() -> bool:
-    return MAESTRO_CLIENT.enabled and MAESTRO_CONFIG.buy_amount_eth > 0
-
-
-def _maestro_callback(success: bool, pair: str, error: Optional[str] = None):
-    context = {"pair": pair}
-    if error:
-        context["error"] = error
-    log_event(
-        logging.INFO if success else logging.ERROR,
-        "maestro_buy_result",
-        "Maestro buy submitted" if success else "Maestro buy failed",
-        pair=pair,
-        context=context,
-    )
-    if not success:
-        send_telegram_message(f"❌ Maestro buy failed for {pair}: {error}")
-
-
-def maybe_execute_maestro_buy(
-    pair_addr: str, token0: str, token1: str, extra: Dict[str, Any]
-):
-    if not maestro_enabled():
-        return
-    has_weth = token0.lower() == WETH_ADDRESS.lower() or token1.lower() == WETH_ADDRESS.lower()
-    if not has_weth:
-        log_event(
-            logging.DEBUG,
-            "maestro_skip",
-            f"Skipping Maestro buy for {pair_addr}: no WETH leg",
-            pair=pair_addr,
-        )
-        return
-    token_out = get_non_weth_token(token0, token1)
-    symbol = extra.get("baseTokenSymbol") or extra.get("tokenSymbol") or ""
-    reason = extra.get("tokenName") or MAESTRO_BUY_REASON
-    log_event(
-        logging.INFO,
-        "maestro_buy_trigger",
-        f"Triggering Maestro buy for {pair_addr}",
-        pair=pair_addr,
-        context={
-            "symbol": symbol,
-            "amount_eth": float(MAESTRO_CONFIG.buy_amount_eth),
-            "slippage_bps": MAESTRO_CONFIG.slippage_bps,
-            "dry_run": MAESTRO_CONFIG.dry_run,
-        },
-    )
-    MAESTRO_CLIENT.submit_buy_background(
-        pair_addr,
-        token_out,
-        MAESTRO_CONFIG.buy_amount_eth,
-        token_in=WETH_ADDRESS,
-        token_symbol=symbol,
-        reason=reason,
-        callback=_maestro_callback,
-    )
-
-
 def handle_new_pair(pair_addr: str, token0: str, token1: str):
     """Process a newly created pair and evaluate its criteria."""
 
@@ -7431,7 +7366,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     clog_percent=extra.get("clogPercent"),
                     extra_stats=extra,
                 )
-                maybe_execute_maestro_buy(paddr, token0, token1, extra)
                 liq_now = extra.get("liquidityUsd", 0)
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
                 outcome_context["next_step"] = "passing_refresh"
