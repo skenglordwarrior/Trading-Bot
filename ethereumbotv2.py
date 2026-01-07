@@ -20,6 +20,7 @@ import os
 import time
 import json
 import logging
+import math
 import re
 import glob
 import uuid
@@ -631,6 +632,7 @@ class MetricsCollector:
         self.lock = threading.Lock()
         self.minute_counts: Counter = Counter()
         self.rpc_latencies: List[float] = []
+        self.rpc_latency_history: deque = deque()
         self.api_calls: int = 0
         self.api_errors: int = 0
         self.last_emit = time.time()
@@ -641,9 +643,16 @@ class MetricsCollector:
         self.last_error_alert = 0.0
         self.zero_throughput_window = 600  # 10 minutes
         self.zero_throughput_alerted = False
+        self.failure_rate_threshold = 0.03
+        self.latency_baseline_window = 24 * 60 * 60
+        self.latency_regression_multiplier = 2.0
+        self.last_failure_alert = 0.0
+        self.last_latency_alert = 0.0
         self.queue_depth_callback = None
         self.stop_event = threading.Event()
-        self.event_history = {name: deque() for name in ("pairs_scanned", "passes")}
+        self.event_history = {
+            name: deque() for name in ("pairs_scanned", "passes", "pairs_failed")
+        }
         self.daily_totals: Counter = Counter()
         self.daily_period_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -667,6 +676,7 @@ class MetricsCollector:
     def record_rpc_call(self, latency_ms: float, *, error: bool = False) -> None:
         with self.lock:
             self.rpc_latencies.append(latency_ms)
+            self.rpc_latency_history.append((time.time(), latency_ms))
             self.minute_counts["rpc_calls"] += 1
             if error:
                 self.minute_counts["rpc_errors"] += 1
@@ -704,6 +714,12 @@ class MetricsCollector:
             self.minute_counts.clear()
             rpc_latencies = list(self.rpc_latencies)
             self.rpc_latencies.clear()
+            self.rpc_latency_history = deque(
+                (ts, latency)
+                for ts, latency in self.rpc_latency_history
+                if now - ts <= self.latency_baseline_window
+            )
+            rpc_latency_history = list(self.rpc_latency_history)
             api_calls = self.api_calls
             api_errors = self.api_errors
             self.api_calls = 0
@@ -718,22 +734,43 @@ class MetricsCollector:
         avg_rpc_latency = (
             sum(rpc_latencies) / len(rpc_latencies) if rpc_latencies else 0.0
         )
+        p95_rpc_latency = self._percentile(rpc_latencies, 95)
+        p99_rpc_latency = self._percentile(rpc_latencies, 99)
+        baseline_p95 = self._percentile(
+            [latency for _, latency in rpc_latency_history], 95
+        )
         pairs_per_min = counts.get("pairs_scanned", 0) / (elapsed / 60)
         exceptions_per_min = counts.get("exceptions", 0) / (elapsed / 60)
         api_error_rate = (api_errors / api_calls) if api_calls else 0.0
+        pairs_failed = counts.get("pairs_failed", 0)
+        passes = counts.get("passes", 0)
+        failure_rate = (
+            pairs_failed / (pairs_failed + passes) if (pairs_failed + passes) else 0.0
+        )
         queue_depths = (
             self.queue_depth_callback() if self.queue_depth_callback else {}
         )
 
         context = {
             "pairs_scanned_per_min": round(pairs_per_min, 3),
-            "passes": counts.get("passes", 0),
+            "passes": passes,
+            "pairs_failed": pairs_failed,
+            "failure_rate": round(failure_rate, 4),
             "trades_placed": counts.get("trades_placed", 0),
             "exceptions_per_min": round(exceptions_per_min, 3),
             "queue_depth": queue_depths,
             "api_error_rate": round(api_error_rate, 4),
             "api_calls": api_calls,
             "average_rpc_latency_ms": round(avg_rpc_latency, 2),
+            "rpc_latency_p95_ms": round(p95_rpc_latency, 2)
+            if p95_rpc_latency
+            else 0.0,
+            "rpc_latency_p99_ms": round(p99_rpc_latency, 2)
+            if p99_rpc_latency
+            else 0.0,
+            "rpc_latency_baseline_p95_ms": round(baseline_p95, 2)
+            if baseline_p95
+            else 0.0,
         }
 
         log_event(logging.INFO, "metrics", "runtime_metrics", context=context)
@@ -745,6 +782,10 @@ class MetricsCollector:
                 "alert",
                 "No pairs scanned in the last 10 minutes",
                 error="zero_throughput",
+                context={
+                    "zero_throughput_window_seconds": self.zero_throughput_window,
+                    "last_pair_seen_seconds": round(now - last_pair_seen, 2),
+                },
             )
 
         error_count = len(self.error_events)
@@ -755,8 +796,60 @@ class MetricsCollector:
                 "alert",
                 "Error spike detected",
                 error="error_spike",
-                context={"errors_last_5m": error_count},
+                context={
+                    "errors_last_5m": error_count,
+                    "error_threshold": self.error_threshold,
+                    "error_window_seconds": self.error_window,
+                },
             )
+
+        if (
+            failure_rate >= self.failure_rate_threshold
+            and now - self.last_failure_alert >= self.error_window
+        ):
+            self.last_failure_alert = now
+            log_event(
+                logging.WARNING,
+                "alert",
+                "Pair failure rate exceeds threshold",
+                error="pair_failure_rate",
+                context={
+                    "pairs_failed": pairs_failed,
+                    "pairs_passed": passes,
+                    "failure_rate": round(failure_rate, 4),
+                    "failure_rate_threshold": self.failure_rate_threshold,
+                    "window_seconds": round(elapsed, 2),
+                },
+            )
+
+        if (
+            baseline_p95
+            and p95_rpc_latency
+            and p95_rpc_latency
+            >= self.latency_regression_multiplier * baseline_p95
+            and now - self.last_latency_alert >= self.error_window
+        ):
+            self.last_latency_alert = now
+            log_event(
+                logging.WARNING,
+                "alert",
+                "RPC latency regression detected",
+                error="rpc_latency_regression",
+                context={
+                    "rpc_latency_p95_ms": round(p95_rpc_latency, 2),
+                    "rpc_latency_baseline_p95_ms": round(baseline_p95, 2),
+                    "latency_regression_multiplier": self.latency_regression_multiplier,
+                    "baseline_window_seconds": self.latency_baseline_window,
+                },
+            )
+
+    @staticmethod
+    def _percentile(values: List[float], percentile: int) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        index = max(int(math.ceil(percentile / 100 * len(sorted_values))) - 1, 0)
+        return float(sorted_values[min(index, len(sorted_values) - 1)])
 
     def get_recent_counts(self, window: int = 3600) -> Dict[str, int]:
         now = time.time()
@@ -7355,6 +7448,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
         nonlocal pair_failure_recorded
         if pair_failure_recorded:
             return
+        metrics.increment("pairs_failed")
         pairs_failed_total.inc()
         pair_failure_recorded = True
 
