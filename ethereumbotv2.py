@@ -2749,11 +2749,27 @@ async def _check_liquidity_locked_etherscan_async(
     # Prefer structured locker feeds (e.g. UNCX) so we retain precise lock/unlock
     # timestamps and coverage data for downstream messaging before falling back to
     # holder heuristics.
-    uncx_based, uncx_details = await _check_liquidity_locked_uncx_async(pair_addr)
+    uncx_result = await _check_liquidity_locked_uncx_async(pair_addr)
+    if not isinstance(uncx_result, tuple) or len(uncx_result) != 2:
+        logger.debug(
+            "uncx lock check returned unexpected result for %s: %r",
+            pair_addr,
+            uncx_result,
+        )
+        uncx_result = (None, None)
+    uncx_based, uncx_details = uncx_result
     if uncx_based is not None:
         return uncx_based, uncx_details
 
-    holder_based, holder_details = await _check_liquidity_locked_holder_analysis(pair_addr)
+    holder_result = await _check_liquidity_locked_holder_analysis(pair_addr)
+    if not isinstance(holder_result, tuple) or len(holder_result) != 2:
+        logger.debug(
+            "holder lock check returned unexpected result for %s: %r",
+            pair_addr,
+            holder_result,
+        )
+        holder_result = (None, None)
+    holder_based, holder_details = holder_result
     if holder_based is not None:
         return holder_based, holder_details
 
