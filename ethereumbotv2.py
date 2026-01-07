@@ -7299,8 +7299,11 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
     """Process a newly created pair and evaluate its criteria."""
 
     start_time = time.perf_counter()
+    detect_start = start_time
     trace_id = uuid.uuid4().hex
     decision_start: Optional[float] = None
+    execute_start: Optional[float] = None
+    detect_recorded = False
     decision_recorded = False
     execute_recorded = False
     pair_failure_recorded = False
@@ -7309,6 +7312,26 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
     outcome_context: Dict[str, object] = {}
     logged_outcome = False
     paddr_display = pair_addr
+
+    def record_detect_latency(detect_end: Optional[float] = None) -> None:
+        nonlocal detect_recorded
+        if detect_recorded:
+            return
+        end_time = detect_end if detect_end is not None else time.perf_counter()
+        detection_to_action_latency_ms.labels(phase="detect").observe(
+            (end_time - detect_start) * 1000
+        )
+        detect_recorded = True
+
+    def start_decision_timer() -> None:
+        nonlocal decision_start
+        if decision_start is None:
+            decision_start = time.perf_counter()
+
+    def start_execute_timer() -> None:
+        nonlocal execute_start
+        if execute_start is None:
+            execute_start = time.perf_counter()
 
     def record_decision_latency() -> None:
         nonlocal decision_recorded
@@ -7321,10 +7344,10 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
     def record_execute_latency() -> None:
         nonlocal execute_recorded
-        if execute_recorded:
+        if execute_recorded or execute_start is None:
             return
         detection_to_action_latency_ms.labels(phase="execute").observe(
-            (time.perf_counter() - start_time) * 1000
+            (time.perf_counter() - execute_start) * 1000
         )
         execute_recorded = True
 
@@ -7334,6 +7357,10 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             return
         pairs_failed_total.inc()
         pair_failure_recorded = True
+
+    def begin_execute_phase() -> None:
+        record_decision_latency()
+        start_execute_timer()
 
     try:
         paddr = to_checksum_address(pair_addr)
@@ -7358,10 +7385,8 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
         detect_end = time.perf_counter()
-        detection_to_action_latency_ms.labels(phase="detect").observe(
-            (detect_end - start_time) * 1000
-        )
-        decision_start = detect_end
+        record_detect_latency(detect_end)
+        start_decision_timer()
         outcome_context.update({"passes": passes, "total": total})
         if extra.get("dexscreener_missing"):
             dex_reason = extra.get("dexscreener_reason", "unknown")
@@ -7378,6 +7403,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 if extra.get("dexscreener_retry_window_expired"):
                     log_context["retry_window_expired"] = True
             if should_requeue:
+                begin_execute_phase()
                 status_message = "requeue_missing_dexscreener"
                 log_event(
                     logging.INFO,
@@ -7389,6 +7415,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 )
                 queue_recheck(paddr, token0, token1)
             else:
+                begin_execute_phase()
                 status_message = "skip_missing_dexscreener"
                 log_event(
                     logging.INFO,
@@ -7399,7 +7426,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     context=log_context,
                 )
                 record_pair_failure()
-            record_decision_latency()
             return
         if not isinstance(extra, dict):
             status_message = "invalid_extra"
@@ -7414,6 +7440,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             extra = {}
         if not extra or not extra.get("tokenName"):
             status_message = "skip_missing_token_name"
+            begin_execute_phase()
             log_event(
                 logging.DEBUG,
                 "skip_pair",
@@ -7422,7 +7449,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 trace_id=trace_id,
             )
             record_pair_failure()
-            record_decision_latency()
             return
         fail, reason = critical_verification_failure(extra)
         verification_error = False
@@ -7444,6 +7470,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     context={"reason": reason},
                 )
             else:
+                begin_execute_phase()
                 status_message = "removed_by_verification"
                 outcome_context["remove_reason"] = reason
                 log_event(
@@ -7457,9 +7484,24 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 if reason not in ("verification error", "risk score 9999"):
                     send_telegram_message(f"[Remove] {paddr} removed: {reason}")
                 record_pair_failure()
-                record_decision_latency()
                 return
+        stored_passes = passes
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        fail_reasons = evaluate_fail_reasons(extra)
+        if fail_reasons:
+            outcome_context["fail_reasons"] = fail_reasons
+            passes = 0
+
+        mc_now = extra.get("marketCap", 0)
+        main_token = get_non_weth_token(token0, token1)
+        qualifies_for_pass = passes >= MIN_PASS_THRESHOLD
+        vol_now = extra.get("volume24h", 0)
+        trades_now = extra.get("buys", 0) + extra.get("sells", 0)
+        qualifies_for_volume = (
+            vol_now >= MIN_VOLUME_USD
+            and trades_now >= MIN_TRADES_REQUIRED
+        )
+        begin_execute_phase()
         log_event(
             logging.INFO,
             "new_pair",
@@ -7474,28 +7516,18 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 "total": total,
             },
         )
-        store_pair_record(paddr, token0, token1, passes, total, extra)
+        store_pair_record(paddr, token0, token1, stored_passes, total, extra)
 
-        fail_reasons = evaluate_fail_reasons(extra)
-        if fail_reasons:
-            outcome_context["fail_reasons"] = fail_reasons
-            passes = 0
-
-        mc_now = extra.get("marketCap", 0)
         if mc_now > 0:
             check_marketcap_milestones(paddr, mc_now)
 
-        main_token = get_non_weth_token(token0, token1)
-
-        if passes >= MIN_PASS_THRESHOLD:
+        if qualifies_for_pass:
             metrics.increment("passes")
             pairs_passed_total.inc()
             start_wallet_monitor(main_token)
 
-        if passes >= MIN_PASS_THRESHOLD:
-            vol_now = extra.get("volume24h", 0)
-            trades_now = extra.get("buys", 0) + extra.get("sells", 0)
-            if vol_now >= MIN_VOLUME_USD and trades_now >= MIN_TRADES_REQUIRED:
+        if qualifies_for_pass:
+            if qualifies_for_volume:
                 send_ui_criteria_message(
                     paddr,
                     passes,
@@ -7506,7 +7538,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     extra_stats=extra,
                 )
                 liq_now = extra.get("liquidityUsd", 0)
-                record_decision_latency()
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
                 outcome_context["next_step"] = "passing_refresh"
                 if verification_error:
@@ -7531,7 +7562,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     },
                 )
                 outcome_context["next_step"] = "volume_check"
-                record_decision_latency()
                 queue_volume_check(paddr, token0, token1, passes, total, extra)
         else:
             log_event(
@@ -7543,7 +7573,6 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             )
             outcome_context["next_step"] = "recheck"
             record_pair_failure()
-            record_decision_latency()
             queue_recheck(paddr, token0, token1)
     except Exception as e:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
