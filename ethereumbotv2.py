@@ -2140,7 +2140,7 @@ def _telegram_command_listener():
                 if not text.startswith("/"):
                     continue
                 parts = text.split()
-                cmd = parts[0].lower()
+                cmd = parts[0].lower().split("@", 1)[0]
                 arg = parts[1] if len(parts) > 1 else ""
                 extra = parts[2] if len(parts) > 2 else None
                 if cmd in ("/monitor_on", "/monitoron"):
