@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import glob
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 try:
@@ -544,6 +545,7 @@ PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
 MAINTENANCE_LOOP_SLEEP = int(os.getenv("MAINTENANCE_LOOP_SLEEP", "2"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_JSON = os.getenv("LOG_JSON", "0").lower() in ("1", "true", "yes", "on")
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="[%(levelname)s] %(asctime)s - %(message)s",
@@ -568,11 +570,29 @@ def log_event(
     message: str,
     *,
     pair: Optional[str] = None,
+    trace_id: Optional[str] = None,
     latency_ms: Optional[float] = None,
     error: Optional[str] = None,
     context: Optional[dict] = None,
+    json_payload: Optional[bool] = None,
 ) -> None:
     """Emit a structured log entry with standard metadata."""
+
+    use_json_payload = LOG_JSON if json_payload is None else json_payload
+    if use_json_payload:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": logging.getLevelName(level),
+            "action": action,
+            "message": message,
+            "pair_id": pair,
+            "trace_id": trace_id,
+            "latency_ms": latency_ms,
+            "error": error,
+            "context": context,
+        }
+        logger.log(level, json.dumps(payload, sort_keys=True, default=str))
+        return
 
     parts = []
     if action:
@@ -582,6 +602,8 @@ def log_event(
     meta: List[str] = []
     if pair:
         meta.append(f"pair={pair}")
+    if trace_id:
+        meta.append(f"trace_id={trace_id}")
     if latency_ms is not None:
         meta.append(f"latency={latency_ms:.2f}ms")
     if error:
@@ -7226,6 +7248,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
     """Process a newly created pair and evaluate its criteria."""
 
     start_time = time.perf_counter()
+    trace_id = uuid.uuid4().hex
     metrics.increment("pairs_scanned")
     status_message = "processed"
     outcome_context: Dict[str, object] = {}
@@ -7245,6 +7268,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "skip_pair",
                     f"{paddr} already processed, skipping",
                     pair=paddr,
+                    trace_id=trace_id,
                     context={"reason": "already_processed"},
                 )
                 return
@@ -7275,6 +7299,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "requeue",
                     f"{paddr} missing DexScreener data",
                     pair=paddr,
+                    trace_id=trace_id,
                     context={"reason": status_message, **log_context},
                 )
                 queue_recheck(paddr, token0, token1)
@@ -7285,6 +7310,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "skip_pair",
                     f"{paddr} missing DexScreener data (not requeueing)",
                     pair=paddr,
+                    trace_id=trace_id,
                     context=log_context,
                 )
             return
@@ -7295,6 +7321,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 "invalid_pair_data",
                 f"check_pair_criteria returned invalid data for {paddr}",
                 pair=paddr,
+                trace_id=trace_id,
                 error=str(extra),
             )
             extra = {}
@@ -7305,6 +7332,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 "skip_pair",
                 f"{paddr} missing DexScreener token name",
                 pair=paddr,
+                trace_id=trace_id,
             )
             return
         fail, reason = critical_verification_failure(extra)
@@ -7323,6 +7351,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "verification_warning",
                     f"{paddr} contract verification error detected",
                     pair=paddr,
+                    trace_id=trace_id,
                     context={"reason": reason},
                 )
             else:
@@ -7333,6 +7362,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "remove_pair",
                     f"{paddr} removed: {reason}",
                     pair=paddr,
+                    trace_id=trace_id,
                     context={"reason": reason},
                 )
                 if reason not in ("verification error", "risk score 9999"):
@@ -7344,6 +7374,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             "new_pair",
             f"{paddr} => {passes}/{total} partial passes",
             pair=paddr,
+            trace_id=trace_id,
             latency_ms=latency_ms,
             context={
                 "verification": extra.get("contractCheckStatus"),
@@ -7400,6 +7431,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     "queue_volume_check",
                     f"Waiting for volume targets on {paddr}",
                     pair=paddr,
+                    trace_id=trace_id,
                     context={
                         "volume24h": vol_now,
                         "trades": trades_now,
@@ -7413,6 +7445,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 "queue_recheck",
                 f"Not enough passes for {paddr}, scheduling recheck",
                 pair=paddr,
+                trace_id=trace_id,
             )
             outcome_context["next_step"] = "recheck"
             queue_recheck(paddr, token0, token1)
@@ -7426,6 +7459,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             "handle_new_pair_error",
             f"handle_new_pair failed for {paddr_display} at line {line}",
             pair=paddr_display,
+            trace_id=trace_id,
             latency_ms=latency_ms,
             error=str(e),
             context={"line": line},
@@ -7440,6 +7474,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 "handle_new_pair_complete",
                 status_message,
                 pair=paddr_display,
+                trace_id=trace_id,
                 latency_ms=latency_ms,
                 context=outcome_context or None,
             )
