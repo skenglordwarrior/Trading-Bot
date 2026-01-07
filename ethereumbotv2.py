@@ -581,6 +581,13 @@ def log_event(
 ) -> None:
     """Emit a structured log entry with standard metadata."""
 
+    context_payload = context
+    if trace_id:
+        if context_payload is None:
+            context_payload = {"trace_id": trace_id}
+        elif isinstance(context_payload, dict) and "trace_id" not in context_payload:
+            context_payload = {"trace_id": trace_id, **context_payload}
+
     use_json_payload = LOG_JSON if json_payload is None else json_payload
     if use_json_payload:
         payload = {
@@ -592,7 +599,7 @@ def log_event(
             "trace_id": trace_id,
             "latency_ms": latency_ms,
             "error": error,
-            "context": context,
+            "context": context_payload,
         }
         logger.log(level, json.dumps(payload, sort_keys=True, default=str))
         return
@@ -611,11 +618,11 @@ def log_event(
         meta.append(f"latency={latency_ms:.2f}ms")
     if error:
         meta.append(f"error={error}")
-    if context:
+    if context_payload:
         try:
-            context_str = json.dumps(context, sort_keys=True, default=str)
+            context_str = json.dumps(context_payload, sort_keys=True, default=str)
         except TypeError:
-            context_str = str(context)
+            context_str = str(context_payload)
         meta.append(f"context={context_str}")
 
     text = " ".join(parts)
