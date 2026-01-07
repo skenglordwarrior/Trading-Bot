@@ -38,6 +38,7 @@ from openpyxl import Workbook, load_workbook
 import traceback
 import requests
 import numpy as np
+import prometheus_client
 
 import social_discovery
 
@@ -543,6 +544,7 @@ MAIN_LOOP_SLEEP = 2
 PAIR_QUEUE_MAXSIZE = int(os.getenv("PAIR_QUEUE_MAXSIZE", "500"))
 PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
 MAINTENANCE_LOOP_SLEEP = int(os.getenv("MAINTENANCE_LOOP_SLEEP", "2"))
+PROMETHEUS_METRICS_PORT = int(os.getenv("PROMETHEUS_METRICS_PORT", "8000"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = os.getenv("LOG_JSON", "0").lower() in ("1", "true", "yes", "on")
@@ -857,9 +859,43 @@ class RuntimeReporter:
 
 metrics = MetricsCollector()
 runtime_reporter = RuntimeReporter(metrics)
+pairs_passed_total = prometheus_client.Counter(
+    "pairs_passed_total", "Total pairs that passed the minimum threshold"
+)
+pairs_failed_total = prometheus_client.Counter(
+    "pairs_failed_total", "Total pairs that failed or were skipped due to checks"
+)
+data_trafficked_bytes_total = prometheus_client.Counter(
+    "data_trafficked_bytes_total",
+    "Total data trafficked in bytes",
+    ["dir"],
+)
+recheck_interval_seconds = prometheus_client.Gauge(
+    "recheck_interval_seconds", "Current recheck cadence in seconds"
+)
+detection_to_action_latency_ms = prometheus_client.Histogram(
+    "detection_to_action_latency_ms",
+    "Latency between detection and action by phase",
+    ["phase"],
+    buckets=(50, 100, 250, 500, 1000, 2000, 5000, 10000),
+)
 
 
 PAIR_RECORD_LOCK = threading.Lock()
+
+
+def _record_http_traffic(
+    response_bytes: int,
+    *,
+    url: Optional[Union[str, aiohttp.client.URL]] = None,
+    request_bytes: Optional[int] = None,
+) -> None:
+    if response_bytes:
+        data_trafficked_bytes_total.labels(dir="in").inc(response_bytes)
+    if request_bytes is None and url is not None:
+        request_bytes = len(str(url).encode("utf-8"))
+    if request_bytes:
+        data_trafficked_bytes_total.labels(dir="out").inc(request_bytes)
 
 
 def init_excel(path: str):
@@ -2898,6 +2934,7 @@ def _fetch_token_creation_metadata_ethplorer(
 
     try:
         resp = requests.get(url, params=params, timeout=FETCH_TIMEOUT + 5)
+        _record_http_traffic(len(resp.content), url=resp.url)
         resp.raise_for_status()
         payload = resp.json()
     except (requests.RequestException, ValueError) as exc:
@@ -2944,6 +2981,7 @@ def _fetch_pair_creation_timestamp(pair_addr: str) -> Tuple[Optional[int], Optio
     try:
         prepared = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=prepared, timeout=FETCH_TIMEOUT + 5)
+        _record_http_traffic(len(resp.content), url=resp.url)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as exc:
@@ -2977,6 +3015,7 @@ def _fetch_pair_creation_timestamp(pair_addr: str) -> Tuple[Optional[int], Optio
             block_resp = requests.get(
                 ETHERSCAN_API_URL, params=prepared_block, timeout=FETCH_TIMEOUT + 5
             )
+            _record_http_traffic(len(block_resp.content), url=block_resp.url)
             block_resp.raise_for_status()
             block_payload = block_resp.json()
             ts_val = (block_payload.get("result") or {}).get("timeStamp")
@@ -3018,6 +3057,7 @@ def _fetch_lp_transfers(pair_addr: str, *, limit: int = 200) -> List[dict]:
     try:
         prepared = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=prepared, timeout=FETCH_TIMEOUT + 5)
+        _record_http_traffic(len(resp.content), url=resp.url)
         resp.raise_for_status()
         payload = resp.json()
     except requests.RequestException as exc:
@@ -3161,6 +3201,7 @@ def _fetch_initial_lp_mint(
     try:
         prepared = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=prepared, timeout=FETCH_TIMEOUT + 5)
+        _record_http_traffic(len(resp.content), url=resp.url)
         resp.raise_for_status()
         payload = resp.json()
     except requests.RequestException as exc:
@@ -3326,7 +3367,9 @@ async def _fetch_dexscreener_data_async(
             async with create_aiohttp_session() as session:
                 async with session.get(url, timeout=FETCH_TIMEOUT) as resp:
                     resp.raise_for_status()
-                    data = await resp.json()
+                    raw = await resp.read()
+                    _record_http_traffic(len(raw), url=resp.url)
+                    data = json.loads(raw or b"{}")
             metrics.record_api_call(error=False)
             return data, None
         except aiohttp.ClientResponseError as exc:
@@ -3596,7 +3639,9 @@ async def _perform_direct_etherscan_request(
             ETHERSCAN_API_URL, params=params, timeout=timeout
         ) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            raw = await resp.read()
+            _record_http_traffic(len(raw), url=resp.url)
+            return json.loads(raw or b"{}")
 
 
 async def _perform_etherscan_request(params: dict, timeout: int) -> dict:
@@ -4140,7 +4185,9 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
                 async with create_aiohttp_session() as session:
                     async with session.get(base_url, params=attempt_params, timeout=20) as response:
                         if response.status >= 500:
-                            body = (await response.text())[:120].strip()
+                            raw = await response.read()
+                            _record_http_traffic(len(raw), url=response.url)
+                            body = raw[:120].decode(errors="replace").strip()
                             errors.append(
                                 f"{base_url} {response.status}: {body or 'server error'}"
                             )
@@ -4148,9 +4195,11 @@ async def _fetch_contract_source_etherscan_async(token_addr: str) -> dict:
                             continue
 
                         try:
-                            payload = await response.json(content_type=None)
+                            raw = await response.read()
+                            _record_http_traffic(len(raw), url=response.url)
+                            payload = json.loads(raw or b"{}")
                         except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
-                            body = (await response.text())[:120].strip()
+                            body = raw[:120].decode(errors="replace").strip()
                             errors.append(
                                 f"{base_url} invalid JSON: {exc} :: {body or 'no body'}"
                             )
@@ -4255,6 +4304,7 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
     try:
         params = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
+        _record_http_traffic(len(resp.content), url=resp.url)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
             return data["result"][0].get("contractCreator")
@@ -5798,6 +5848,7 @@ def get_contract_creator(token_addr: str) -> Optional[str]:
     try:
         params = _prepare_etherscan_params(params)
         resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=20)
+        _record_http_traffic(len(resp.content), url=resp.url)
         data = resp.json()
         if data.get("status") == "1" and data.get("result"):
             return data["result"][0].get("contractCreator")
@@ -7249,11 +7300,40 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
     start_time = time.perf_counter()
     trace_id = uuid.uuid4().hex
+    decision_start: Optional[float] = None
+    decision_recorded = False
+    execute_recorded = False
+    pair_failure_recorded = False
     metrics.increment("pairs_scanned")
     status_message = "processed"
     outcome_context: Dict[str, object] = {}
     logged_outcome = False
     paddr_display = pair_addr
+
+    def record_decision_latency() -> None:
+        nonlocal decision_recorded
+        if decision_recorded or decision_start is None:
+            return
+        detection_to_action_latency_ms.labels(phase="decide").observe(
+            (time.perf_counter() - decision_start) * 1000
+        )
+        decision_recorded = True
+
+    def record_execute_latency() -> None:
+        nonlocal execute_recorded
+        if execute_recorded:
+            return
+        detection_to_action_latency_ms.labels(phase="execute").observe(
+            (time.perf_counter() - start_time) * 1000
+        )
+        execute_recorded = True
+
+    def record_pair_failure() -> None:
+        nonlocal pair_failure_recorded
+        if pair_failure_recorded:
+            return
+        pairs_failed_total.inc()
+        pair_failure_recorded = True
 
     try:
         paddr = to_checksum_address(pair_addr)
@@ -7277,6 +7357,11 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             known_pairs[paddr.lower()] = (token0, token1)
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
+        detect_end = time.perf_counter()
+        detection_to_action_latency_ms.labels(phase="detect").observe(
+            (detect_end - start_time) * 1000
+        )
+        decision_start = detect_end
         outcome_context.update({"passes": passes, "total": total})
         if extra.get("dexscreener_missing"):
             dex_reason = extra.get("dexscreener_reason", "unknown")
@@ -7313,6 +7398,8 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     trace_id=trace_id,
                     context=log_context,
                 )
+                record_pair_failure()
+            record_decision_latency()
             return
         if not isinstance(extra, dict):
             status_message = "invalid_extra"
@@ -7334,6 +7421,8 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 pair=paddr,
                 trace_id=trace_id,
             )
+            record_pair_failure()
+            record_decision_latency()
             return
         fail, reason = critical_verification_failure(extra)
         verification_error = False
@@ -7367,6 +7456,8 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 )
                 if reason not in ("verification error", "risk score 9999"):
                     send_telegram_message(f"[Remove] {paddr} removed: {reason}")
+                record_pair_failure()
+                record_decision_latency()
                 return
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         log_event(
@@ -7398,6 +7489,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
 
         if passes >= MIN_PASS_THRESHOLD:
             metrics.increment("passes")
+            pairs_passed_total.inc()
             start_wallet_monitor(main_token)
 
         if passes >= MIN_PASS_THRESHOLD:
@@ -7414,6 +7506,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     extra_stats=extra,
                 )
                 liq_now = extra.get("liquidityUsd", 0)
+                record_decision_latency()
                 queue_passing_refresh(paddr, token0, token1, mc_now, liq_now)
                 outcome_context["next_step"] = "passing_refresh"
                 if verification_error:
@@ -7438,6 +7531,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     },
                 )
                 outcome_context["next_step"] = "volume_check"
+                record_decision_latency()
                 queue_volume_check(paddr, token0, token1, passes, total, extra)
         else:
             log_event(
@@ -7448,6 +7542,8 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                 trace_id=trace_id,
             )
             outcome_context["next_step"] = "recheck"
+            record_pair_failure()
+            record_decision_latency()
             queue_recheck(paddr, token0, token1)
     except Exception as e:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -7467,6 +7563,7 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
         logger.debug(''.join(traceback.format_tb(e.__traceback__)))
         logged_outcome = True
     finally:
+        record_execute_latency()
         if not logged_outcome:
             latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
             log_event(
@@ -7547,6 +7644,7 @@ def start_pair_workers() -> None:
 
 
 def maintenance_loop() -> None:
+    recheck_interval_seconds.set(MAINTENANCE_LOOP_SLEEP)
     while not maintenance_stop.wait(MAINTENANCE_LOOP_SLEEP):
         loop_start = time.perf_counter()
         try:
@@ -7605,6 +7703,7 @@ def save_last_block(bn: int, fname: str):
 def main():
     global runtime_reporter
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
+    prometheus_client.start_http_server(PROMETHEUS_METRICS_PORT)
     ensure_etherscan_connectivity()
     if runtime_reporter is None:
         runtime_reporter = RuntimeReporter(metrics)
@@ -7765,6 +7864,7 @@ def main():
             time.sleep(5)
 
         time.sleep(MAIN_LOOP_SLEEP)
+        recheck_interval_seconds.set(MAIN_LOOP_SLEEP)
 
 
 if __name__ == "__main__":
