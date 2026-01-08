@@ -4203,7 +4203,7 @@ async def _check_liquidity_locked_uncx_graph_async(
 
     if result.get("errors"):
         logger.debug("Uncx graph returned errors for %s: %s", pair_addr, result["errors"])
-        return None
+        return None, None
 
     data = result.get("data") or {}
     pool_info = data.get("pool") or {}
