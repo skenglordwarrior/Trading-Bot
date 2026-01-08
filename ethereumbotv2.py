@@ -2162,8 +2162,10 @@ def _telegram_command_listener():
                     continue
                 for raw_line in text.splitlines():
                     line = raw_line.strip()
-                    if not line.startswith("/"):
+                    if "/" not in line:
                         continue
+                    if not line.startswith("/"):
+                        line = line[line.find("/") :]
                     parts = line.split()
                     cmd = parts[0].lower().split("@", 1)[0]
                     arg = parts[1] if len(parts) > 1 else ""
@@ -3533,8 +3535,16 @@ def build_liquidity_lock_snapshot(pair_addr: str) -> str:
         return "Usage: /lock_check <pair-address>"
 
     header = f"🔒 LP lock snapshot for <code>{pair_arg}</code>"
-    creation_block, creation_ts = _resolve_pair_creation(pair_arg)
-    initial_amount, initial_ts, initial_tx, initial_block = _fetch_initial_lp_mint(pair_arg)
+    creation_result = _resolve_pair_creation(pair_arg)
+    if creation_result:
+        creation_block, creation_ts = creation_result
+    else:
+        creation_block, creation_ts = None, None
+    initial_result = _fetch_initial_lp_mint(pair_arg)
+    if initial_result:
+        initial_amount, initial_ts, initial_tx, initial_block = initial_result
+    else:
+        initial_amount, initial_ts, initial_tx, initial_block = (None, None, None, None)
     if creation_block is None and initial_block is not None:
         creation_block = initial_block
     if creation_ts is None:
