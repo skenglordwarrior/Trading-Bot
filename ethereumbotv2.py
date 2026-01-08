@@ -2158,63 +2158,103 @@ def _telegram_command_listener():
                 if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
                     continue
                 text = (msg.get("text") or "").strip()
-                if not text.startswith("/"):
+                if not text:
                     continue
-                parts = text.split()
-                cmd = parts[0].lower().split("@", 1)[0]
-                arg = parts[1] if len(parts) > 1 else ""
-                extra = parts[2] if len(parts) > 2 else None
-                if cmd in ("/monitor_on", "/monitoron"):
-                    token = _resolve_main_token_from_arg(arg)
-                    if not token:
-                        send_telegram_message("Usage: /monitor_on <token-or-pair-address>")
+                for raw_line in text.splitlines():
+                    line = raw_line.strip()
+                    if not line.startswith("/"):
                         continue
-                    start_wallet_monitor(token)
-                    send_telegram_message(f"✅ Monitoring started for <code>{token}</code>")
-                elif cmd in ("/monitor_off", "/monitoroff"):
-                    if not arg:
-                        send_telegram_message("Usage: /monitor_off <token-or-pair-address>")
-                        continue
-                    ok = stop_wallet_monitor(arg)
-                    if ok:
-                        send_telegram_message(f"🛑 Monitoring stopped for <code>{arg}</code>")
-                    else:
-                        send_telegram_message(f"ℹ️ Not monitoring <code>{arg}</code>")
-                elif cmd in ("/monitor_off_all", "/monitoroffall"):
-                    n = stop_all_wallet_monitors()
-                    send_telegram_message(f"🧹 Stopped {n} wallet monitor(s).")
-                elif cmd in ("/monitor_list", "/monitorlist"):
-                    lst = list_wallet_monitors()
-                    if not lst:
-                        send_telegram_message("No active wallet monitors.")
-                    else:
-                        body = "\n".join(f"- <code>{x}</code>" for x in lst)
-                        send_telegram_message(f"Active monitors ({len(lst)}):\n{body}")
-                elif cmd in ("/refresh_on", "/refreshon", "/autorefresh"):
-                    if not arg:
-                        send_telegram_message("Usage: /refresh_on <pair-address> [seconds]")
-                        continue
-                    send_telegram_message(start_telegram_auto_refresh(arg, extra))
-                elif cmd in ("/refresh_off", "/refreshoff"):
-                    if not arg:
-                        send_telegram_message("Usage: /refresh_off <pair-address>")
-                        continue
-                    send_telegram_message(stop_telegram_auto_refresh(arg))
-                elif cmd in ("/refresh_list", "/refreshlist"):
-                    send_telegram_message(list_telegram_auto_refresh())
-                elif cmd in ("/lock_check", "/lockcheck", "/lock_status"):
-                    if not arg:
-                        send_telegram_message("Usage: /lock_check <pair-address>")
-                        continue
-                    report = build_liquidity_lock_snapshot(arg)
-                    send_telegram_message(report)
-                elif cmd in ("/status", "/health", "/commands", "/cmds", "/menu", "/help"):
-                    if cmd == "/status":
-                        send_telegram_message(_build_status_message())
-                    elif cmd == "/health":
-                        send_telegram_message(_build_health_message())
-                    else:
-                        send_telegram_message(_build_commands_overview())
+                    parts = line.split()
+                    cmd = parts[0].lower().split("@", 1)[0]
+                    arg = parts[1] if len(parts) > 1 else ""
+                    extra = parts[2] if len(parts) > 2 else None
+                    if cmd in ("/monitor_on", "/monitoron"):
+                        token = _resolve_main_token_from_arg(arg)
+                        if not token:
+                            send_telegram_message(
+                                "Usage: /monitor_on <token-or-pair-address>"
+                            )
+                            continue
+                        start_wallet_monitor(token)
+                        send_telegram_message(
+                            f"✅ Monitoring started for <code>{token}</code>"
+                        )
+                    elif cmd in ("/monitor_off", "/monitoroff"):
+                        if not arg:
+                            send_telegram_message(
+                                "Usage: /monitor_off <token-or-pair-address>"
+                            )
+                            continue
+                        ok = stop_wallet_monitor(arg)
+                        if ok:
+                            send_telegram_message(
+                                f"🛑 Monitoring stopped for <code>{arg}</code>"
+                            )
+                        else:
+                            send_telegram_message(f"ℹ️ Not monitoring <code>{arg}</code>")
+                    elif cmd in ("/monitor_off_all", "/monitoroffall"):
+                        n = stop_all_wallet_monitors()
+                        send_telegram_message(f"🧹 Stopped {n} wallet monitor(s).")
+                    elif cmd in ("/monitor_list", "/monitorlist"):
+                        lst = list_wallet_monitors()
+                        if not lst:
+                            send_telegram_message("No active wallet monitors.")
+                        else:
+                            body = "\n".join(f"- <code>{x}</code>" for x in lst)
+                            send_telegram_message(f"Active monitors ({len(lst)}):\n{body}")
+                    elif cmd in ("/refresh_on", "/refreshon", "/autorefresh"):
+                        if not arg:
+                            send_telegram_message(
+                                "Usage: /refresh_on <pair-address> [seconds]"
+                            )
+                            continue
+                        send_telegram_message(start_telegram_auto_refresh(arg, extra))
+                    elif cmd in ("/refresh_off", "/refreshoff"):
+                        if not arg:
+                            send_telegram_message("Usage: /refresh_off <pair-address>")
+                            continue
+                        send_telegram_message(stop_telegram_auto_refresh(arg))
+                    elif cmd in ("/refresh_list", "/refreshlist"):
+                        send_telegram_message(list_telegram_auto_refresh())
+                    elif cmd in ("/lock_check", "/lockcheck", "/lock_status"):
+                        if not arg:
+                            send_telegram_message("Usage: /lock_check <pair-address>")
+                            continue
+                        send_telegram_message(
+                            f"⏳ Running lock check for <code>{arg}</code>..."
+                        )
+
+                        def _lock_check_worker(pair_addr: str) -> None:
+                            try:
+                                report = build_liquidity_lock_snapshot(pair_addr)
+                                send_telegram_message(report)
+                            except Exception as exc:
+                                logger.warning(
+                                    "lock_check_failed for %s: %s", pair_addr, exc
+                                )
+                                send_telegram_message(
+                                    f"⚠️ Lock check failed for <code>{pair_addr}</code>: {exc}"
+                                )
+
+                        threading.Thread(
+                            target=_lock_check_worker,
+                            args=(arg,),
+                            daemon=True,
+                        ).start()
+                    elif cmd in (
+                        "/status",
+                        "/health",
+                        "/commands",
+                        "/cmds",
+                        "/menu",
+                        "/help",
+                    ):
+                        if cmd == "/status":
+                            send_telegram_message(_build_status_message())
+                        elif cmd == "/health":
+                            send_telegram_message(_build_health_message())
+                        else:
+                            send_telegram_message(_build_commands_overview())
         except Exception as e:
             logger.debug(f"telegram listener error: {e}")
         finally:
