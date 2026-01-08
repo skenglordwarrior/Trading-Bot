@@ -1,0 +1,124 @@
+What you are seeing is normal for Windows terminals: the console buffer is finite. If the bot has been running since 11:00 and your export starts around 17:00, the earlier output was overwritten in the buffer, so it cannot be exported from the console after the fact.
+
+The institutional fix is to stop treating the terminal buffer as a log store and to write logs to durable storage from the start.
+
+Below are the best options, in order of reliability.
+
+---
+
+## 1) Immediate explanation (why it happened)
+
+Windows PowerShell/Windows Terminal keeps only a limited number of lines in memory. Once exceeded, older lines are discarded. Exporting later will only capture whatever is still in the buffer.
+
+If the earlier logs are not already written to a file, they are gone.
+
+---
+
+## 2) Institutional solution: log to file (and rotate) always
+
+### Option A: Start the bot and tee output to a file
+
+This captures everything from that point onward.
+
+**PowerShell:**
+
+```powershell
+# Creates/overwrites
+python .\app\main.py 2>&1 | Tee-Object -FilePath .\logs\bot_$(Get-Date -Format yyyyMMdd_HHmmss).log
+
+# Or append
+python .\app\main.py 2>&1 | Tee-Object -FilePath .\logs\bot.log -Append
+```
+
+If you run Node:
+
+```powershell
+node .\app\main.js 2>&1 | Tee-Object -FilePath .\logs\bot.log -Append
+```
+
+Key detail: `2>&1` ensures errors are included.
+
+### Option B: Redirect stdout/stderr directly (simpler, fastest)
+
+```powershell
+python .\app\main.py *> .\logs\bot.log
+# append:
+python .\app\main.py *>> .\logs\bot.log
+```
+
+This is extremely robust and avoids terminal buffer limitations.
+
+---
+
+## 3) If the bot is currently still running: attach to its output properly
+
+If the bot was started in an interactive terminal without redirection, you cannot recover output that already scrolled out of the buffer. But you can prevent further loss by restarting it with file logging (Options above).
+
+If you must avoid restart, your only “partial” mitigation is increasing the terminal scrollback for future runs (does not recover past output):
+
+### Windows Terminal scrollback
+
+* Settings → Profiles → Defaults → **Scrollback** → increase (e.g., 50,000–200,000 lines)
+
+PowerShell console host (legacy) has similar buffer settings, but Windows Terminal is preferred.
+
+---
+
+## 4) Best practice: structured logs should go to a log file by design
+
+Since you now have trace IDs and context, you should log to:
+
+* **Console**: INFO summaries only (human monitoring)
+* **File**: full JSON logs (ground truth)
+* Optional: a sink (Grafana Loki, ELK, etc.)
+
+### Recommended file pattern (institutional)
+
+* `logs/bot.jsonl` for JSON line logs
+* Rotate daily or by size:
+
+  * `bot_2026-01-07.jsonl`
+  * keep last N files
+
+If you’re using Python, use a RotatingFileHandler/TimedRotatingFileHandler.
+If Node, use pino/winston with rotation.
+
+This avoids dependence on the terminal.
+
+---
+
+## 5) What to do now (practical steps)
+
+1. Accept that anything before ~17:00 is likely unrecoverable unless you already had file logging enabled.
+2. Restart the bot using `Tee-Object` or redirection so you have full capture from launch.
+3. Update the bot to write full logs to file automatically (so you never need PowerShell export again).
+
+---
+
+## 6) Codex workflow (how to get Codex to analyze logs reliably)
+
+Instead of trying to extract console history, do this:
+
+1. Run the bot with file logging:
+
+   * `logs/bot_yyyyMMdd_HHmmss.jsonl`
+2. Upload that file to Codex / paste the relevant excerpt.
+3. Ask Codex to:
+
+   * group by `trace_id`
+   * summarize error codes
+   * detect long scan cycles / scheduler lag
+   * list provider degradation events and time windows
+
+This is exactly what structured logging enables.
+
+---
+
+## If you want the cleanest “institutional” answer
+
+Implement two outputs simultaneously:
+
+* `INFO` summaries to console (so you can watch it live)
+* full JSON logs to rotating files (so nothing is lost)
+
+If you tell me whether your bot is Python or Node/TS and what logging library you’re using, I’ll give you the exact code snippet to add file logging + rotation while keeping the console output readable.
