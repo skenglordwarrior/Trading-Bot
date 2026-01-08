@@ -3494,7 +3494,15 @@ def _fetch_initial_lp_mint(
 async def _gather_lock_details_async(
     pair_addr: str, minted_amount: Optional[Decimal], minted_tx_hash: Optional[str]
 ) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
-    locked, details = await _check_liquidity_locked_uncx_async(pair_addr)
+    uncx_result = await _check_liquidity_locked_uncx_async(pair_addr)
+    if not isinstance(uncx_result, tuple) or len(uncx_result) != 2:
+        logger.debug(
+            "uncx lock check returned unexpected result for %s: %r",
+            pair_addr,
+            uncx_result,
+        )
+        uncx_result = (None, None)
+    locked, details = uncx_result
     txs = _fetch_lp_transfers(pair_addr)
 
     target_amount = details.locked_amount if details and details.locked_amount else minted_amount
@@ -6798,6 +6806,47 @@ def _build_lock_info_line(
     return "Lock Info: " + " | ".join(segments)
 
 
+def _build_refresh_downgrade_alert(
+    pair_addr: str,
+    passes: int,
+    total: int,
+    attempt_num: int,
+    extra: Optional[Dict[str, Any]],
+) -> str:
+    stats = extra or {}
+    token_name = stats.get("tokenName") or "Unnamed"
+    liquidity = stats.get("liquidityUsd")
+    volume = stats.get("volume24h")
+    market_cap = stats.get("marketCap")
+    risk_score = stats.get("riskScore")
+    renounced = stats.get("contractRenounced")
+    verified = stats.get("verified")
+    clog = stats.get("clogPercent")
+
+    def _fmt_money(value: Any) -> str:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        return f"${val:,.0f}"
+
+    parts = [
+        f"🔻 <b>Refresh downgrade</b> (Attempt #{attempt_num})",
+        f"Pair: <code>{pair_addr}</code>",
+        f"Token: <b>{token_name}</b>",
+        f"Criteria: <b>{passes}/{total}</b> passes",
+        f"Liquidity: {_fmt_money(liquidity)}",
+        f"24h Volume: {_fmt_money(volume)}",
+        f"Market Cap: {_fmt_money(market_cap)}",
+        f"Risk Score: {risk_score if risk_score is not None else 'unknown'}",
+        f"Renounced: {renounced if renounced is not None else 'unknown'}",
+        f"Verified: {verified if verified is not None else 'unknown'}",
+    ]
+    if clog is not None:
+        parts.append(f"Clog: {clog:.2f}% sells")
+    return "\n".join(parts)
+
+
 def send_ui_criteria_message(
     pair_addr: str,
     passes: int,
@@ -7098,6 +7147,15 @@ def handle_passing_refreshes():
                     data["last_liq_check"] = now_ts
                     if passes < MIN_PASS_THRESHOLD:
                         logger.info(f"[Refresh] => removing {pair} from passing.")
+                        send_telegram_message(
+                            _build_refresh_downgrade_alert(
+                                pair,
+                                passes,
+                                total,
+                                attempt_num,
+                                xtra,
+                            )
+                        )
                         remove_list.append(pair)
         else:
             # no more attempts
