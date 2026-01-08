@@ -2052,6 +2052,8 @@ def _build_commands_overview() -> str:
         "/status - runtime summary",
         "/health - health assessment",
         "/commands - list available controls",
+        "/cmds - list available controls (backup)",
+        "/menu - list available controls (backup)",
         "/monitor_on <token-or-pair-address>",
         "/monitor_off <token-or-pair-address>",
         "/monitor_off_all",
@@ -2206,7 +2208,7 @@ def _telegram_command_listener():
                         continue
                     report = build_liquidity_lock_snapshot(arg)
                     send_telegram_message(report)
-                elif cmd in ("/status", "/health", "/commands", "/help"):
+                elif cmd in ("/status", "/health", "/commands", "/cmds", "/menu", "/help"):
                     if cmd == "/status":
                         send_telegram_message(_build_status_message())
                     elif cmd == "/health":
