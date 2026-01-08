@@ -37,6 +37,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
+from logging.handlers import TimedRotatingFileHandler
 import requests
 import numpy as np
 import prometheus_client
@@ -546,13 +547,32 @@ PAIR_QUEUE_MAXSIZE = int(os.getenv("PAIR_QUEUE_MAXSIZE", "500"))
 PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
 MAINTENANCE_LOOP_SLEEP = int(os.getenv("MAINTENANCE_LOOP_SLEEP", "2"))
 PROMETHEUS_METRICS_PORT = int(os.getenv("PROMETHEUS_METRICS_PORT", "8000"))
+BOT_START_TS = time.time()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = os.getenv("LOG_JSON", "0").lower() in ("1", "true", "yes", "on")
+LOG_TO_FILE = os.getenv("LOG_TO_FILE", "1").lower() in ("1", "true", "yes", "on")
+LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", os.path.join(SCRIPT_DIR, "logs", "bot.log"))
+LOG_FILE_BACKUPS = int(os.getenv("LOG_FILE_BACKUPS", "7"))
+
+log_handlers = [logging.StreamHandler()]
+if LOG_TO_FILE:
+    log_dir = os.path.dirname(LOG_FILE_PATH)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE_PATH,
+        when="midnight",
+        backupCount=LOG_FILE_BACKUPS,
+        encoding="utf-8",
+        utc=True,
+    )
+    log_handlers.append(file_handler)
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="[%(levelname)s] %(asctime)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=log_handlers,
     force=True,
 )
 logger = logging.getLogger("trading_bot")
@@ -664,6 +684,8 @@ class MetricsCollector:
         self.daily_period_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+        self.last_summary: Dict[str, Any] = {}
+        self.last_summary_ts: float = 0.0
         threading.Thread(target=self._emit_loop, daemon=True).start()
 
     def increment(self, name: str, value: int = 1) -> None:
@@ -780,6 +802,10 @@ class MetricsCollector:
             else 0.0,
         }
 
+        with self.lock:
+            self.last_summary = dict(context)
+            self.last_summary_ts = now
+
         log_event(logging.INFO, "metrics", "runtime_metrics", context=context)
 
         if (not zero_alerted) and (now - last_pair_seen >= self.zero_throughput_window):
@@ -877,6 +903,10 @@ class MetricsCollector:
             logger.exception("queue_depth_callback_error")
             return {}
         return dict(data)
+
+    def get_last_summary(self) -> Tuple[Dict[str, Any], float]:
+        with self.lock:
+            return dict(self.last_summary), float(self.last_summary_ts)
 
     def snapshot_daily_totals(
         self, reference: Optional[datetime] = None
@@ -2017,6 +2047,86 @@ def _telegram_refresh_loop():
             _run_refresh_cycle(key, entry)
 
 
+def _build_commands_overview() -> str:
+    commands = [
+        "/status - runtime summary",
+        "/health - health assessment",
+        "/commands - list available controls",
+        "/cmds - list available controls (backup)",
+        "/menu - list available controls (backup)",
+        "/monitor_on <token-or-pair-address>",
+        "/monitor_off <token-or-pair-address>",
+        "/monitor_off_all",
+        "/monitor_list",
+        "/refresh_on <pair-address> [seconds]",
+        "/refresh_off <pair-address>",
+        "/refresh_list",
+        "/lock_check <pair-address>",
+    ]
+    return "🛠️ Available commands:\n" + "\n".join(f"• {cmd}" for cmd in commands)
+
+
+def _build_status_message() -> str:
+    counts = metrics.get_recent_counts(3600)
+    queue_depths = metrics.get_queue_depths()
+    summary, summary_ts = metrics.get_last_summary()
+    uptime = _format_duration_brief(int(time.time() - BOT_START_TS))
+    summary_age = (
+        f"{int(time.time() - summary_ts)}s ago" if summary_ts else "not yet"
+    )
+    lines = [
+        "📊 Bot status",
+        f"Uptime: {uptime or '0m'}",
+        f"Pairs scanned (1h): {counts.get('pairs_scanned', 0)}",
+        f"Pairs passed (1h): {counts.get('passes', 0)}",
+        f"Queue depth: {queue_depths}",
+        f"Last metrics: {summary_age}",
+    ]
+    if summary:
+        lines.append(
+            "Rates: "
+            f"pairs/min {summary.get('pairs_scanned_per_min', 0)}, "
+            f"failure {summary.get('failure_rate', 0)}, "
+            f"api_error {summary.get('api_error_rate', 0)}"
+        )
+        lines.append(
+            "RPC latency p95/p99: "
+            f"{summary.get('rpc_latency_p95_ms', 0)}ms/"
+            f"{summary.get('rpc_latency_p99_ms', 0)}ms"
+        )
+    return "\n".join(lines)
+
+
+def _build_health_message() -> str:
+    summary, summary_ts = metrics.get_last_summary()
+    reasons: List[str] = []
+    status = "HEALTHY"
+    if not summary:
+        status = "UNKNOWN"
+        reasons.append("No metrics summary emitted yet")
+    else:
+        failure_rate = summary.get("failure_rate", 0.0) or 0.0
+        api_error_rate = summary.get("api_error_rate", 0.0) or 0.0
+        pairs_per_min = summary.get("pairs_scanned_per_min", 0.0) or 0.0
+        if failure_rate >= metrics.failure_rate_threshold:
+            status = "DEGRADED"
+            reasons.append(
+                f"Failure rate {failure_rate:.2%} >= {metrics.failure_rate_threshold:.2%}"
+            )
+        if api_error_rate >= 0.1:
+            status = "DEGRADED"
+            reasons.append(f"API error rate {api_error_rate:.2%} >= 10%")
+        if pairs_per_min == 0:
+            status = "DEGRADED"
+            reasons.append("No pairs scanned in latest window")
+    age_line = (
+        f"{int(time.time() - summary_ts)}s ago" if summary_ts else "not yet"
+    )
+    header = f"🩺 Health: {status}"
+    body = "\n".join(f"• {reason}" for reason in reasons) if reasons else "• All clear"
+    return f"{header}\nLast metrics: {age_line}\n{body}"
+
+
 
 
 # ---------------------------------------------------------
@@ -2051,7 +2161,7 @@ def _telegram_command_listener():
                 if not text.startswith("/"):
                     continue
                 parts = text.split()
-                cmd = parts[0].lower()
+                cmd = parts[0].lower().split("@", 1)[0]
                 arg = parts[1] if len(parts) > 1 else ""
                 extra = parts[2] if len(parts) > 2 else None
                 if cmd in ("/monitor_on", "/monitoron"):
@@ -2098,6 +2208,13 @@ def _telegram_command_listener():
                         continue
                     report = build_liquidity_lock_snapshot(arg)
                     send_telegram_message(report)
+                elif cmd in ("/status", "/health", "/commands", "/cmds", "/menu", "/help"):
+                    if cmd == "/status":
+                        send_telegram_message(_build_status_message())
+                    elif cmd == "/health":
+                        send_telegram_message(_build_health_message())
+                    else:
+                        send_telegram_message(_build_commands_overview())
         except Exception as e:
             logger.debug(f"telegram listener error: {e}")
         finally:
