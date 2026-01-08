@@ -37,6 +37,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, Tuple, List, Union, Set, Any
 from openpyxl import Workbook, load_workbook
 import traceback
+from logging.handlers import TimedRotatingFileHandler
 import requests
 import numpy as np
 import prometheus_client
@@ -550,10 +551,28 @@ BOT_START_TS = time.time()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_JSON = os.getenv("LOG_JSON", "0").lower() in ("1", "true", "yes", "on")
+LOG_TO_FILE = os.getenv("LOG_TO_FILE", "1").lower() in ("1", "true", "yes", "on")
+LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", os.path.join(SCRIPT_DIR, "logs", "bot.log"))
+LOG_FILE_BACKUPS = int(os.getenv("LOG_FILE_BACKUPS", "7"))
+
+log_handlers = [logging.StreamHandler()]
+if LOG_TO_FILE:
+    log_dir = os.path.dirname(LOG_FILE_PATH)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE_PATH,
+        when="midnight",
+        backupCount=LOG_FILE_BACKUPS,
+        encoding="utf-8",
+        utc=True,
+    )
+    log_handlers.append(file_handler)
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="[%(levelname)s] %(asctime)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=log_handlers,
     force=True,
 )
 logger = logging.getLogger("trading_bot")
