@@ -1,0 +1,77 @@
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+5 0 obj << /Length 1220 >> stream
+BT
+/F1 11 Tf
+50 750 Td
+(Institutional Scan Review) Tj
+0 -14 Td
+(Generated: 2026-01-08 23:19:30 UTC) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Pair: 0x542DB2d78047E362FA7Fc94bA744B2264275845A) Tj
+0 -14 Td
+(Trace ID: unknown) Tj
+0 -14 Td
+(First seen \\(DexScreener not listed\\): unknown) Tj
+0 -14 Td
+(Recheck pass time: unknown) Tj
+0 -14 Td
+(Recheck score: unknown) Tj
+0 -14 Td
+(Auto-refresh enabled: unknown) Tj
+0 -14 Td
+(Refresh pass time: unknown) Tj
+0 -14 Td
+(Refresh score: unknown) Tj
+0 -14 Td
+(Refresh removed: not removed) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Pair: 0x41cE04Ec71059CE20316db0BdDF84669A2Dd9e9A) Tj
+0 -14 Td
+(Trace ID: unknown) Tj
+0 -14 Td
+(First seen \\(DexScreener not listed\\): unknown) Tj
+0 -14 Td
+(Recheck pass time: unknown) Tj
+0 -14 Td
+(Recheck score: unknown) Tj
+0 -14 Td
+(Auto-refresh enabled: unknown) Tj
+0 -14 Td
+(Refresh pass time: unknown) Tj
+0 -14 Td
+(Refresh score: unknown) Tj
+0 -14 Td
+(Refresh removed: not removed) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Key recommendations:) Tj
+0 -14 Td
+(1\\) Require multiple refresh passes before trade-ready flag.) Tj
+0 -14 Td
+(2\\) Alert immediately on refresh downgrade/removal events.) Tj
+0 -14 Td
+(3\\) Enforce minimum DexScreener availability window before passing.) Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+1583
+%%EOF
