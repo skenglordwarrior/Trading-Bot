@@ -523,8 +523,8 @@ def get_non_weth_token(token0: str, token1: str) -> str:
 RECHECK_DELAYS = [60, 180, 300, 600, 1800]  # 1m,3m,5m,10m,30m
 
 # Watchlist (slow-burn) monitoring for near-miss pairs
-WATCHLIST_MIN_PASSES = 6
 WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
+WATCHLIST_MIN_PASSES = max(1, WATCHLIST_MAX_PASSES - 2)
 WATCHLIST_MIN_LIQUIDITY_USD = MIN_LIQUIDITY_USD
 WATCHLIST_MIN_VOLUME_USD = MIN_VOLUME_USD * 0.5
 WATCHLIST_CHECK_INTERVAL = 1800  # 30 minutes
