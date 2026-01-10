@@ -8274,11 +8274,23 @@ def save_last_block(bn: int, fname: str):
         pass
 
 
+def ensure_slither_available() -> None:
+    if shutil.which("slither") is None:
+        logger.warning("slither executable not found; contract analysis will be limited")
+        send_telegram_message(
+            "⚠️ Slither is not installed. Contract analysis will skip Slither checks "
+            "until it is available."
+        )
+    else:
+        logger.info("slither executable found; advanced contract analysis enabled")
+
+
 def main():
     global runtime_reporter
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
     prometheus_client.start_http_server(PROMETHEUS_METRICS_PORT)
     ensure_etherscan_connectivity()
+    ensure_slither_available()
     if runtime_reporter is None:
         runtime_reporter = RuntimeReporter(metrics)
     start_pair_workers()
