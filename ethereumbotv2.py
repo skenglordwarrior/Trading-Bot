@@ -533,6 +533,10 @@ WATCHLIST_MAX_AGE_SECONDS = 12 * 3600  # 12 hours
 WATCHLIST_GROWTH_PCT = 0.2
 WATCHLIST_MC_MILESTONES = [3, 5, 10]
 
+# Slither safety thresholds (set to tighten contract analysis gating)
+SLITHER_MAX_HIGH_ISSUES = 0
+SLITHER_MAX_MEDIUM_ISSUES = 1
+
 # Passing refresh intervals
 PASSING_REFRESH_DELAYS = [
     30,
@@ -5004,14 +5008,18 @@ def check_renounced_by_event(addr: str) -> bool:
 
 
 def run_slither_analysis(source: object) -> dict:
-    """Run Slither on the given source code and return issue count.
+    """Run Slither on the given source code and return issue details.
 
     ``source`` can be a string (single Solidity file) or a list of
     ``{"filename": str, "content": str}`` dictionaries representing a project.
     """
     import tempfile, subprocess, json as _json, shutil
 
-    result = {"slitherIssues": None}
+    result = {
+        "slitherIssues": None,
+        "slitherIssueCounts": None,
+        "slitherDetectors": None,
+    }
     if shutil.which("slither") is None:
         logger.warning("slither executable not found; skipping analysis")
         result["slitherIssues"] = "not_installed"
@@ -5042,7 +5050,20 @@ def run_slither_analysis(source: object) -> dict:
             )
             data = _json.load(open(out_json, encoding="utf-8"))
             issues = data.get("results", {}).get("detectors", [])
+            counts = {"high": 0, "medium": 0, "low": 0, "informational": 0, "unknown": 0}
+            detectors = set()
+            for issue in issues:
+                impact = str(issue.get("impact", "")).lower()
+                if impact in counts:
+                    counts[impact] += 1
+                else:
+                    counts["unknown"] += 1
+                detector_name = issue.get("check") or issue.get("title")
+                if detector_name:
+                    detectors.add(detector_name)
             result["slitherIssues"] = len(issues)
+            result["slitherIssueCounts"] = counts
+            result["slitherDetectors"] = sorted(detectors)
     except subprocess.CalledProcessError as e:
         stdout = (
             e.stdout.decode("utf-8", errors="replace")
@@ -5089,8 +5110,12 @@ def advanced_contract_check(token_addr: str) -> dict:
         slither_res = run_slither_analysis(info["source"])
         if slither_res.get("slitherIssues") is not None:
             flags["slitherIssues"] = slither_res["slitherIssues"]
+            flags["slitherIssueCounts"] = slither_res.get("slitherIssueCounts")
+            flags["slitherDetectors"] = slither_res.get("slitherDetectors")
         else:
             flags["slitherIssues"] = "error"
+            flags["slitherIssueCounts"] = None
+            flags["slitherDetectors"] = None
         if impl:
             flags["upgradeableProxy"] = True
         if renounced:
@@ -5109,6 +5134,12 @@ def advanced_contract_check(token_addr: str) -> dict:
             score += 3
         if isinstance(flags.get("slitherIssues"), int):
             score += min(flags["slitherIssues"], 5)
+        counts = flags.get("slitherIssueCounts") or {}
+        if isinstance(counts, dict):
+            high = counts.get("high", 0)
+            medium = counts.get("medium", 0)
+            low = counts.get("low", 0)
+            score += min(high * 3 + medium * 2 + low, 8)
         if not renounced:
             score += 2
         if score >= 10:
@@ -5126,6 +5157,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": flags.get("slitherIssues"),
+            "slitherIssueCounts": flags.get("slitherIssueCounts"),
+            "slitherDetectors": flags.get("slitherDetectors"),
             "ownerActivity": suspicious_activity,
             "privateSale": private_sale,
             "onChainMetrics": onchain_metrics,
@@ -5831,7 +5864,7 @@ def check_pair_criteria(
     main_token = get_non_weth_token(token0, token1)
     counter_token = token1 if main_token.lower() == token0.lower() else token0
 
-    expected_total_checks = 14
+    expected_total_checks = 16
 
     dex_data, dex_reason = fetch_dexscreener_data(
         main_token, pair_addr, with_reason=True
@@ -5895,6 +5928,8 @@ def check_pair_criteria(
             "implementation": None,
             "renounced": None,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
             "privateSale": {},
             "onChainMetrics": {},
             "error": str(exc),
@@ -5912,6 +5947,8 @@ def check_pair_criteria(
             "implementation": contract_info.get("implementation"),
             "contractRenounced": contract_info.get("renounced"),
             "slitherIssues": contract_info.get("slitherIssues"),
+            "slitherIssueCounts": contract_info.get("slitherIssueCounts"),
+            "slitherDetectors": contract_info.get("slitherDetectors"),
             "privateSale": contract_info.get("privateSale", {}),
             "onChainMetrics": contract_info.get("onChainMetrics", {}),
             "contractAnalysisError": contract_info.get("error"),
@@ -5951,6 +5988,15 @@ def check_pair_criteria(
     add_check(
         "risk_score",
         isinstance(risk_score, (int, float)) and risk_score < 10,
+    )
+    slither_counts = contract_info.get("slitherIssueCounts") or {}
+    add_check(
+        "slither_high_issues",
+        slither_counts.get("high", 0) <= SLITHER_MAX_HIGH_ISSUES,
+    )
+    add_check(
+        "slither_medium_issues",
+        slither_counts.get("medium", 0) <= SLITHER_MAX_MEDIUM_ISSUES,
     )
     add_check("renounced", contract_info.get("renounced") is True)
     private_sale = contract_info.get("privateSale", {})
@@ -6514,14 +6560,18 @@ def check_renounced_by_event(addr: str) -> bool:
 
 
 def run_slither_analysis(source: object) -> dict:
-    """Run Slither on the given source code and return issue count.
+    """Run Slither on the given source code and return issue details.
 
     ``source`` can be a string (single Solidity file) or a list of
     ``{"filename": str, "content": str}`` dictionaries representing a project.
     """
     import tempfile, subprocess, json as _json, shutil
 
-    result = {"slitherIssues": None}
+    result = {
+        "slitherIssues": None,
+        "slitherIssueCounts": None,
+        "slitherDetectors": None,
+    }
     if shutil.which("slither") is None:
         logger.warning("slither executable not found; skipping analysis")
         result["slitherIssues"] = "not_installed"
@@ -6552,7 +6602,20 @@ def run_slither_analysis(source: object) -> dict:
             )
             data = _json.load(open(out_json, encoding="utf-8"))
             issues = data.get("results", {}).get("detectors", [])
+            counts = {"high": 0, "medium": 0, "low": 0, "informational": 0, "unknown": 0}
+            detectors = set()
+            for issue in issues:
+                impact = str(issue.get("impact", "")).lower()
+                if impact in counts:
+                    counts[impact] += 1
+                else:
+                    counts["unknown"] += 1
+                detector_name = issue.get("check") or issue.get("title")
+                if detector_name:
+                    detectors.add(detector_name)
             result["slitherIssues"] = len(issues)
+            result["slitherIssueCounts"] = counts
+            result["slitherDetectors"] = sorted(detectors)
     except subprocess.CalledProcessError as e:
         stdout = (
             e.stdout.decode("utf-8", errors="replace")
@@ -6594,8 +6657,12 @@ def advanced_contract_check(token_addr: str) -> dict:
         slither_res = run_slither_analysis(info["source"])
         if slither_res.get("slitherIssues") is not None:
             flags["slitherIssues"] = slither_res["slitherIssues"]
+            flags["slitherIssueCounts"] = slither_res.get("slitherIssueCounts")
+            flags["slitherDetectors"] = slither_res.get("slitherDetectors")
         else:
             flags["slitherIssues"] = "error"
+            flags["slitherIssueCounts"] = None
+            flags["slitherDetectors"] = None
         if impl:
             flags["upgradeableProxy"] = True
         if renounced:
@@ -6612,6 +6679,12 @@ def advanced_contract_check(token_addr: str) -> dict:
             score += 3
         if isinstance(flags.get("slitherIssues"), int):
             score += min(flags["slitherIssues"], 5)
+        counts = flags.get("slitherIssueCounts") or {}
+        if isinstance(counts, dict):
+            high = counts.get("high", 0)
+            medium = counts.get("medium", 0)
+            low = counts.get("low", 0)
+            score += min(high * 3 + medium * 2 + low, 8)
         if not renounced:
             score += 2
         if score >= 10:
@@ -6629,6 +6702,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": flags.get("slitherIssues"),
+            "slitherIssueCounts": flags.get("slitherIssueCounts"),
+            "slitherDetectors": flags.get("slitherDetectors"),
             "ownerActivity": suspicious_activity,
             "privateSale": private_sale,
             "onChainMetrics": onchain_metrics,
@@ -6646,6 +6721,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
         }
     else:
         return {
@@ -6659,6 +6736,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
             "error": info.get("error"),
         }
 
