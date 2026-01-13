@@ -522,6 +522,23 @@ def get_non_weth_token(token0: str, token1: str) -> str:
 
 # Re-check intervals for failing pairs
 RECHECK_DELAYS = [60, 180, 300, 600, 1800]  # 1m,3m,5m,10m,30m
+RECHECK_BACKLOG_THRESHOLD = int(os.getenv("RECHECK_BACKLOG_THRESHOLD", "30"))
+RECHECK_MAX_PER_CYCLE = int(os.getenv("RECHECK_MAX_PER_CYCLE", "25"))
+RECHECK_BACKLOG_BURST = int(os.getenv("RECHECK_BACKLOG_BURST", "80"))
+
+# Watchlist (slow-burn) monitoring for near-miss pairs
+WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
+WATCHLIST_MIN_PASSES = max(1, WATCHLIST_MAX_PASSES - 2)
+WATCHLIST_MIN_LIQUIDITY_USD = MIN_LIQUIDITY_USD
+WATCHLIST_MIN_VOLUME_USD = MIN_VOLUME_USD * 0.5
+WATCHLIST_CHECK_INTERVAL = 1800  # 30 minutes
+WATCHLIST_MAX_AGE_SECONDS = 12 * 3600  # 12 hours
+WATCHLIST_GROWTH_PCT = 0.2
+WATCHLIST_MC_MILESTONES = [3, 5, 10]
+
+# Slither safety thresholds (set to tighten contract analysis gating)
+SLITHER_MAX_HIGH_ISSUES = 0
+SLITHER_MAX_MEDIUM_ISSUES = 1
 
 # Watchlist (slow-burn) monitoring for near-miss pairs
 WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
@@ -548,6 +565,10 @@ PASSING_REFRESH_DELAYS = [
     600,
     900,
 ]  # 30s,45s,45s,30s,1m,5m,10m,15m
+REFRESH_OVERDUE_MULTIPLIER = float(os.getenv("REFRESH_OVERDUE_MULTIPLIER", "2.0"))
+REFRESH_OVERDUE_ALERT_COOLDOWN = int(
+    os.getenv("REFRESH_OVERDUE_ALERT_COOLDOWN", "900")
+)
 
 # Additional silent MC check
 SILENT_CHECK_INTERVAL = 600  # 10 min
@@ -6787,6 +6808,7 @@ def queue_passing_refresh(
                 "first_sell_detected": False,
                 "verification_retry_at": 0,
                 "verification_warning": False,
+                "refresh_overdue_alerted_at": 0,
             }
             auto_refresh_added = True
 
@@ -7295,6 +7317,15 @@ def handle_passing_refreshes():
         # normal refresh attempts
         if idx < len(PASSING_REFRESH_DELAYS):
             delay = PASSING_REFRESH_DELAYS[idx]
+            overdue_seconds = (now_ts - data["last_attempt"]) - delay
+            if overdue_seconds > (delay * REFRESH_OVERDUE_MULTIPLIER):
+                last_alert = data.get("refresh_overdue_alerted_at", 0)
+                if (now_ts - last_alert) >= REFRESH_OVERDUE_ALERT_COOLDOWN:
+                    data["refresh_overdue_alerted_at"] = now_ts
+                    send_telegram_message(
+                        f"⚠️ <b>Refresh overdue</b>\nPair: <code>{pair}</code>\n"
+                        f"Expected ~{int(delay)}s, overdue by {int(overdue_seconds)}s."
+                    )
             if (now_ts - data["last_attempt"]) >= delay:
                 retry_at = data.get("verification_retry_at", 0)
                 if retry_at and now_ts < retry_at:
@@ -7758,6 +7789,11 @@ def handle_rechecks():
     with state_lock:
         pending_items = list(pending_rechecks.items())
 
+    backlog_size = len(pending_items)
+    max_per_cycle = (
+        RECHECK_BACKLOG_BURST if backlog_size >= RECHECK_BACKLOG_THRESHOLD else RECHECK_MAX_PER_CYCLE
+    )
+    due_items = []
     for pair, data in pending_items:
         with state_lock:
             idx = data["attempt_index"]
@@ -7771,129 +7807,134 @@ def handle_rechecks():
         with state_lock:
             last_attempt = data["last_attempt"]
             retry_at = data.get("verification_retry_at", 0)
-        if (now_ts - last_attempt) >= delay:
-            if retry_at and now_ts < retry_at:
-                continue
-            with state_lock:
-                data["attempt_index"] += 1
-                data["last_attempt"] = now_ts
-                attempt_num = data["attempt_index"]
-                token0 = data["token0"]
-                token1 = data["token1"]
-            logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
+        overdue = (now_ts - last_attempt) - delay
+        if overdue >= 0 and (not retry_at or now_ts >= retry_at):
+            due_items.append((overdue, pair, data))
 
-            passes, total, extra = recheck_logic_detail(
-                pair, token0, token1, attempt_num, False
-            )
-            with state_lock:
-                data["last_extra"] = extra
-                data["last_passes"] = passes
-                data["last_total"] = total
-            if isinstance(extra, dict) and extra.get("dexscreener_missing"):
-                dex_reason = extra.get("dexscreener_reason", "unknown")
-                if extra.get("should_requeue", True):
+    due_items.sort(reverse=True, key=lambda item: item[0])
+    processed = 0
+    for _, pair, data in due_items:
+        if processed >= max_per_cycle:
+            break
+        with state_lock:
+            data["attempt_index"] += 1
+            data["last_attempt"] = now_ts
+            attempt_num = data["attempt_index"]
+            token0 = data["token0"]
+            token1 = data["token1"]
+        logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
+
+        passes, total, extra = recheck_logic_detail(
+            pair, token0, token1, attempt_num, False
+        )
+        with state_lock:
+            data["last_extra"] = extra
+            data["last_passes"] = passes
+            data["last_total"] = total
+        processed += 1
+        if isinstance(extra, dict) and extra.get("dexscreener_missing"):
+            dex_reason = extra.get("dexscreener_reason", "unknown")
+            if extra.get("should_requeue", True):
+                logger.info(
+                    f"[Recheck] => {pair} DexScreener unavailable ({dex_reason}); will retry"
+                )
+            else:
+                age = extra.get("dexscreener_not_listed_age")
+                retry_window = extra.get("dexscreener_retry_window")
+                if age is not None and extra.get("dexscreener_retry_window_expired"):
                     logger.info(
-                        f"[Recheck] => {pair} DexScreener unavailable ({dex_reason}); will retry"
+                        f"[Recheck] => removing {pair}, DexScreener still not listed after"
+                        f" ~{age:.1f}s (window {retry_window}s)"
                     )
                 else:
-                    age = extra.get("dexscreener_not_listed_age")
-                    retry_window = extra.get("dexscreener_retry_window")
-                    if age is not None and extra.get(
-                        "dexscreener_retry_window_expired"
-                    ):
-                        logger.info(
-                            f"[Recheck] => removing {pair}, DexScreener still not listed after"
-                            f" ~{age:.1f}s (window {retry_window}s)"
-                        )
-                    else:
-                        logger.info(
-                            f"[Recheck] => removing {pair}, DexScreener unavailable ({dex_reason})"
-                        )
-                    rm_list.append(pair)
-                continue
-            fail, reason = critical_verification_failure(extra)
-            if fail:
-                if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
-                    _schedule_verification_retry(
-                        pair,
-                        data,
-                        extra,
-                        context="recheck",
-                        attempt_num=attempt_num,
+                    logger.info(
+                        f"[Recheck] => removing {pair}, DexScreener unavailable ({dex_reason})"
                     )
-                    continue
-                logger.info(f"[Remove] {pair} removed: {reason}")
-                if reason not in ("verification error", "risk score 9999"):
-                    send_telegram_message(f"[Remove] {pair} removed: {reason}")
+                rm_list.append(pair)
+            continue
+        fail, reason = critical_verification_failure(extra)
+        if fail:
+            if reason == "verification error" and passes >= MIN_PASS_THRESHOLD:
+                _schedule_verification_retry(
+                    pair,
+                    data,
+                    extra,
+                    context="recheck",
+                    attempt_num=attempt_num,
+                )
+                continue
+            logger.info(f"[Remove] {pair} removed: {reason}")
+            if reason not in ("verification error", "risk score 9999"):
+                send_telegram_message(f"[Remove] {pair} removed: {reason}")
+            rm_list.append(pair)
+            continue
+        else:
+            with state_lock:
+                if data.get("verification_warning"):
+                    data["verification_warning"] = False
+                    data["verification_retry_at"] = 0
+        if passes >= MIN_PASS_THRESHOLD:
+            vol_now = extra.get("volume24h", 0)
+            trades_now = extra.get("buys", 0) + extra.get("sells", 0)
+            if vol_now >= MIN_VOLUME_USD and trades_now >= MIN_TRADES_REQUIRED:
+                logger.info(f"[Recheck] => removing {pair}, now passing.")
+                rm_list.append(pair)
+                mc_now = extra.get("marketCap", 0)
+                liq_now = extra.get("liquidityUsd", 0)
+                send_ui_criteria_message(
+                    pair,
+                    passes,
+                    total,
+                    is_recheck=True,
+                    token_name=extra.get("tokenName", ""),
+                    clog_percent=extra.get("clogPercent"),
+                    extra_stats=extra,
+                    recheck_attempt=attempt_num,
+                    is_passing_refresh=False,
+                )
+                with state_lock:
+                    token0 = data.get("token0")
+                    token1 = data.get("token1")
+                queue_passing_refresh(pair, token0, token1, mc_now, liq_now)
+                main_token = get_non_weth_token(token0, token1)
+                start_wallet_monitor(main_token)
+                continue
+            else:
+                logger.info(f"[VolumeCheck] waiting on {pair}")
+                with state_lock:
+                    token0 = data.get("token0")
+                    token1 = data.get("token1")
+                queue_volume_check(
+                    pair,
+                    token0,
+                    token1,
+                    passes,
+                    total,
+                    extra,
+                    is_recheck=True,
+                    attempt_num=attempt_num,
+                )
                 rm_list.append(pair)
                 continue
-            else:
+        else:
+            line = (
+                f"- {extra.get('tokenName','Unnamed')} => {passes}/{total} (Attempt #{attempt_num}) "
+                f"Verified={extra.get('contractCheckStatus')} Risk={extra.get('riskScore')}"
+            )
+            if not extra.get("transient_failure"):
+                add_failed_recheck_message(line)
                 with state_lock:
-                    if data.get("verification_warning"):
-                        data["verification_warning"] = False
-                        data["verification_retry_at"] = 0
-            if passes >= MIN_PASS_THRESHOLD:
-                vol_now = extra.get("volume24h", 0)
-                trades_now = extra.get("buys", 0) + extra.get("sells", 0)
-                if vol_now >= MIN_VOLUME_USD and trades_now >= MIN_TRADES_REQUIRED:
-                    logger.info(f"[Recheck] => removing {pair}, now passing.")
-                    rm_list.append(pair)
-                    mc_now = extra.get("marketCap", 0)
-                    liq_now = extra.get("liquidityUsd", 0)
-                    send_ui_criteria_message(
-                        pair,
-                        passes,
-                        total,
-                        is_recheck=True,
-                        token_name=extra.get("tokenName", ""),
-                        clog_percent=extra.get("clogPercent"),
-                        extra_stats=extra,
-                        recheck_attempt=attempt_num,
-                        is_passing_refresh=False,
-                    )
-                    with state_lock:
-                        token0 = data.get("token0")
-                        token1 = data.get("token1")
-                    queue_passing_refresh(pair, token0, token1, mc_now, liq_now)
-                    main_token = get_non_weth_token(token0, token1)
-                    start_wallet_monitor(main_token)
-                    continue
-                else:
-                    logger.info(f"[VolumeCheck] waiting on {pair}")
-                    with state_lock:
-                        token0 = data.get("token0")
-                        token1 = data.get("token1")
-                    queue_volume_check(
-                        pair,
-                        token0,
-                        token1,
-                        passes,
-                        total,
-                        extra,
-                        is_recheck=True,
-                        attempt_num=attempt_num,
-                    )
+                    data["fail_count"] = data.get("fail_count", 0) + 1
+                    fail_count = data["fail_count"]
+                if fail_count >= 3:
+                    logger.info(f"[Recheck] => removing {pair}, failed 3 times")
+                    _maybe_queue_watchlist_from_recheck(pair, data, context="recheck_failed")
                     rm_list.append(pair)
                     continue
             else:
-                line = (
-                    f"- {extra.get('tokenName','Unnamed')} => {passes}/{total} (Attempt #{attempt_num}) "
-                    f"Verified={extra.get('contractCheckStatus')} Risk={extra.get('riskScore')}"
+                logger.info(
+                    f"[Recheck] => {pair} retry deferred due to transient issue"
                 )
-                if not extra.get("transient_failure"):
-                    add_failed_recheck_message(line)
-                    with state_lock:
-                        data["fail_count"] = data.get("fail_count", 0) + 1
-                        fail_count = data["fail_count"]
-                    if fail_count >= 3:
-                        logger.info(f"[Recheck] => removing {pair}, failed 3 times")
-                        _maybe_queue_watchlist_from_recheck(pair, data, context="recheck_failed")
-                        rm_list.append(pair)
-                        continue
-                else:
-                    logger.info(
-                        f"[Recheck] => {pair} retry deferred due to transient issue"
-                    )
 
         # stop after 10 minutes of failures
         with state_lock:
