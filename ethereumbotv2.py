@@ -17,6 +17,7 @@ Features:
 """
 
 import os
+import shutil
 import time
 import json
 import logging
@@ -521,6 +522,20 @@ def get_non_weth_token(token0: str, token1: str) -> str:
 
 # Re-check intervals for failing pairs
 RECHECK_DELAYS = [60, 180, 300, 600, 1800]  # 1m,3m,5m,10m,30m
+
+# Watchlist (slow-burn) monitoring for near-miss pairs
+WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
+WATCHLIST_MIN_PASSES = max(1, WATCHLIST_MAX_PASSES - 2)
+WATCHLIST_MIN_LIQUIDITY_USD = MIN_LIQUIDITY_USD
+WATCHLIST_MIN_VOLUME_USD = MIN_VOLUME_USD * 0.5
+WATCHLIST_CHECK_INTERVAL = 1800  # 30 minutes
+WATCHLIST_MAX_AGE_SECONDS = 12 * 3600  # 12 hours
+WATCHLIST_GROWTH_PCT = 0.2
+WATCHLIST_MC_MILESTONES = [3, 5, 10]
+
+# Slither safety thresholds (set to tighten contract analysis gating)
+SLITHER_MAX_HIGH_ISSUES = 0
+SLITHER_MAX_MEDIUM_ISSUES = 1
 
 # Passing refresh intervals
 PASSING_REFRESH_DELAYS = [
@@ -3494,7 +3509,15 @@ def _fetch_initial_lp_mint(
 async def _gather_lock_details_async(
     pair_addr: str, minted_amount: Optional[Decimal], minted_tx_hash: Optional[str]
 ) -> Tuple[Optional[bool], Optional[LiquidityLockDetails]]:
-    locked, details = await _check_liquidity_locked_uncx_async(pair_addr)
+    uncx_result = await _check_liquidity_locked_uncx_async(pair_addr)
+    if not isinstance(uncx_result, tuple) or len(uncx_result) != 2:
+        logger.debug(
+            "uncx lock check returned unexpected result for %s: %r",
+            pair_addr,
+            uncx_result,
+        )
+        uncx_result = (None, None)
+    locked, details = uncx_result
     txs = _fetch_lp_transfers(pair_addr)
 
     target_amount = details.locked_amount if details and details.locked_amount else minted_amount
@@ -4203,7 +4226,7 @@ async def _check_liquidity_locked_uncx_graph_async(
 
     if result.get("errors"):
         logger.debug("Uncx graph returned errors for %s: %s", pair_addr, result["errors"])
-        return None
+        return None, None
 
     data = result.get("data") or {}
     pool_info = data.get("pool") or {}
@@ -4985,14 +5008,18 @@ def check_renounced_by_event(addr: str) -> bool:
 
 
 def run_slither_analysis(source: object) -> dict:
-    """Run Slither on the given source code and return issue count.
+    """Run Slither on the given source code and return issue details.
 
     ``source`` can be a string (single Solidity file) or a list of
     ``{"filename": str, "content": str}`` dictionaries representing a project.
     """
     import tempfile, subprocess, json as _json, shutil
 
-    result = {"slitherIssues": None}
+    result = {
+        "slitherIssues": None,
+        "slitherIssueCounts": None,
+        "slitherDetectors": None,
+    }
     if shutil.which("slither") is None:
         logger.warning("slither executable not found; skipping analysis")
         result["slitherIssues"] = "not_installed"
@@ -5023,7 +5050,20 @@ def run_slither_analysis(source: object) -> dict:
             )
             data = _json.load(open(out_json, encoding="utf-8"))
             issues = data.get("results", {}).get("detectors", [])
+            counts = {"high": 0, "medium": 0, "low": 0, "informational": 0, "unknown": 0}
+            detectors = set()
+            for issue in issues:
+                impact = str(issue.get("impact", "")).lower()
+                if impact in counts:
+                    counts[impact] += 1
+                else:
+                    counts["unknown"] += 1
+                detector_name = issue.get("check") or issue.get("title")
+                if detector_name:
+                    detectors.add(detector_name)
             result["slitherIssues"] = len(issues)
+            result["slitherIssueCounts"] = counts
+            result["slitherDetectors"] = sorted(detectors)
     except subprocess.CalledProcessError as e:
         stdout = (
             e.stdout.decode("utf-8", errors="replace")
@@ -5070,8 +5110,12 @@ def advanced_contract_check(token_addr: str) -> dict:
         slither_res = run_slither_analysis(info["source"])
         if slither_res.get("slitherIssues") is not None:
             flags["slitherIssues"] = slither_res["slitherIssues"]
+            flags["slitherIssueCounts"] = slither_res.get("slitherIssueCounts")
+            flags["slitherDetectors"] = slither_res.get("slitherDetectors")
         else:
             flags["slitherIssues"] = "error"
+            flags["slitherIssueCounts"] = None
+            flags["slitherDetectors"] = None
         if impl:
             flags["upgradeableProxy"] = True
         if renounced:
@@ -5090,6 +5134,12 @@ def advanced_contract_check(token_addr: str) -> dict:
             score += 3
         if isinstance(flags.get("slitherIssues"), int):
             score += min(flags["slitherIssues"], 5)
+        counts = flags.get("slitherIssueCounts") or {}
+        if isinstance(counts, dict):
+            high = counts.get("high", 0)
+            medium = counts.get("medium", 0)
+            low = counts.get("low", 0)
+            score += min(high * 3 + medium * 2 + low, 8)
         if not renounced:
             score += 2
         if score >= 10:
@@ -5107,6 +5157,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": flags.get("slitherIssues"),
+            "slitherIssueCounts": flags.get("slitherIssueCounts"),
+            "slitherDetectors": flags.get("slitherDetectors"),
             "ownerActivity": suspicious_activity,
             "privateSale": private_sale,
             "onChainMetrics": onchain_metrics,
@@ -5812,7 +5864,7 @@ def check_pair_criteria(
     main_token = get_non_weth_token(token0, token1)
     counter_token = token1 if main_token.lower() == token0.lower() else token0
 
-    expected_total_checks = 14
+    expected_total_checks = 16
 
     dex_data, dex_reason = fetch_dexscreener_data(
         main_token, pair_addr, with_reason=True
@@ -5876,6 +5928,8 @@ def check_pair_criteria(
             "implementation": None,
             "renounced": None,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
             "privateSale": {},
             "onChainMetrics": {},
             "error": str(exc),
@@ -5893,6 +5947,8 @@ def check_pair_criteria(
             "implementation": contract_info.get("implementation"),
             "contractRenounced": contract_info.get("renounced"),
             "slitherIssues": contract_info.get("slitherIssues"),
+            "slitherIssueCounts": contract_info.get("slitherIssueCounts"),
+            "slitherDetectors": contract_info.get("slitherDetectors"),
             "privateSale": contract_info.get("privateSale", {}),
             "onChainMetrics": contract_info.get("onChainMetrics", {}),
             "contractAnalysisError": contract_info.get("error"),
@@ -5932,6 +5988,15 @@ def check_pair_criteria(
     add_check(
         "risk_score",
         isinstance(risk_score, (int, float)) and risk_score < 10,
+    )
+    slither_counts = contract_info.get("slitherIssueCounts") or {}
+    add_check(
+        "slither_high_issues",
+        slither_counts.get("high", 0) <= SLITHER_MAX_HIGH_ISSUES,
+    )
+    add_check(
+        "slither_medium_issues",
+        slither_counts.get("medium", 0) <= SLITHER_MAX_MEDIUM_ISSUES,
     )
     add_check("renounced", contract_info.get("renounced") is True)
     private_sale = contract_info.get("privateSale", {})
@@ -6495,14 +6560,18 @@ def check_renounced_by_event(addr: str) -> bool:
 
 
 def run_slither_analysis(source: object) -> dict:
-    """Run Slither on the given source code and return issue count.
+    """Run Slither on the given source code and return issue details.
 
     ``source`` can be a string (single Solidity file) or a list of
     ``{"filename": str, "content": str}`` dictionaries representing a project.
     """
     import tempfile, subprocess, json as _json, shutil
 
-    result = {"slitherIssues": None}
+    result = {
+        "slitherIssues": None,
+        "slitherIssueCounts": None,
+        "slitherDetectors": None,
+    }
     if shutil.which("slither") is None:
         logger.warning("slither executable not found; skipping analysis")
         result["slitherIssues"] = "not_installed"
@@ -6533,7 +6602,20 @@ def run_slither_analysis(source: object) -> dict:
             )
             data = _json.load(open(out_json, encoding="utf-8"))
             issues = data.get("results", {}).get("detectors", [])
+            counts = {"high": 0, "medium": 0, "low": 0, "informational": 0, "unknown": 0}
+            detectors = set()
+            for issue in issues:
+                impact = str(issue.get("impact", "")).lower()
+                if impact in counts:
+                    counts[impact] += 1
+                else:
+                    counts["unknown"] += 1
+                detector_name = issue.get("check") or issue.get("title")
+                if detector_name:
+                    detectors.add(detector_name)
             result["slitherIssues"] = len(issues)
+            result["slitherIssueCounts"] = counts
+            result["slitherDetectors"] = sorted(detectors)
     except subprocess.CalledProcessError as e:
         stdout = (
             e.stdout.decode("utf-8", errors="replace")
@@ -6575,8 +6657,12 @@ def advanced_contract_check(token_addr: str) -> dict:
         slither_res = run_slither_analysis(info["source"])
         if slither_res.get("slitherIssues") is not None:
             flags["slitherIssues"] = slither_res["slitherIssues"]
+            flags["slitherIssueCounts"] = slither_res.get("slitherIssueCounts")
+            flags["slitherDetectors"] = slither_res.get("slitherDetectors")
         else:
             flags["slitherIssues"] = "error"
+            flags["slitherIssueCounts"] = None
+            flags["slitherDetectors"] = None
         if impl:
             flags["upgradeableProxy"] = True
         if renounced:
@@ -6593,6 +6679,12 @@ def advanced_contract_check(token_addr: str) -> dict:
             score += 3
         if isinstance(flags.get("slitherIssues"), int):
             score += min(flags["slitherIssues"], 5)
+        counts = flags.get("slitherIssueCounts") or {}
+        if isinstance(counts, dict):
+            high = counts.get("high", 0)
+            medium = counts.get("medium", 0)
+            low = counts.get("low", 0)
+            score += min(high * 3 + medium * 2 + low, 8)
         if not renounced:
             score += 2
         if score >= 10:
@@ -6610,6 +6702,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": flags.get("slitherIssues"),
+            "slitherIssueCounts": flags.get("slitherIssueCounts"),
+            "slitherDetectors": flags.get("slitherDetectors"),
             "ownerActivity": suspicious_activity,
             "privateSale": private_sale,
             "onChainMetrics": onchain_metrics,
@@ -6627,6 +6721,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
         }
     else:
         return {
@@ -6640,6 +6736,8 @@ def advanced_contract_check(token_addr: str) -> dict:
             "implementation": impl,
             "renounced": renounced,
             "slitherIssues": None,
+            "slitherIssueCounts": None,
+            "slitherDetectors": None,
             "error": info.get("error"),
         }
 
@@ -6654,6 +6752,9 @@ PASSED_PAIRS: Set[str] = set()
 
 # Pairs waiting to hit minimum volume/trade requirements before promotion
 volume_checks: Dict[str, dict] = {}
+
+# Watchlist for near-miss pairs that may perform later
+watchlist_pairs: Dict[str, dict] = {}
 
 
 def queue_passing_refresh(
@@ -6716,6 +6817,103 @@ def queue_volume_check(
                 "is_recheck": is_recheck,
                 "attempt": attempt_num,
             }
+
+
+def _should_watchlist(passes: int, extra: dict) -> bool:
+    if passes < WATCHLIST_MIN_PASSES or passes > WATCHLIST_MAX_PASSES:
+        return False
+    if extra.get("dexscreener_missing"):
+        return False
+    liquidity = extra.get("liquidityUsd", 0) or 0
+    volume = extra.get("volume24h", 0) or 0
+    return liquidity >= WATCHLIST_MIN_LIQUIDITY_USD or volume >= WATCHLIST_MIN_VOLUME_USD
+
+
+def _build_watchlist_alert(
+    pair_addr: str,
+    passes: int,
+    total: int,
+    extra: dict,
+    *,
+    context: str,
+) -> str:
+    token_name = extra.get("tokenName") or "Unnamed"
+    liquidity = extra.get("liquidityUsd")
+    volume = extra.get("volume24h")
+    market_cap = extra.get("marketCap")
+    risk_score = extra.get("riskScore")
+
+    def _fmt_money(value: Any) -> str:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        return f"${val:,.0f}"
+
+    return "\n".join(
+        [
+            "🟡 <b>Watchlist (slow-burn)</b>",
+            f"Context: {context}",
+            f"Pair: <code>{pair_addr}</code>",
+            f"Token: <b>{token_name}</b>",
+            f"Criteria: <b>{passes}/{total}</b> passes",
+            f"Liquidity: {_fmt_money(liquidity)}",
+            f"24h Volume: {_fmt_money(volume)}",
+            f"Market Cap: {_fmt_money(market_cap)}",
+            f"Risk Score: {risk_score if risk_score is not None else 'unknown'}",
+        ]
+    )
+
+
+def queue_watchlist(
+    pair_addr: str,
+    token0: str,
+    token1: str,
+    passes: int,
+    total: int,
+    extra: dict,
+    *,
+    context: str,
+) -> None:
+    now_ts = time.time()
+    with state_lock:
+        if pair_addr in watchlist_pairs:
+            return
+        watchlist_pairs[pair_addr] = {
+            "token0": token0,
+            "token1": token1,
+            "created": now_ts,
+            "last_check": now_ts,
+            "initial_mc": extra.get("marketCap", 0) or 0,
+            "initial_liq": extra.get("liquidityUsd", 0) or 0,
+            "initial_volume": extra.get("volume24h", 0) or 0,
+            "last_liq": extra.get("liquidityUsd", 0) or 0,
+            "last_volume": extra.get("volume24h", 0) or 0,
+            "growth_hits": 0,
+            "growth_alerted": False,
+            "mc_milestones_hit": set(),
+        }
+    logger.info(f"[Watchlist] queued {pair_addr} ({passes}/{total})")
+    send_telegram_message(_build_watchlist_alert(pair_addr, passes, total, extra, context=context))
+
+
+def _maybe_queue_watchlist_from_recheck(pair_addr: str, data: dict, *, context: str) -> None:
+    extra = data.get("last_extra")
+    passes = data.get("last_passes")
+    total = data.get("last_total")
+    if not isinstance(extra, dict) or passes is None or total is None:
+        return
+    if not _should_watchlist(int(passes), extra):
+        return
+    queue_watchlist(
+        pair_addr,
+        data.get("token0"),
+        data.get("token1"),
+        int(passes),
+        int(total),
+        extra,
+        context=context,
+    )
 
 
 def _format_utc_timestamp(ts: int) -> str:
@@ -6796,6 +6994,47 @@ def _build_lock_info_line(
         return None
 
     return "Lock Info: " + " | ".join(segments)
+
+
+def _build_refresh_downgrade_alert(
+    pair_addr: str,
+    passes: int,
+    total: int,
+    attempt_num: int,
+    extra: Optional[Dict[str, Any]],
+) -> str:
+    stats = extra or {}
+    token_name = stats.get("tokenName") or "Unnamed"
+    liquidity = stats.get("liquidityUsd")
+    volume = stats.get("volume24h")
+    market_cap = stats.get("marketCap")
+    risk_score = stats.get("riskScore")
+    renounced = stats.get("contractRenounced")
+    verified = stats.get("verified")
+    clog = stats.get("clogPercent")
+
+    def _fmt_money(value: Any) -> str:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        return f"${val:,.0f}"
+
+    parts = [
+        f"🔻 <b>Refresh downgrade</b> (Attempt #{attempt_num})",
+        f"Pair: <code>{pair_addr}</code>",
+        f"Token: <b>{token_name}</b>",
+        f"Criteria: <b>{passes}/{total}</b> passes",
+        f"Liquidity: {_fmt_money(liquidity)}",
+        f"24h Volume: {_fmt_money(volume)}",
+        f"Market Cap: {_fmt_money(market_cap)}",
+        f"Risk Score: {risk_score if risk_score is not None else 'unknown'}",
+        f"Renounced: {renounced if renounced is not None else 'unknown'}",
+        f"Verified: {verified if verified is not None else 'unknown'}",
+    ]
+    if clog is not None:
+        parts.append(f"Clog: {clog:.2f}% sells")
+    return "\n".join(parts)
 
 
 def send_ui_criteria_message(
@@ -7098,6 +7337,15 @@ def handle_passing_refreshes():
                     data["last_liq_check"] = now_ts
                     if passes < MIN_PASS_THRESHOLD:
                         logger.info(f"[Refresh] => removing {pair} from passing.")
+                        send_telegram_message(
+                            _build_refresh_downgrade_alert(
+                                pair,
+                                passes,
+                                total,
+                                attempt_num,
+                                xtra,
+                            )
+                        )
                         remove_list.append(pair)
         else:
             # no more attempts
@@ -7257,6 +7505,106 @@ def handle_passing_refreshes():
             logger.info(f"[PassingPairs] => removed {rm}")
 
 
+def handle_watchlist():
+    now_ts = time.time()
+    remove_list = []
+    with state_lock:
+        items = list(watchlist_pairs.items())
+
+    for pair, data in items:
+        age = now_ts - data.get("created", now_ts)
+        if age >= WATCHLIST_MAX_AGE_SECONDS:
+            logger.info(f"[Watchlist] => removing {pair}, max age reached")
+            remove_list.append(pair)
+            continue
+
+        if (now_ts - data.get("last_check", 0)) < WATCHLIST_CHECK_INTERVAL:
+            continue
+
+        data["last_check"] = now_ts
+        token0 = data.get("token0")
+        token1 = data.get("token1")
+        if not token0 or not token1:
+            remove_list.append(pair)
+            continue
+
+        passes, total, extra = check_pair_criteria(pair, token0, token1)
+        if extra.get("dexscreener_missing"):
+            logger.info(f"[Watchlist] {pair} DexScreener unavailable, retrying later")
+            continue
+
+        if passes >= MIN_PASS_THRESHOLD:
+            logger.info(f"[Watchlist] => promoting {pair} to passing")
+            mc_now = extra.get("marketCap", 0)
+            liq_now = extra.get("liquidityUsd", 0)
+            vol_now = extra.get("volume24h", 0)
+            send_ui_criteria_message(
+                pair,
+                passes,
+                total,
+                is_recheck=True,
+                token_name=extra.get("tokenName", ""),
+                clog_percent=extra.get("clogPercent"),
+                extra_stats=extra,
+                recheck_attempt=None,
+                is_passing_refresh=False,
+            )
+            trades_now = extra.get("buys", 0) + extra.get("sells", 0)
+            if vol_now >= MIN_VOLUME_USD and trades_now >= MIN_TRADES_REQUIRED:
+                queue_passing_refresh(pair, token0, token1, mc_now, liq_now)
+            else:
+                queue_volume_check(
+                    pair,
+                    token0,
+                    token1,
+                    passes,
+                    total,
+                    extra,
+                    is_recheck=True,
+                    attempt_num=None,
+                )
+            remove_list.append(pair)
+            continue
+
+        if passes < WATCHLIST_MIN_PASSES:
+            logger.info(f"[Watchlist] => removing {pair}, below threshold")
+            remove_list.append(pair)
+            continue
+
+        mc_now = extra.get("marketCap", 0) or 0
+        init_mc = data.get("initial_mc", 0) or 0
+        if init_mc > 0:
+            ratio = mc_now / init_mc
+            for milestone in WATCHLIST_MC_MILESTONES:
+                if ratio >= milestone and milestone not in data["mc_milestones_hit"]:
+                    data["mc_milestones_hit"].add(milestone)
+                    send_telegram_message(
+                        f"[DelayedGrowth] {pair} reached {milestone}x from ${init_mc:,.0f}"
+                    )
+
+        last_liq = data.get("last_liq", 0) or 0
+        last_vol = data.get("last_volume", 0) or 0
+        liq_now = extra.get("liquidityUsd", 0) or 0
+        vol_now = extra.get("volume24h", 0) or 0
+        if last_liq and liq_now >= last_liq * (1 + WATCHLIST_GROWTH_PCT):
+            data["growth_hits"] = data.get("growth_hits", 0) + 1
+        if last_vol and vol_now >= last_vol * (1 + WATCHLIST_GROWTH_PCT):
+            data["growth_hits"] = data.get("growth_hits", 0) + 1
+
+        if data.get("growth_hits", 0) >= 2 and not data.get("growth_alerted"):
+            data["growth_alerted"] = True
+            send_telegram_message(
+                f"[DelayedGrowth] {pair} showing sustained liquidity/volume growth"
+            )
+
+        data["last_liq"] = liq_now
+        data["last_volume"] = vol_now
+
+    with state_lock:
+        for rm in remove_list:
+            watchlist_pairs.pop(rm, None)
+
+
 def handle_volume_checks():
     now = time.time()
     remove = []
@@ -7381,6 +7729,7 @@ def _collect_queue_depth() -> dict:
             "passing_pairs": len(passing_pairs),
             "volume_checks": len(volume_checks),
             "pending_rechecks": len(pending_rechecks),
+            "watchlist_pairs": len(watchlist_pairs),
             "new_pairs": discovered_pairs_queue.qsize(),
         }
 
@@ -7414,6 +7763,7 @@ def handle_rechecks():
             idx = data["attempt_index"]
         if idx >= len(RECHECK_DELAYS):
             logger.info(f"[Recheck] => removing {pair}, no more attempts.")
+            _maybe_queue_watchlist_from_recheck(pair, data, context="recheck_expired")
             rm_list.append(pair)
             continue
 
@@ -7435,6 +7785,10 @@ def handle_rechecks():
             passes, total, extra = recheck_logic_detail(
                 pair, token0, token1, attempt_num, False
             )
+            with state_lock:
+                data["last_extra"] = extra
+                data["last_passes"] = passes
+                data["last_total"] = total
             if isinstance(extra, dict) and extra.get("dexscreener_missing"):
                 dex_reason = extra.get("dexscreener_reason", "unknown")
                 if extra.get("should_requeue", True):
@@ -7533,6 +7887,7 @@ def handle_rechecks():
                         fail_count = data["fail_count"]
                     if fail_count >= 3:
                         logger.info(f"[Recheck] => removing {pair}, failed 3 times")
+                        _maybe_queue_watchlist_from_recheck(pair, data, context="recheck_failed")
                         rm_list.append(pair)
                         continue
                 else:
@@ -7545,6 +7900,7 @@ def handle_rechecks():
             elapsed = now_ts - data.get("created", data["last_attempt"])
         if elapsed >= 600:
             logger.info(f"[Recheck] => removing {pair}, failed after 10m")
+            _maybe_queue_watchlist_from_recheck(pair, data, context="recheck_timeout")
             rm_list.append(pair)
 
     for r in rm_list:
@@ -7948,6 +8304,7 @@ def maintenance_loop() -> None:
             handle_rechecks()
             handle_volume_checks()
             handle_passing_refreshes()
+            handle_watchlist()
             handle_wallet_updates()
             maybe_flush_failed_rechecks()
         except Exception as exc:
@@ -7997,11 +8354,23 @@ def save_last_block(bn: int, fname: str):
         pass
 
 
+def ensure_slither_available() -> None:
+    if shutil.which("slither") is None:
+        logger.warning("slither executable not found; contract analysis will be limited")
+        send_telegram_message(
+            "⚠️ Slither is not installed. Contract analysis will skip Slither checks "
+            "until it is available."
+        )
+    else:
+        logger.info("slither executable found; advanced contract analysis enabled")
+
+
 def main():
     global runtime_reporter
     log_event(logging.INFO, "startup", "Starting advanced CryptoBot")
     prometheus_client.start_http_server(PROMETHEUS_METRICS_PORT)
     ensure_etherscan_connectivity()
+    ensure_slither_available()
     if runtime_reporter is None:
         runtime_reporter = RuntimeReporter(metrics)
     start_pair_workers()
