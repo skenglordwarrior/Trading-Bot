@@ -525,6 +525,18 @@ RECHECK_DELAYS = [60, 180, 300, 600, 1800]  # 1m,3m,5m,10m,30m
 RECHECK_BACKLOG_THRESHOLD = int(os.getenv("RECHECK_BACKLOG_THRESHOLD", "30"))
 RECHECK_MAX_PER_CYCLE = int(os.getenv("RECHECK_MAX_PER_CYCLE", "25"))
 RECHECK_BACKLOG_BURST = int(os.getenv("RECHECK_BACKLOG_BURST", "80"))
+RECHECK_PRIORITY_DELAY_SECONDS = int(
+    os.getenv("RECHECK_PRIORITY_DELAY_SECONDS", "60")
+)
+RECHECK_PRIORITY_WINDOW_SECONDS = int(
+    os.getenv("RECHECK_PRIORITY_WINDOW_SECONDS", "600")
+)
+RECHECK_SLA_OVERDUE_SECONDS = int(
+    os.getenv("RECHECK_SLA_OVERDUE_SECONDS", "180")
+)
+RECHECK_PRIORITY_MIN_PER_CYCLE = int(
+    os.getenv("RECHECK_PRIORITY_MIN_PER_CYCLE", "10")
+)
 
 # Watchlist (slow-burn) monitoring for near-miss pairs
 WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
@@ -7768,18 +7780,34 @@ def _collect_queue_depth() -> dict:
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
-def queue_recheck(pair_addr: str, token0: str, token1: str):
+def queue_recheck(
+    pair_addr: str,
+    token0: str,
+    token1: str,
+    *,
+    priority: str = "normal",
+    reason: Optional[str] = None,
+):
     with state_lock:
         if pair_addr not in pending_rechecks:
+            now_ts = time.time()
+            priority_boost_until = (
+                now_ts + RECHECK_PRIORITY_WINDOW_SECONDS
+                if priority == "high"
+                else 0
+            )
             pending_rechecks[pair_addr] = {
                 "token0": token0,
                 "token1": token1,
                 "attempt_index": 0,
-                "last_attempt": time.time(),
-                "created": time.time(),
+                "last_attempt": now_ts,
+                "created": now_ts,
                 "fail_count": 0,
                 "verification_retry_at": 0,
                 "verification_warning": False,
+                "priority": priority,
+                "priority_boost_until": priority_boost_until,
+                "queued_reason": reason,
             }
 
 
@@ -7794,6 +7822,7 @@ def handle_rechecks():
         RECHECK_BACKLOG_BURST if backlog_size >= RECHECK_BACKLOG_THRESHOLD else RECHECK_MAX_PER_CYCLE
     )
     due_items = []
+    high_priority_due = 0
     for pair, data in pending_items:
         with state_lock:
             idx = data["attempt_index"]
@@ -7807,13 +7836,31 @@ def handle_rechecks():
         with state_lock:
             last_attempt = data["last_attempt"]
             retry_at = data.get("verification_retry_at", 0)
+            priority = data.get("priority", "normal")
+            priority_boost_until = data.get("priority_boost_until", 0)
         overdue = (now_ts - last_attempt) - delay
+        if priority_boost_until and now_ts <= priority_boost_until:
+            overdue = (now_ts - last_attempt) - min(
+                delay, RECHECK_PRIORITY_DELAY_SECONDS
+            )
         if overdue >= 0 and (not retry_at or now_ts >= retry_at):
-            due_items.append((overdue, pair, data))
+            due_items.append((overdue, pair, data, priority))
+            if priority == "high":
+                high_priority_due += 1
 
-    due_items.sort(reverse=True, key=lambda item: item[0])
+    due_items.sort(
+        reverse=True,
+        key=lambda item: (
+            1 if item[3] == "high" else 0,
+            item[0],
+        ),
+    )
+    if high_priority_due:
+        max_per_cycle = max(max_per_cycle, RECHECK_PRIORITY_MIN_PER_CYCLE)
     processed = 0
-    for _, pair, data in due_items:
+    for overdue, pair, data, priority in due_items:
+        if overdue >= RECHECK_SLA_OVERDUE_SECONDS:
+            metrics.increment("recheck_overdue")
         if processed >= max_per_cycle:
             break
         with state_lock:
@@ -7822,7 +7869,9 @@ def handle_rechecks():
             attempt_num = data["attempt_index"]
             token0 = data["token0"]
             token1 = data["token1"]
-        logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
+        logger.info(
+            f"[Recheck] Attempt #{attempt_num} for {pair} (priority={priority})"
+        )
 
         passes, total, extra = recheck_logic_detail(
             pair, token0, token1, attempt_num, False
@@ -8078,7 +8127,13 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     trace_id=trace_id,
                     context={"reason": status_message, **log_context},
                 )
-                queue_recheck(paddr, token0, token1)
+                queue_recheck(
+                    paddr,
+                    token0,
+                    token1,
+                    priority="high",
+                    reason="dexscreener_missing",
+                )
             else:
                 begin_execute_phase()
                 status_message = "skip_missing_dexscreener"
@@ -8238,7 +8293,13 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             )
             outcome_context["next_step"] = "recheck"
             record_pair_failure()
-            queue_recheck(paddr, token0, token1)
+            queue_recheck(
+                paddr,
+                token0,
+                token1,
+                priority="normal",
+                reason="criteria_recheck",
+            )
     except Exception as e:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         tb = traceback.extract_tb(e.__traceback__)
