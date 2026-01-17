@@ -50,7 +50,7 @@ Analyzed the nine log files `bot.log.2026-01-08` through `bot.log.2026-01-16` fo
 - **Operational tuning knobs**: the following environment variables can be adjusted without code changes to keep delays bounded as traffic grows: `RECHECK_PRIORITY_DELAY_SECONDS`, `RECHECK_PRIORITY_WINDOW_SECONDS`, `RECHECK_SLA_OVERDUE_SECONDS`, and `RECHECK_PRIORITY_MIN_PER_CYCLE`.
 
 ## Institutional lifecycle dataset (implemented)
-- **Lifecycle windows**: snapshot schedule supports early and long horizons (default 1m, 5m, 4h, 6h, 12h) via `LIFECYCLE_SNAPSHOT_OFFSETS_SECONDS` so you can model both early momentum and medium-hold outcomes.
+- **Lifecycle windows**: snapshot schedule supports early and long horizons (default 1m, 5m, 30m, 1h, 4h, 6h, 12h) via `LIFECYCLE_SNAPSHOT_OFFSETS_SECONDS` so you can model both early momentum and medium-hold outcomes.
 - **Multi-source pricing**: snapshot collection pulls price data from DexScreener by default, with optional CoinGecko fallback via `LIFECYCLE_PRICE_SOURCES=dexscreener,coingecko` to widen coverage when one vendor is slow.
 - **Consistent feature payloads**: each snapshot writes a structured JSONL row with price, market cap, liquidity, volume, buys/sells/trades, and source metadata to `backtests/lifecycle_snapshots.jsonl` for ML-ready ingestion.
 - **Operational guardrails**: snapshot throughput is capped per maintenance cycle (`LIFECYCLE_SNAPSHOT_MAX_PER_CYCLE`) and can include raw DexScreener payloads for deeper feature engineering (`LIFECYCLE_INCLUDE_RAW_DEX=1`).
