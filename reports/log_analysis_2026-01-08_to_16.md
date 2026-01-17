@@ -42,3 +42,9 @@ Analyzed the nine log files `bot.log.2026-01-08` through `bot.log.2026-01-16` fo
 1. **Centralized request coalescing**: coalesce repeated Etherscan/Ethplorer calls for the same token within a short window to cut duplicate traffic.
 2. **Dynamic concurrency limits**: decrease API concurrency when `pending_rechecks` grows to avoid overwhelming external APIs and creating more retries.
 3. **Structured error budget**: if API error rates exceed a threshold (e.g., >10% in a minute), degrade non-critical checks (wallet activity/holder distribution) to protect core pair detection.
+
+## Institutional delay guardrails (implemented)
+- **Priority rechecks for newly discovered pairs**: DexScreener-missing pairs are now queued as high-priority so they recheck sooner and more consistently during the first 10 minutes, helping reduce early-launch blind spots.
+- **SLA-based scheduling**: if a recheck is overdue beyond a configured SLA window, it is surfaced for immediate processing and tracked via a `recheck_overdue` metric, giving visibility into refresh delays.
+- **Backlog-aware minimum throughput**: when high-priority rechecks exist, the recheck loop now reserves a minimum per-cycle budget to prevent high-priority items from starving behind large backlogs.
+- **Operational tuning knobs**: the following environment variables can be adjusted without code changes to keep delays bounded as traffic grows: `RECHECK_PRIORITY_DELAY_SECONDS`, `RECHECK_PRIORITY_WINDOW_SECONDS`, `RECHECK_SLA_OVERDUE_SECONDS`, and `RECHECK_PRIORITY_MIN_PER_CYCLE`.
