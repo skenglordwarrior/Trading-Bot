@@ -525,6 +525,35 @@ RECHECK_DELAYS = [60, 180, 300, 600, 1800]  # 1m,3m,5m,10m,30m
 RECHECK_BACKLOG_THRESHOLD = int(os.getenv("RECHECK_BACKLOG_THRESHOLD", "30"))
 RECHECK_MAX_PER_CYCLE = int(os.getenv("RECHECK_MAX_PER_CYCLE", "25"))
 RECHECK_BACKLOG_BURST = int(os.getenv("RECHECK_BACKLOG_BURST", "80"))
+RECHECK_PRIORITY_DELAY_SECONDS = int(
+    os.getenv("RECHECK_PRIORITY_DELAY_SECONDS", "60")
+)
+RECHECK_PRIORITY_WINDOW_SECONDS = int(
+    os.getenv("RECHECK_PRIORITY_WINDOW_SECONDS", "600")
+)
+RECHECK_SLA_OVERDUE_SECONDS = int(
+    os.getenv("RECHECK_SLA_OVERDUE_SECONDS", "180")
+)
+RECHECK_PRIORITY_MIN_PER_CYCLE = int(
+    os.getenv("RECHECK_PRIORITY_MIN_PER_CYCLE", "10")
+)
+LIFECYCLE_SNAPSHOT_ENABLED = os.getenv(
+    "LIFECYCLE_SNAPSHOT_ENABLED", "1"
+).lower() in ("1", "true", "yes", "on")
+LIFECYCLE_SNAPSHOT_OFFSETS_SECONDS = os.getenv(
+    "LIFECYCLE_SNAPSHOT_OFFSETS_SECONDS", "60,300,1800,3600,14400,21600,43200"
+)
+LIFECYCLE_SNAPSHOT_MAX_PER_CYCLE = int(
+    os.getenv("LIFECYCLE_SNAPSHOT_MAX_PER_CYCLE", "25")
+)
+LIFECYCLE_PRICE_SOURCES = {
+    source.strip().lower()
+    for source in os.getenv("LIFECYCLE_PRICE_SOURCES", "dexscreener").split(",")
+    if source.strip()
+}
+LIFECYCLE_INCLUDE_RAW_DEX = os.getenv(
+    "LIFECYCLE_INCLUDE_RAW_DEX", "0"
+).lower() in ("1", "true", "yes", "on")
 
 # Watchlist (slow-burn) monitoring for near-miss pairs
 WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
@@ -578,6 +607,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_BLOCK_FILE_V2 = os.path.join(SCRIPT_DIR, "last_block_v2.json")
 LAST_BLOCK_FILE_V3 = os.path.join(SCRIPT_DIR, "last_block_v3.json")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "pairs.xlsx")
+LIFECYCLE_SNAPSHOT_DIR = os.path.join(SCRIPT_DIR, "backtests")
+LIFECYCLE_SNAPSHOT_FILE = os.path.join(
+    LIFECYCLE_SNAPSHOT_DIR, "lifecycle_snapshots.jsonl"
+)
 MAIN_LOOP_SLEEP = 2
 PAIR_QUEUE_MAXSIZE = int(os.getenv("PAIR_QUEUE_MAXSIZE", "500"))
 PAIR_WORKER_COUNT = int(os.getenv("PAIR_WORKER_COUNT", "3"))
@@ -621,6 +654,7 @@ maintenance_stop = threading.Event()
 telegram_refresh_stop = threading.Event()
 telegram_refresh_lock = threading.RLock()
 telegram_refresh_subscriptions: Dict[str, dict] = {}
+lifecycle_snapshot_schedule: Dict[str, dict] = {}
 
 
 def log_event(
@@ -686,6 +720,28 @@ def log_event(
         text = f"{text} | {' '.join(meta)}"
 
     logger.log(level, text)
+
+
+def _parse_lifecycle_offsets(offsets_raw: str) -> List[int]:
+    offsets: List[int] = []
+    for part in offsets_raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0:
+            offsets.append(value)
+    if not offsets:
+        return [60, 300, 14400, 21600, 43200]
+    return sorted(set(offsets))
+
+
+LIFECYCLE_OFFSETS = _parse_lifecycle_offsets(
+    LIFECYCLE_SNAPSHOT_OFFSETS_SECONDS
+)
 
 
 class MetricsCollector:
@@ -7768,18 +7824,179 @@ def _collect_queue_depth() -> dict:
 metrics.set_queue_depth_callback(_collect_queue_depth)
 
 
-def queue_recheck(pair_addr: str, token0: str, token1: str):
+def _fetch_coingecko_price_usd(token_addr: str) -> Optional[float]:
+    url = "https://api.coingecko.com/api/v3/simple/token_price/ethereum"
+    params = {"contract_addresses": token_addr, "vs_currencies": "usd"}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        metrics.record_api_call(error=False)
+    except Exception as exc:  # noqa: BLE001
+        metrics.record_api_call(error=True)
+        logger.debug("coingecko price fetch failed for %s: %s", token_addr, exc)
+        return None
+    entry = payload.get(token_addr.lower())
+    if not isinstance(entry, dict):
+        return None
+    price = entry.get("usd")
+    try:
+        return float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def register_lifecycle_snapshots(
+    pair_addr: str, token0: str, token1: str, *, detected_ts: Optional[float] = None
+) -> None:
+    if not LIFECYCLE_SNAPSHOT_ENABLED:
+        return
+    main_token = get_non_weth_token(token0, token1)
+    if detected_ts is None:
+        detected_ts = detected_at.get(pair_addr.lower(), time.time())
+    schedule = []
+    for offset in LIFECYCLE_OFFSETS:
+        schedule.append({"due_ts": detected_ts + offset, "offset_s": offset})
+    with state_lock:
+        lifecycle_snapshot_schedule.setdefault(
+            pair_addr.lower(),
+            {
+                "pair_addr": pair_addr,
+                "token": main_token,
+                "token0": token0,
+                "token1": token1,
+                "detected_ts": detected_ts,
+                "schedule": schedule,
+            },
+        )
+
+
+def _collect_lifecycle_snapshot(
+    pair_addr: str,
+    token_addr: str,
+    *,
+    offset_s: int,
+    detected_ts: float,
+) -> dict:
+    dex_data = None
+    dex_reason = None
+    if "dexscreener" in LIFECYCLE_PRICE_SOURCES or LIFECYCLE_INCLUDE_RAW_DEX:
+        dex_data, dex_reason = fetch_dexscreener_data(
+            token_addr, pair_addr, with_reason=True
+        )
+
+    prices: Dict[str, Optional[float]] = {}
+    if dex_data:
+        prices["dexscreener"] = _safe_float(dex_data.get("priceUsd"))
+    if "coingecko" in LIFECYCLE_PRICE_SOURCES:
+        prices["coingecko"] = _fetch_coingecko_price_usd(token_addr)
+
+    snapshot = {
+        "pair_address": pair_addr,
+        "token_address": token_addr,
+        "timestamp": time.time(),
+        "detected_at": detected_ts,
+        "offset_seconds": offset_s,
+        "price_sources": prices,
+        "dexscreener_reason": dex_reason,
+        "dexscreener_missing": dex_data is None,
+    }
+
+    if dex_data:
+        snapshot.update(
+            {
+                "token_symbol": dex_data.get("baseTokenSymbol"),
+                "token_name": dex_data.get("baseTokenName"),
+                "price_usd": _safe_float(dex_data.get("priceUsd")),
+                "market_cap": _safe_float(dex_data.get("marketCap")),
+                "liquidity_usd": _safe_float(dex_data.get("liquidityUsd")),
+                "fdv": _safe_float(dex_data.get("fdv")),
+                "volume24h": _safe_float(dex_data.get("volume24h")),
+                "buys": _safe_int(dex_data.get("buys")),
+                "sells": _safe_int(dex_data.get("sells")),
+                "trades": _safe_int(dex_data.get("trades24h")),
+                "dex_paid": dex_data.get("dexPaid"),
+                "locked_liquidity": dex_data.get("lockedLiquidity"),
+            }
+        )
+        if LIFECYCLE_INCLUDE_RAW_DEX:
+            snapshot["dexscreener_payload"] = dex_data
+
+    return snapshot
+
+
+def _persist_lifecycle_snapshot(snapshot: dict) -> None:
+    os.makedirs(LIFECYCLE_SNAPSHOT_DIR, exist_ok=True)
+    line = json.dumps(snapshot, default=str)
+    with open(LIFECYCLE_SNAPSHOT_FILE, "a", encoding="utf-8") as fp:
+        fp.write(line + "\n")
+
+
+def handle_lifecycle_snapshots() -> None:
+    if not LIFECYCLE_SNAPSHOT_ENABLED:
+        return
+    now_ts = time.time()
+    due_entries = []
+    with state_lock:
+        for key, entry in lifecycle_snapshot_schedule.items():
+            schedule = entry.get("schedule", [])
+            for item in schedule:
+                if item.get("due_ts", 0) <= now_ts:
+                    due_entries.append((item["due_ts"], key, item))
+    due_entries.sort(key=lambda item: item[0])
+    processed = 0
+    for _, key, item in due_entries:
+        if processed >= LIFECYCLE_SNAPSHOT_MAX_PER_CYCLE:
+            break
+        with state_lock:
+            entry = lifecycle_snapshot_schedule.get(key)
+            if not entry:
+                continue
+            schedule = entry.get("schedule", [])
+            if item not in schedule:
+                continue
+            schedule.remove(item)
+        snapshot = _collect_lifecycle_snapshot(
+            entry["pair_addr"],
+            entry["token"],
+            offset_s=item["offset_s"],
+            detected_ts=entry.get("detected_ts", now_ts),
+        )
+        _persist_lifecycle_snapshot(snapshot)
+        processed += 1
+        with state_lock:
+            if not entry.get("schedule"):
+                lifecycle_snapshot_schedule.pop(key, None)
+
+
+def queue_recheck(
+    pair_addr: str,
+    token0: str,
+    token1: str,
+    *,
+    priority: str = "normal",
+    reason: Optional[str] = None,
+):
     with state_lock:
         if pair_addr not in pending_rechecks:
+            now_ts = time.time()
+            priority_boost_until = (
+                now_ts + RECHECK_PRIORITY_WINDOW_SECONDS
+                if priority == "high"
+                else 0
+            )
             pending_rechecks[pair_addr] = {
                 "token0": token0,
                 "token1": token1,
                 "attempt_index": 0,
-                "last_attempt": time.time(),
-                "created": time.time(),
+                "last_attempt": now_ts,
+                "created": now_ts,
                 "fail_count": 0,
                 "verification_retry_at": 0,
                 "verification_warning": False,
+                "priority": priority,
+                "priority_boost_until": priority_boost_until,
+                "queued_reason": reason,
             }
 
 
@@ -7794,6 +8011,7 @@ def handle_rechecks():
         RECHECK_BACKLOG_BURST if backlog_size >= RECHECK_BACKLOG_THRESHOLD else RECHECK_MAX_PER_CYCLE
     )
     due_items = []
+    high_priority_due = 0
     for pair, data in pending_items:
         with state_lock:
             idx = data["attempt_index"]
@@ -7807,13 +8025,31 @@ def handle_rechecks():
         with state_lock:
             last_attempt = data["last_attempt"]
             retry_at = data.get("verification_retry_at", 0)
+            priority = data.get("priority", "normal")
+            priority_boost_until = data.get("priority_boost_until", 0)
         overdue = (now_ts - last_attempt) - delay
+        if priority_boost_until and now_ts <= priority_boost_until:
+            overdue = (now_ts - last_attempt) - min(
+                delay, RECHECK_PRIORITY_DELAY_SECONDS
+            )
         if overdue >= 0 and (not retry_at or now_ts >= retry_at):
-            due_items.append((overdue, pair, data))
+            due_items.append((overdue, pair, data, priority))
+            if priority == "high":
+                high_priority_due += 1
 
-    due_items.sort(reverse=True, key=lambda item: item[0])
+    due_items.sort(
+        reverse=True,
+        key=lambda item: (
+            1 if item[3] == "high" else 0,
+            item[0],
+        ),
+    )
+    if high_priority_due:
+        max_per_cycle = max(max_per_cycle, RECHECK_PRIORITY_MIN_PER_CYCLE)
     processed = 0
-    for _, pair, data in due_items:
+    for overdue, pair, data, priority in due_items:
+        if overdue >= RECHECK_SLA_OVERDUE_SECONDS:
+            metrics.increment("recheck_overdue")
         if processed >= max_per_cycle:
             break
         with state_lock:
@@ -7822,7 +8058,9 @@ def handle_rechecks():
             attempt_num = data["attempt_index"]
             token0 = data["token0"]
             token1 = data["token1"]
-        logger.info(f"[Recheck] Attempt #{attempt_num} for {pair}")
+        logger.info(
+            f"[Recheck] Attempt #{attempt_num} for {pair} (priority={priority})"
+        )
 
         passes, total, extra = recheck_logic_detail(
             pair, token0, token1, attempt_num, False
@@ -8047,6 +8285,9 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             SEEN_PAIRS.add(lower_addr)
             detected_at[paddr.lower()] = time.time()
             known_pairs[paddr.lower()] = (token0, token1)
+            register_lifecycle_snapshots(
+                paddr, token0, token1, detected_ts=detected_at[paddr.lower()]
+            )
 
         passes, total, extra = check_pair_criteria(paddr, token0, token1)
         detect_end = time.perf_counter()
@@ -8078,7 +8319,13 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
                     trace_id=trace_id,
                     context={"reason": status_message, **log_context},
                 )
-                queue_recheck(paddr, token0, token1)
+                queue_recheck(
+                    paddr,
+                    token0,
+                    token1,
+                    priority="high",
+                    reason="dexscreener_missing",
+                )
             else:
                 begin_execute_phase()
                 status_message = "skip_missing_dexscreener"
@@ -8238,7 +8485,13 @@ def handle_new_pair(pair_addr: str, token0: str, token1: str):
             )
             outcome_context["next_step"] = "recheck"
             record_pair_failure()
-            queue_recheck(paddr, token0, token1)
+            queue_recheck(
+                paddr,
+                token0,
+                token1,
+                priority="normal",
+                reason="criteria_recheck",
+            )
     except Exception as e:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         tb = traceback.extract_tb(e.__traceback__)
@@ -8347,6 +8600,7 @@ def maintenance_loop() -> None:
             handle_passing_refreshes()
             handle_watchlist()
             handle_wallet_updates()
+            handle_lifecycle_snapshots()
             maybe_flush_failed_rechecks()
         except Exception as exc:
             metrics.record_exception()
