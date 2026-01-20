@@ -554,6 +554,21 @@ LIFECYCLE_PRICE_SOURCES = {
 LIFECYCLE_INCLUDE_RAW_DEX = os.getenv(
     "LIFECYCLE_INCLUDE_RAW_DEX", "0"
 ).lower() in ("1", "true", "yes", "on")
+DETECTION_COVERAGE_AUDIT_ENABLED = os.getenv(
+    "DETECTION_COVERAGE_AUDIT_ENABLED", "1"
+).lower() in ("1", "true", "yes", "on")
+DETECTION_COVERAGE_AUDIT_INTERVAL_SECONDS = int(
+    os.getenv("DETECTION_COVERAGE_AUDIT_INTERVAL_SECONDS", "300")
+)
+DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS = int(
+    os.getenv("DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS", "600")
+)
+DETECTION_COVERAGE_AUDIT_MAX_MISSING = int(
+    os.getenv("DETECTION_COVERAGE_AUDIT_MAX_MISSING", "5")
+)
+DETECTION_COVERAGE_AUDIT_ENQUEUE_MISSING = os.getenv(
+    "DETECTION_COVERAGE_AUDIT_ENQUEUE_MISSING", "0"
+).lower() in ("1", "true", "yes", "on")
 
 # Watchlist (slow-burn) monitoring for near-miss pairs
 WATCHLIST_MAX_PASSES = max(1, MIN_PASS_THRESHOLD - 1)
@@ -655,6 +670,7 @@ telegram_refresh_stop = threading.Event()
 telegram_refresh_lock = threading.RLock()
 telegram_refresh_subscriptions: Dict[str, dict] = {}
 lifecycle_snapshot_schedule: Dict[str, dict] = {}
+last_detection_audit_ts = 0.0
 
 
 def log_event(
@@ -7987,6 +8003,115 @@ def handle_lifecycle_snapshots() -> None:
                 lifecycle_snapshot_schedule.pop(key, None)
 
 
+def _decode_pair_from_log_v2(log_entry: dict) -> Optional[tuple[str, str, str]]:
+    if len(log_entry.get("topics", [])) < 3:
+        return None
+    token0_hex = "0x" + log_entry["topics"][1].hex()[-40:]
+    token1_hex = "0x" + log_entry["topics"][2].hex()[-40:]
+    data_field = log_entry.get("data", "")
+    if isinstance(data_field, HexBytes):
+        data_field = data_field.hex()
+    if data_field.startswith("0x"):
+        data_field = data_field[2:]
+    raw_bytes = bytes.fromhex(data_field)
+    pair_addr, _ = decode(["address", "uint256"], raw_bytes)
+    return (to_checksum_address(pair_addr), token0_hex, token1_hex)
+
+
+def _decode_pair_from_log_v3(log_entry: dict) -> Optional[tuple[str, str, str]]:
+    if len(log_entry.get("topics", [])) < 4:
+        return None
+    token0_hex = "0x" + log_entry["topics"][1].hex()[-40:]
+    token1_hex = "0x" + log_entry["topics"][2].hex()[-40:]
+    data_field = log_entry.get("data", "")
+    if isinstance(data_field, HexBytes):
+        data_field = data_field.hex()
+    if data_field.startswith("0x"):
+        data_field = data_field[2:]
+    raw_bytes = bytes.fromhex(data_field)
+    _, pool_addr = decode(["int24", "address"], raw_bytes)
+    return (to_checksum_address(pool_addr), token0_hex, token1_hex)
+
+
+def run_detection_coverage_audit() -> None:
+    global last_detection_audit_ts
+    if not DETECTION_COVERAGE_AUDIT_ENABLED:
+        return
+    now_ts = time.time()
+    if now_ts - last_detection_audit_ts < DETECTION_COVERAGE_AUDIT_INTERVAL_SECONDS:
+        return
+    last_detection_audit_ts = now_ts
+
+    missing_pairs: list[dict] = []
+    try:
+        curr_v2 = safe_block_number(False)
+        curr_v3 = safe_block_number(True)
+        from_v2 = max(curr_v2 - DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS, 0)
+        from_v3 = max(curr_v3 - DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS, 0)
+        logs_v2 = safe_get_logs(
+            {
+                "fromBlock": from_v2,
+                "toBlock": curr_v2,
+                "address": UNISWAP_V2_FACTORY_ADDRESS,
+                "topics": [PAIR_CREATED_TOPIC_V2],
+            }
+        )
+        logs_v3 = safe_get_logs(
+            {
+                "fromBlock": from_v3,
+                "toBlock": curr_v3,
+                "address": UNISWAP_V3_FACTORY_ADDRESS,
+                "topics": [POOL_CREATED_TOPIC_V3],
+            },
+            is_v3=True,
+        )
+        for entry in logs_v2:
+            decoded = _decode_pair_from_log_v2(entry)
+            if not decoded:
+                continue
+            pair_addr, token0, token1 = decoded
+            if pair_addr.lower() not in SEEN_PAIRS:
+                missing_pairs.append(
+                    {"pair": pair_addr, "token0": token0, "token1": token1, "network": "v2"}
+                )
+        for entry in logs_v3:
+            decoded = _decode_pair_from_log_v3(entry)
+            if not decoded:
+                continue
+            pair_addr, token0, token1 = decoded
+            if pair_addr.lower() not in SEEN_PAIRS:
+                missing_pairs.append(
+                    {"pair": pair_addr, "token0": token0, "token1": token1, "network": "v3"}
+                )
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logging.WARNING,
+            "detection_audit_error",
+            "Detection coverage audit failed",
+            error=str(exc),
+            context={
+                "lookback_blocks": DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS,
+            },
+        )
+        return
+
+    if missing_pairs:
+        sample = missing_pairs[:DETECTION_COVERAGE_AUDIT_MAX_MISSING]
+        log_event(
+            logging.WARNING,
+            "detection_coverage_gap",
+            "Detected pair creation logs missing from ingestion",
+            context={
+                "missing_count": len(missing_pairs),
+                "sample": sample,
+                "lookback_blocks": DETECTION_COVERAGE_AUDIT_LOOKBACK_BLOCKS,
+            },
+        )
+        if DETECTION_COVERAGE_AUDIT_ENQUEUE_MISSING:
+            for item in sample:
+                enqueue_discovered_pair(item["pair"], item["token0"], item["token1"])
+
+
 def queue_recheck(
     pair_addr: str,
     token0: str,
@@ -8619,6 +8744,7 @@ def maintenance_loop() -> None:
             handle_watchlist()
             handle_wallet_updates()
             handle_lifecycle_snapshots()
+            run_detection_coverage_audit()
             maybe_flush_failed_rechecks()
         except Exception as exc:
             metrics.record_exception()
