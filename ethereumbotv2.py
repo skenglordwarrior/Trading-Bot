@@ -744,6 +744,24 @@ LIFECYCLE_OFFSETS = _parse_lifecycle_offsets(
 )
 
 
+def _safe_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class MetricsCollector:
     """Collect runtime metrics and emit periodic summaries."""
 
