@@ -43,6 +43,14 @@ def _env_flag(name: str, default: bool = True) -> bool:
 
 _ETHERSCAN_LOOKUPS_ENABLED = _env_flag("ENABLE_ETHERSCAN_LOOKUPS", True)
 _ETHERSCAN_DISABLED_REASON: Optional[str] = None
+_ETHERSCAN_FAILURES = 0
+_ETHERSCAN_DISABLED_UNTIL = 0.0
+_ETHERSCAN_FAILURE_THRESHOLD = int(
+    os.getenv("ETHERSCAN_FAILURE_THRESHOLD", "3")
+)
+_ETHERSCAN_COOLDOWN_SECONDS = int(
+    os.getenv("ETHERSCAN_COOLDOWN_SECONDS", "300")
+)
 
 
 def set_etherscan_lookup_enabled(enabled: bool, reason: str = ""):
@@ -56,7 +64,25 @@ def set_etherscan_lookup_enabled(enabled: bool, reason: str = ""):
 
 
 def _etherscan_enabled() -> bool:
+    global _ETHERSCAN_LOOKUPS_ENABLED, _ETHERSCAN_DISABLED_REASON, _ETHERSCAN_FAILURES
+    if (
+        not _ETHERSCAN_LOOKUPS_ENABLED
+        and _ETHERSCAN_DISABLED_UNTIL
+        and time.time() >= _ETHERSCAN_DISABLED_UNTIL
+    ):
+        _ETHERSCAN_LOOKUPS_ENABLED = True
+        _ETHERSCAN_DISABLED_REASON = None
+        _ETHERSCAN_FAILURES = 0
+        logger.info("Re-enabled wallet tracker Etherscan lookups after cooldown")
     return _ETHERSCAN_LOOKUPS_ENABLED
+
+
+def _record_etherscan_failure(reason: str) -> None:
+    global _ETHERSCAN_FAILURES, _ETHERSCAN_DISABLED_UNTIL
+    _ETHERSCAN_FAILURES += 1
+    if _ETHERSCAN_FAILURES >= _ETHERSCAN_FAILURE_THRESHOLD:
+        _ETHERSCAN_DISABLED_UNTIL = time.time() + _ETHERSCAN_COOLDOWN_SECONDS
+        set_etherscan_lookup_enabled(False, reason)
 
 
 async def _etherscan_get_async(params: dict, timeout: int = 20) -> dict:
@@ -86,18 +112,21 @@ async def _etherscan_get_async(params: dict, timeout: int = 20) -> dict:
         return await loop.run_in_executor(None, _do_request)
     except requests.Timeout as exc:
         logger.warning("Etherscan request timed out: %s", exc)
+        _record_etherscan_failure(f"etherscan timeout: {exc}")
         raise
     except requests.ConnectionError as exc:
         logger.warning("Etherscan connection error: %s", exc)
+        _record_etherscan_failure(f"etherscan connection error: {exc}")
         raise
     except requests.HTTPError as exc:
-        set_etherscan_lookup_enabled(False, f"etherscan HTTP error: {exc}")
+        _record_etherscan_failure(f"etherscan HTTP error: {exc}")
         raise
     except (asyncio.TimeoutError, OSError) as exc:
         logger.warning("Async Etherscan request failed: %s", exc)
+        _record_etherscan_failure(f"etherscan async error: {exc}")
         raise
     except requests.RequestException as exc:  # pragma: no cover - defensive
-        set_etherscan_lookup_enabled(False, f"etherscan request failed: {exc}")
+        _record_etherscan_failure(f"etherscan request failed: {exc}")
         raise
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Unexpected Etherscan error: %s", exc)
